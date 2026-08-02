@@ -54,6 +54,7 @@ const PAPER_KEYWORDS_REMOVAL_MIGRATION_ID = "remove-paper-keywords-v1";
 const PAPER_SOURCES_NORMALIZATION_MIGRATION_ID =
   "normalize-paper-publication-sources-v1";
 const MAX_CATEGORY_DEPTH = 3;
+const PDF_ARCHIVE_STATUSES = new Set(["ready", "failed", "stale"]);
 const LEGACY_AI_BASE_URLS = {
   openai: "https://api.openai.com/v1",
   deepseek: "https://api.deepseek.com",
@@ -228,6 +229,69 @@ function validateNoteCount(value) {
     });
   }
   return value;
+}
+
+function validatePdfArchiveStatus(value) {
+  if (!PDF_ARCHIVE_STATUSES.has(value)) {
+    throw new ValidationError("PDF 本地归档状态无效。", {
+      field: "status",
+    });
+  }
+  return value;
+}
+
+function validatePdfStorageKey(value) {
+  if (typeof value !== "string" || !/^pdf-[a-f0-9]{64}\.pdf$/u.test(value)) {
+    throw new ValidationError("PDF 本地文件标识无效。", {
+      field: "storageKey",
+    });
+  }
+  return value;
+}
+
+function validatePdfSha256(value) {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new ValidationError("PDF 文件校验值无效。", {
+      field: "sha256",
+    });
+  }
+  return value;
+}
+
+function validatePdfSize(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new ValidationError("PDF 文件大小无效。", {
+      field: "sizeBytes",
+    });
+  }
+  return value;
+}
+
+function validatePdfErrorMessage(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ValidationError("PDF 下载错误信息无效。", {
+      field: "errorMessage",
+    });
+  }
+  return value.trim().slice(0, 500);
+}
+
+function validatePdfArchiveSourceUrl(value) {
+  if (value === "" || value === null || value === undefined) return "";
+  return validateHttpUrl(value, "sourceUrl") ?? "";
+}
+
+function pdfArchiveForClient(row) {
+  if (!row) return undefined;
+  return {
+    status: validatePdfArchiveStatus(row.status),
+    ...(row.downloadedAt ? { downloadedAt: row.downloadedAt } : {}),
+    ...(row.sizeBytes !== null && row.sizeBytes !== undefined
+      ? { sizeBytes: Number(row.sizeBytes) }
+      : {}),
+    ...(row.lastErrorCode ? { errorCode: row.lastErrorCode } : {}),
+    ...(row.lastErrorMessage ? { errorMessage: row.lastErrorMessage } : {}),
+  };
 }
 
 function validatePaperIdentifiers(value) {
@@ -578,6 +642,7 @@ function paperInsertValues(paper, now, sortOrder) {
     [];
   const title = requiredTitle(paper.title);
   const date = validateString(paper.date ?? "", "date");
+  const pdfUrl = validateHttpUrl(paper.pdfUrl, "pdfUrl") ?? null;
 
   return {
     id: validatePaperId(paper.id),
@@ -602,9 +667,9 @@ function paperInsertValues(paper, now, sortOrder) {
       paper.watchLater ?? false,
       "watchLater",
     ),
-    hasPdf: validateBoolean(paper.hasPdf ?? false, "hasPdf"),
+    hasPdf: Boolean(validateBoolean(paper.hasPdf ?? false, "hasPdf") || pdfUrl),
     pdfAttachmentKey: toNullableText(paper.pdfAttachmentKey),
-    pdfUrl: validateHttpUrl(paper.pdfUrl, "pdfUrl") ?? null,
+    pdfUrl,
     originalUrl: validateHttpUrl(paper.originalUrl, "originalUrl") ?? null,
     codeProvider: toNullableText(paper.codeProvider),
     codeUrl: validateHttpUrl(paper.codeUrl, "codeUrl") ?? null,
@@ -735,6 +800,15 @@ export class LibraryRepository {
         )
         .get(),
     );
+    const hadPaperPdfArchivesTable = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'paper_pdf_archives'`,
+        )
+        .get(),
+    );
     const legacyAiConnectionColumns = hadAiConnectionsTable
       ? this.db
           .prepare("PRAGMA table_info(ai_connections)")
@@ -816,6 +890,33 @@ export class LibraryRepository {
 
       CREATE INDEX IF NOT EXISTS paper_identifiers_lookup_idx
         ON paper_identifiers(kind, normalized_value, paper_id);
+
+      CREATE TABLE IF NOT EXISTS paper_pdf_archives (
+        paper_id TEXT PRIMARY KEY
+          REFERENCES papers(id) ON DELETE CASCADE,
+        status TEXT NOT NULL
+          CHECK (status IN ('ready', 'failed', 'stale')),
+        source_url TEXT NOT NULL DEFAULT '',
+        storage_key TEXT,
+        sha256 TEXT,
+        size_bytes INTEGER CHECK (size_bytes IS NULL OR size_bytes > 0),
+        downloaded_at TEXT,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          status <> 'ready'
+          OR (
+            storage_key IS NOT NULL
+            AND sha256 IS NOT NULL
+            AND size_bytes IS NOT NULL
+            AND downloaded_at IS NOT NULL
+          )
+        )
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS paper_pdf_archives_status_idx
+        ON paper_pdf_archives(status, updated_at DESC);
 
       CREATE TABLE IF NOT EXISTS repository_migrations (
         id TEXT PRIMARY KEY,
@@ -1026,6 +1127,7 @@ export class LibraryRepository {
         this.schemaMigrated = true;
       }
       if (!hadPaperIdentifiersTable) this.schemaMigrated = true;
+      if (!hadPaperPdfArchivesTable) this.schemaMigrated = true;
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS categories_active_parent_order_idx
           ON categories(deleted_at, parent_id, sort_order, id)
@@ -1447,7 +1549,33 @@ export class LibraryRepository {
     return byPaper;
   }
 
-  #paperFromRow(row, directCategories, categoryModel, identifiers = []) {
+  #pdfArchivesByPaper() {
+    const rows = this.db
+      .prepare(
+        `SELECT
+           paper_id AS paperId,
+           status,
+           source_url AS sourceUrl,
+           storage_key AS storageKey,
+           sha256,
+           size_bytes AS sizeBytes,
+           downloaded_at AS downloadedAt,
+           last_error_code AS lastErrorCode,
+           last_error_message AS lastErrorMessage,
+           updated_at AS updatedAt
+         FROM paper_pdf_archives`,
+      )
+      .all();
+    return new Map(rows.map((row) => [row.paperId, pdfArchiveForClient(row)]));
+  }
+
+  #paperFromRow(
+    row,
+    directCategories,
+    categoryModel,
+    identifiers = [],
+    pdfArchive,
+  ) {
     const tags = directCategories.map((category) => ({
       label: category.name,
       scope: category.id,
@@ -1486,6 +1614,7 @@ export class LibraryRepository {
       favorite: Boolean(row.favorite),
       watchLater: Boolean(row.watchLater),
       hasPdf: Boolean(row.hasPdf),
+      ...(pdfArchive ? { pdfArchive } : {}),
       ...(row.pdfAttachmentKey
         ? { pdfAttachmentKey: row.pdfAttachmentKey }
         : {}),
@@ -1552,12 +1681,14 @@ export class LibraryRepository {
     const categoryModel = this.#categoryModel();
     const directByPaper = this.#directCategoriesByPaper();
     const identifiersByPaper = this.#identifiersByPaper();
+    const pdfArchivesByPaper = this.#pdfArchivesByPaper();
     return this.#paperRows({ includeDeleted, id }).map((row) =>
       this.#paperFromRow(
         row,
         directByPaper.get(row.id) ?? [],
         categoryModel,
         identifiersByPaper.get(row.id) ?? [],
+        pdfArchivesByPaper.get(row.id),
       ),
     );
   }
@@ -2002,6 +2133,223 @@ export class LibraryRepository {
     return this.#papers({ includeDeleted, id })[0] ?? null;
   }
 
+  getPdfArchiveRecord(id, { includeDeleted = false } = {}) {
+    this.#assertOpen();
+    validatePaperId(id);
+    const row = this.db
+      .prepare(
+        `SELECT
+           a.paper_id AS paperId,
+           a.status,
+           a.source_url AS sourceUrl,
+           a.storage_key AS storageKey,
+           a.sha256,
+           a.size_bytes AS sizeBytes,
+           a.downloaded_at AS downloadedAt,
+           a.last_error_code AS lastErrorCode,
+           a.last_error_message AS lastErrorMessage,
+           a.updated_at AS updatedAt
+         FROM paper_pdf_archives a
+         JOIN papers p ON p.id = a.paper_id
+         WHERE a.paper_id = ?
+           ${includeDeleted ? "" : "AND p.deleted_at IS NULL"}`,
+      )
+      .get(id);
+    return row ?? null;
+  }
+
+  async recordPdfArchiveReady(
+    id,
+    { sourceUrl = "", storageKey, sha256, sizeBytes } = {},
+  ) {
+    return this.#queueMutation(async () => {
+      validatePaperId(id);
+      const current = this.getPaper(id);
+      if (!current) throw new NotFoundError(`未找到论文 ${id}。`);
+      const normalizedSourceUrl = validatePdfArchiveSourceUrl(sourceUrl);
+      const normalizedStorageKey = validatePdfStorageKey(storageKey);
+      const normalizedSha256 = validatePdfSha256(sha256);
+      const normalizedSizeBytes = validatePdfSize(sizeBytes);
+      const now = this.now().toISOString();
+      let committed = true;
+
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        if (
+          normalizedSourceUrl &&
+          current.pdfUrl &&
+          current.pdfUrl !== normalizedSourceUrl
+        ) {
+          this.db
+            .prepare(
+              `INSERT INTO paper_pdf_archives (
+                 paper_id, status, source_url, updated_at
+               ) VALUES (?, 'stale', ?, ?)
+               ON CONFLICT(paper_id) DO UPDATE SET
+                 status = 'stale',
+                 source_url = excluded.source_url,
+                 updated_at = excluded.updated_at`,
+            )
+            .run(id, current.pdfUrl, now);
+          committed = false;
+        } else {
+          this.db
+            .prepare(
+              `INSERT INTO paper_pdf_archives (
+                 paper_id, status, source_url, storage_key, sha256,
+                 size_bytes, downloaded_at, last_error_code,
+                 last_error_message, updated_at
+               ) VALUES (?, 'ready', ?, ?, ?, ?, ?, NULL, NULL, ?)
+               ON CONFLICT(paper_id) DO UPDATE SET
+                 status = 'ready',
+                 source_url = excluded.source_url,
+                 storage_key = excluded.storage_key,
+                 sha256 = excluded.sha256,
+                 size_bytes = excluded.size_bytes,
+                 downloaded_at = excluded.downloaded_at,
+                 last_error_code = NULL,
+                 last_error_message = NULL,
+                 updated_at = excluded.updated_at`,
+            )
+            .run(
+              id,
+              normalizedSourceUrl,
+              normalizedStorageKey,
+              normalizedSha256,
+              normalizedSizeBytes,
+              now,
+              now,
+            );
+          this.db
+            .prepare(
+              `UPDATE papers
+               SET has_pdf = 1, updated_at = ?
+               WHERE id = ? AND deleted_at IS NULL`,
+            )
+            .run(now, id);
+        }
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      const backup = await this.#createBackup();
+      return { paper: this.getPaper(id), backup, committed };
+    });
+  }
+
+  async recordPdfArchiveFailure(
+    id,
+    { sourceUrl = "", errorCode, errorMessage } = {},
+  ) {
+    return this.#queueMutation(async () => {
+      validatePaperId(id);
+      const current = this.getPaper(id);
+      if (!current) throw new NotFoundError(`未找到论文 ${id}。`);
+      const normalizedSourceUrl = validatePdfArchiveSourceUrl(sourceUrl);
+      const normalizedErrorCode = validateString(errorCode, "errorCode");
+      const normalizedErrorMessage = validatePdfErrorMessage(errorMessage);
+      const existing = this.getPdfArchiveRecord(id);
+      const status = validatePdfArchiveStatus(
+        existing?.status === "ready" && existing.storageKey
+          ? "ready"
+          : existing?.storageKey
+            ? "stale"
+            : "failed",
+      );
+      const now = this.now().toISOString();
+
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO paper_pdf_archives (
+               paper_id, status, source_url, last_error_code,
+               last_error_message, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(paper_id) DO UPDATE SET
+               status = excluded.status,
+               source_url = excluded.source_url,
+               last_error_code = excluded.last_error_code,
+               last_error_message = excluded.last_error_message,
+               updated_at = excluded.updated_at`,
+          )
+          .run(
+            id,
+            status,
+            normalizedSourceUrl || current.pdfUrl || existing?.sourceUrl || "",
+            normalizedErrorCode,
+            normalizedErrorMessage,
+            now,
+          );
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      const backup = await this.#createBackup();
+      return { paper: this.getPaper(id), backup };
+    });
+  }
+
+  async recordPdfArchiveStale(id) {
+    return this.#queueMutation(async () => {
+      validatePaperId(id);
+      const current = this.getPaper(id);
+      if (!current) throw new NotFoundError(`未找到论文 ${id}。`);
+      const now = this.now().toISOString();
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO paper_pdf_archives (
+               paper_id, status, source_url, updated_at
+             ) VALUES (?, 'stale', ?, ?)
+             ON CONFLICT(paper_id) DO UPDATE SET
+               status = 'stale',
+               source_url = excluded.source_url,
+               updated_at = excluded.updated_at`,
+          )
+          .run(id, current.pdfUrl ?? "", now);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      const backup = await this.#createBackup();
+      return { paper: this.getPaper(id), backup };
+    });
+  }
+
+  async clearPdfArchiveRecord(id) {
+    return this.#queueMutation(async () => {
+      validatePaperId(id);
+      const current = this.getPaper(id);
+      if (!current) throw new NotFoundError(`未找到论文 ${id}。`);
+      const now = this.now().toISOString();
+      const hasPdf = Boolean(current.pdfUrl || current.pdfAttachmentKey);
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db
+          .prepare("DELETE FROM paper_pdf_archives WHERE paper_id = ?")
+          .run(id);
+        this.db
+          .prepare(
+            `UPDATE papers
+             SET has_pdf = ?, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL`,
+          )
+          .run(sqliteBoolean(hasPdf), now, id);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      const backup = await this.#createBackup();
+      return { paper: this.getPaper(id), backup };
+    });
+  }
+
   findPaperDuplicates({
     identifiers = [],
     title = "",
@@ -2129,6 +2477,17 @@ export class LibraryRepository {
       const current = this.getPaper(id);
       if (!current) throw new NotFoundError(`未找到论文 ${id}。`);
       const patch = validatePaperInput(input);
+      const currentPdfArchive = this.getPdfArchiveRecord(id);
+      const pdfUrlChanged =
+        Object.hasOwn(patch, "pdfUrl") &&
+        patch.pdfUrl !== (current.pdfUrl ?? null);
+      if (pdfUrlChanged && !Object.hasOwn(patch, "hasPdf")) {
+        patch.hasPdf = Boolean(
+          patch.pdfUrl ||
+            current.pdfAttachmentKey ||
+            currentPdfArchive?.status === "ready",
+        );
+      }
       if (
         Object.hasOwn(patch, "source") ||
         Object.hasOwn(patch, "date") ||
@@ -2197,6 +2556,20 @@ export class LibraryRepository {
               .prepare("UPDATE papers SET updated_at = ? WHERE id = ?")
               .run(now, id);
           }
+        }
+        if (
+          pdfUrlChanged &&
+          patch.pdfUrl &&
+          currentPdfArchive?.sourceUrl &&
+          currentPdfArchive.sourceUrl !== patch.pdfUrl
+        ) {
+          this.db
+            .prepare(
+              `UPDATE paper_pdf_archives
+               SET status = 'stale', source_url = ?, updated_at = ?
+               WHERE paper_id = ?`,
+            )
+            .run(patch.pdfUrl, now, id);
         }
         this.db.exec("COMMIT");
       } catch (error) {

@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  ChangeEvent,
   DragEvent as ReactDragEvent,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
@@ -61,6 +62,14 @@ type PaperIdentifier = {
   value: string;
 };
 
+type PdfArchive = {
+  status: "ready" | "failed" | "stale";
+  downloadedAt?: string;
+  sizeBytes?: number;
+  errorCode?: string;
+  errorMessage?: string;
+};
+
 type Paper = {
   id: string;
   zoteroKey?: string;
@@ -82,6 +91,7 @@ type Paper = {
   hasPdf: boolean;
   pdfAttachmentKey?: string;
   pdfUrl?: string;
+  pdfArchive?: PdfArchive;
   originalUrl?: string;
   codeProvider?: string;
   codeUrl?: string;
@@ -174,7 +184,6 @@ type PaperEditDraft = {
   selectedCategoryIds: string[];
   aiSummary: string;
   note: string;
-  hasPdf: boolean;
   pdfUrl: string;
   originalUrl: string;
   hasCode: boolean;
@@ -198,6 +207,11 @@ type LibraryResponse = {
 type PaperMutationResponse = {
   paper: Paper;
   backup?: BackupStatus;
+};
+
+type PdfArchiveMutationResponse = PaperMutationResponse & {
+  alreadyArchived?: boolean;
+  committed?: boolean;
 };
 
 type CategoryMutationResponse = {
@@ -441,7 +455,6 @@ function draftFromPaper(paper: Paper): PaperEditDraft {
       paper.tags.map((tag) => tag.scope).filter((scope) => scope !== "uncategorized"),
     aiSummary: paper.aiSummary,
     note: paper.note ?? "",
-    hasPdf: paper.hasPdf,
     pdfUrl: paper.pdfUrl ?? "",
     originalUrl: paper.originalUrl ?? "",
     hasCode: Boolean(paper.codeProvider || paper.codeUrl),
@@ -486,6 +499,30 @@ async function libraryRequest<T>(path: string, init?: RequestInit) {
     );
   }
   return payload as T;
+}
+
+function pdfOpenUrl(paperId: string) {
+  return `${LIBRARY_API_BASE}/papers/${encodeURIComponent(paperId)}/pdf/open`;
+}
+
+function formatPdfSize(sizeBytes?: number) {
+  if (!sizeBytes || sizeBytes < 1_024) return sizeBytes ? `${sizeBytes} B` : "";
+  if (sizeBytes < 1_024 * 1_024) {
+    return `${(sizeBytes / 1_024).toFixed(1)} KB`;
+  }
+  return `${(sizeBytes / (1_024 * 1_024)).toFixed(1)} MB`;
+}
+
+function formatPdfArchiveTime(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function formatBackupTime(value?: string) {
@@ -664,6 +701,9 @@ export default function Home() {
   const [editBaseline, setEditBaseline] = useState("");
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const [savingPaper, setSavingPaper] = useState(false);
+  const [pdfActionBusyId, setPdfActionBusyId] = useState<string | null>(
+    null,
+  );
   const [lastDeleted, setLastDeleted] = useState<{
     paper: Paper;
     index: number;
@@ -685,6 +725,7 @@ export default function Home() {
   const modalRef = useRef<HTMLElement>(null);
   const titlePreviewCloseRef = useRef<HTMLButtonElement>(null);
   const editFormRef = useRef<HTMLFormElement>(null);
+  const pdfImportInputRef = useRef<HTMLInputElement>(null);
   const discardReturnFocusRef = useRef<HTMLElement | null>(null);
   const modalTriggerRef = useRef<HTMLElement | null>(null);
   const modalWasOpenRef = useRef(false);
@@ -704,6 +745,11 @@ export default function Home() {
     : null;
   const editDirty = Boolean(
     editDraft && JSON.stringify(editDraft) !== editBaseline,
+  );
+  const editPdfSourceChanged = Boolean(
+    editingPaper &&
+      editDraft &&
+      editDraft.pdfUrl.trim() !== (editingPaper.pdfUrl ?? ""),
   );
   const renamingCategory = renamingCategoryId
     ? categoryRecords.find((category) => category.id === renamingCategoryId) ??
@@ -924,6 +970,43 @@ export default function Home() {
     () => flattenCategoryTree(categories),
     [categories],
   );
+  const ensureCategoryAncestors = (categoryIds: string[]) => {
+    const selected = new Set(categoryIds);
+    categoryIds.forEach((categoryId) => {
+      const category = flattenedCategories.find(
+        (candidate) => candidate.id === categoryId,
+      );
+      [...(category?.ancestorIds ?? [])].forEach((ancestorId) =>
+        selected.add(ancestorId),
+      );
+    });
+    return [...selected];
+  };
+  const toggleCategorySelection = (
+    categoryId: string,
+    categoryIds: string[],
+  ) => {
+    const selected = new Set(categoryIds);
+    if (selected.has(categoryId)) {
+      flattenedCategories.forEach((category) => {
+        if (
+          category.id === categoryId ||
+          category.ancestorIds?.includes(categoryId)
+        ) {
+          selected.delete(category.id);
+        }
+      });
+    } else {
+      const category = flattenedCategories.find(
+        (candidate) => candidate.id === categoryId,
+      );
+      [...(category?.ancestorIds ?? [])].forEach((ancestorId) =>
+        selected.add(ancestorId),
+      );
+      selected.add(categoryId);
+    }
+    return [...selected];
+  };
   const visibleSidebarCategories = useMemo(
     () => categories.filter((category) => category.sidebarVisible),
     [categories],
@@ -1329,6 +1412,121 @@ export default function Home() {
     }
   };
 
+  const archivePaperPdf = async (
+    paper: Paper,
+    { force = false, silent = false } = {},
+  ) => {
+    if (pdfActionBusyId === paper.id) return null;
+    if (!safeExternalUrl(paper.pdfUrl)) {
+      if (!silent) setToast("请先填写可访问的 PDF 来源链接");
+      return null;
+    }
+    if (libraryConnection !== "ready") {
+      if (!silent) setToast("本机数据库未连接，暂时无法保存 PDF");
+      return null;
+    }
+
+    setPdfActionBusyId(paper.id);
+    try {
+      const response = await libraryRequest<PdfArchiveMutationResponse>(
+        `/papers/${encodeURIComponent(paper.id)}/pdf/archive`,
+        {
+          method: "POST",
+          body: JSON.stringify({ force }),
+        },
+      );
+      replacePaper(response.paper);
+      applyBackupStatus(response.backup);
+      if (!silent && !response.alreadyArchived) {
+        setToast(savedMessage("PDF 已保存到本地", response.backup));
+      }
+      return response.paper;
+    } catch (error) {
+      setToast(
+        error instanceof Error ? error.message : "PDF 保存失败，请稍后重试",
+      );
+      return null;
+    } finally {
+      setPdfActionBusyId(null);
+    }
+  };
+
+  const deleteLocalPdf = async (paper: Paper) => {
+    if (pdfActionBusyId === paper.id) return;
+    if (!window.confirm(`删除《${paper.title}》的本地 PDF 副本吗？`)) return;
+    if (libraryConnection !== "ready") {
+      setToast("本机数据库未连接，未删除本地 PDF");
+      return;
+    }
+
+    setPdfActionBusyId(paper.id);
+    try {
+      const response = await libraryRequest<PaperMutationResponse>(
+        `/papers/${encodeURIComponent(paper.id)}/pdf/archive`,
+        { method: "DELETE" },
+      );
+      replacePaper(response.paper);
+      applyBackupStatus(response.backup);
+      setToast(savedMessage("本地 PDF 副本已删除", response.backup));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "删除本地 PDF 失败");
+    } finally {
+      setPdfActionBusyId(null);
+    }
+  };
+
+  const importLocalPdf = async (paper: Paper, file: File) => {
+    if (pdfActionBusyId === paper.id) return;
+    if (file.size > 200 * 1_024 * 1_024) {
+      setToast("PDF 文件不能超过 200 MiB");
+      return;
+    }
+    if (libraryConnection !== "ready") {
+      setToast("本机数据库未连接，暂时无法导入 PDF");
+      return;
+    }
+
+    setPdfActionBusyId(paper.id);
+    try {
+      const response = await libraryRequest<PaperMutationResponse>(
+        `/papers/${encodeURIComponent(paper.id)}/pdf/import`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": file.type || "application/pdf",
+          },
+          body: file,
+        },
+      );
+      replacePaper(response.paper);
+      applyBackupStatus(response.backup);
+      setToast(savedMessage("PDF 已导入到本地", response.backup));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "导入 PDF 失败");
+    } finally {
+      setPdfActionBusyId(null);
+    }
+  };
+
+  const handlePdfImport = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (file && editingPaper) {
+      void importLocalPdf(editingPaper, file);
+    }
+  };
+
+  const queuePdfArchive = (paper: Paper) => {
+    if (
+      paper.pdfArchive?.status === "ready" ||
+      !safeExternalUrl(paper.pdfUrl) ||
+      libraryConnection !== "ready"
+    ) {
+      return;
+    }
+    void archivePaperPdf(paper, { silent: true });
+  };
+
   const toggleFavorite = async (id: string) => {
     const paper = papers.find((item) => item.id === id);
     if (!paper) return;
@@ -1373,6 +1571,7 @@ export default function Home() {
       if (response.status === "ready") {
         setPaperIntakeDraft({
           ...response.draft,
+          categoryIds: ensureCategoryAncestors(response.draft.categoryIds),
           codeUrl: response.draft.codeUrl ?? "",
           codeProvider: response.draft.codeProvider ?? "",
           projectUrl: response.draft.projectUrl ?? "",
@@ -2168,6 +2367,9 @@ export default function Home() {
 
   const openEditPaper = (paper: Paper) => {
     const draft = draftFromPaper(paper);
+    draft.selectedCategoryIds = ensureCategoryAncestors(
+      draft.selectedCategoryIds,
+    );
     modalTriggerRef.current =
       document.querySelector<HTMLButtonElement>(
         `[data-title-paper="${paper.id}"]`,
@@ -2230,10 +2432,10 @@ export default function Home() {
 
   const toggleDraftCategory = (categoryId: string) => {
     if (!editDraft) return;
-    const selected = new Set(editDraft.selectedCategoryIds);
-    if (selected.has(categoryId)) selected.delete(categoryId);
-    else selected.add(categoryId);
-    updateEditDraft("selectedCategoryIds", [...selected]);
+    updateEditDraft(
+      "selectedCategoryIds",
+      toggleCategorySelection(categoryId, editDraft.selectedCategoryIds),
+    );
   };
 
   const saveEditedPaper = async (event: FormEvent<HTMLFormElement>) => {
@@ -2279,9 +2481,8 @@ export default function Home() {
         aiSummary: editDraft.aiSummary.trim(),
         note: editDraft.note.trim(),
         noteCount: editDraft.note.trim() ? 1 : 0,
-        hasPdf: editDraft.hasPdf,
         pdfUrl:
-          editDraft.hasPdf && editDraft.pdfUrl.trim()
+          editDraft.pdfUrl.trim()
             ? safeExternalUrl(editDraft.pdfUrl.trim())
             : null,
         originalUrl: editDraft.originalUrl.trim()
@@ -3384,10 +3585,48 @@ export default function Home() {
 
   const renderPaperCard = (paper: Paper) => {
     const paperSearchMatch = paperSearchMatches.get(paper.id);
-    const visibleTags = paper.tags.filter(
-      (tag) => tag.scope !== activeScope,
+    const scopedCategoryIds = new Set(paper.scopes);
+    const visibleTags = flattenedCategories
+      .filter((category) => scopedCategoryIds.has(category.id))
+      .map((category) => ({
+        tag: {
+          label: category.name,
+          scope: category.id,
+        },
+        category,
+      }));
+    const visibleTagScopes = new Set(
+      visibleTags.map(({ tag }) => tag.scope),
     );
+    paper.tags.forEach((tag) => {
+      if (!visibleTagScopes.has(tag.scope)) {
+        visibleTags.push({ tag, category: undefined });
+      }
+    });
     const pdfUrl = safeExternalUrl(paper.pdfUrl);
+    const pdfIsLocal = paper.pdfArchive?.status === "ready";
+    const pdfActionBusy = pdfActionBusyId === paper.id;
+    const pdfHref =
+      libraryConnection === "ready"
+        ? pdfOpenUrl(paper.id)
+        : pdfUrl;
+    const canOpenPdf = Boolean(pdfHref && (pdfIsLocal || pdfUrl));
+    const pdfState = pdfIsLocal
+      ? "✓"
+      : pdfActionBusy
+        ? "…"
+        : paper.pdfArchive?.status === "failed"
+          ? "!"
+          : "↓";
+    const pdfStatusLabel = pdfIsLocal
+      ? "本地"
+      : pdfActionBusy
+        ? "保存中"
+        : paper.pdfArchive?.status === "stale"
+          ? "待更新"
+          : paper.pdfArchive?.status === "failed"
+            ? "重试"
+            : "归档";
     const codeUrl = safeExternalUrl(paper.codeUrl);
     const projectUrl = safeExternalUrl(paper.projectUrl);
     const originalUrl = safeExternalUrl(paper.originalUrl);
@@ -3404,16 +3643,18 @@ export default function Home() {
       <article className="paper-card" key={paper.id}>
         <div className="paper-card-top">
           <div className="paper-badges">
-            {visibleTags.slice(0, 2).map((tag) => (
-              <span className="category-badge" key={tag.label}>
+            {visibleTags.map(({ tag, category }) => (
+              <span
+                className={`category-badge category-badge-depth-${Math.min(
+                  category?.depth ?? 0,
+                  2,
+                )}`}
+                key={`${tag.scope}:${tag.label}`}
+                title={category?.path.join(" › ")}
+              >
                 {tag.label}
               </span>
             ))}
-            {visibleTags.length > 2 && (
-              <span className="category-badge">
-                +{visibleTags.length - 2}
-              </span>
-            )}
           </div>
 
           <div className="paper-top-actions">
@@ -3549,24 +3790,35 @@ export default function Home() {
 
         <footer className="paper-card-footer">
           <div className="resource-grid" aria-label="论文资源">
-            {paper.hasPdf && pdfUrl ? (
+            {canOpenPdf ? (
               <a
                 className="resource-slot is-available"
-                href={pdfUrl}
+                href={pdfHref}
                 target="_blank"
                 rel="noopener noreferrer"
-                aria-label={`打开《${paper.title}》的 PDF`}
+                onClick={() => queuePdfArchive(paper)}
+                onAuxClick={(event) => {
+                  if (event.button === 1) queuePdfArchive(paper);
+                }}
+                aria-label={
+                  pdfIsLocal
+                    ? `打开《${paper.title}》的本地 PDF`
+                    : `打开《${paper.title}》的 PDF，并在后台保存到本地`
+                }
               >
-                <span className="resource-state" aria-hidden="true">✓</span>
+                <span className="resource-state" aria-hidden="true">
+                  {pdfState}
+                </span>
                 <span>PDF</span>
+                <small>{pdfStatusLabel}</small>
               </a>
             ) : paper.hasPdf ? (
               <button
                 className="resource-slot is-available"
                 onClick={() =>
-                  setToast("已检测到 PDF，本次迁移未复制附件文件")
+                  setToast("已检测到 PDF，请在编辑页导入本地文件或补充来源链接")
                 }
-                aria-label={`《${paper.title}》有 PDF，尚无本地直达链接`}
+                aria-label={`《${paper.title}》有 PDF，尚无可访问的来源链接`}
               >
                 <span className="resource-state" aria-hidden="true">✓</span>
                 <span>PDF</span>
@@ -4738,38 +4990,139 @@ export default function Home() {
                     />
                   </label>
 
-                  <div className="resource-editor-row">
+                  <div className="resource-editor-row pdf-source-editor">
                     <div className="resource-editor-heading">
-                      <label className="resource-toggle">
-                        <input
-                          type="checkbox"
-                          checked={editDraft.hasPdf}
-                          onChange={(event) =>
-                            updateEditDraft("hasPdf", event.target.checked)
-                          }
-                        />
-                        <span>有 PDF</span>
-                      </label>
+                      <span className="resource-editor-label">PDF 来源链接</span>
                       {safeExternalUrl(editDraft.pdfUrl) && (
                         <a
                           href={safeExternalUrl(editDraft.pdfUrl)}
                           target="_blank"
                           rel="noopener noreferrer"
                         >
-                          测试链接 ↗
+                          打开来源 ↗
                         </a>
                       )}
                     </div>
                     <input
                       type="url"
                       value={editDraft.pdfUrl}
-                      onChange={(event) => {
-                        updateEditDraft("pdfUrl", event.target.value);
-                        if (event.target.value.trim() && !editDraft.hasPdf) {
-                          updateEditDraft("hasPdf", true);
-                        }
-                      }}
+                      onChange={(event) =>
+                        updateEditDraft("pdfUrl", event.target.value)
+                      }
                       placeholder="PDF 直达链接，可留空"
+                    />
+                    <small>
+                      卡片首次打开此来源时会在后台保存 PDF；留空可仅保留本地副本。
+                    </small>
+                  </div>
+
+                  <div
+                    className={`pdf-archive-panel ${
+                      editingPaper.pdfArchive?.status
+                        ? `is-${editingPaper.pdfArchive.status}`
+                        : "is-missing"
+                    }`}
+                    aria-live="polite"
+                  >
+                    <div className="pdf-archive-heading">
+                      <span>本地副本</span>
+                      <strong>
+                        {pdfActionBusyId === editingPaper.id
+                          ? "保存中…"
+                          : editPdfSourceChanged
+                            ? "来源待保存"
+                            : editingPaper.pdfArchive?.status === "ready"
+                              ? "已保存"
+                              : editingPaper.pdfArchive?.status === "stale"
+                                ? "待更新"
+                                : editingPaper.pdfArchive?.status === "failed"
+                                  ? "保存失败"
+                                  : "尚未保存"}
+                      </strong>
+                    </div>
+
+                    {pdfActionBusyId === editingPaper.id ? (
+                      <p>正在验证并保存 PDF；可以继续编辑其他信息。</p>
+                    ) : editPdfSourceChanged ? (
+                      <p>保存来源链接后，本地副本会标记为待更新。</p>
+                    ) : editingPaper.pdfArchive?.status === "ready" ? (
+                      <p>
+                        已保存到本机
+                        {formatPdfSize(editingPaper.pdfArchive.sizeBytes)
+                          ? ` · ${formatPdfSize(editingPaper.pdfArchive.sizeBytes)}`
+                          : ""}
+                        {formatPdfArchiveTime(editingPaper.pdfArchive.downloadedAt)
+                          ? ` · ${formatPdfArchiveTime(editingPaper.pdfArchive.downloadedAt)}`
+                          : ""}
+                      </p>
+                    ) : editingPaper.pdfArchive?.status === "stale" ? (
+                      <p>
+                        当前来源链接已更新；下载新版本前不会将旧副本作为默认 PDF 打开。
+                      </p>
+                    ) : editingPaper.pdfArchive?.status === "failed" ? (
+                      <p>
+                        {editingPaper.pdfArchive.errorMessage ||
+                          "自动保存失败，可重试或选择本地 PDF。"}
+                      </p>
+                    ) : (
+                      <p>尚未保存到本地；打开卡片中的 PDF 时会自动归档。</p>
+                    )}
+
+                    <div className="pdf-archive-actions">
+                      {editingPaper.pdfArchive?.status === "ready" && (
+                        <a
+                          href={pdfOpenUrl(editingPaper.id)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          打开本地 ↗
+                        </a>
+                      )}
+                      {safeExternalUrl(editDraft.pdfUrl) && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void archivePaperPdf(editingPaper, {
+                              force:
+                                editingPaper.pdfArchive?.status === "ready",
+                            })
+                          }
+                          disabled={
+                            pdfActionBusyId === editingPaper.id ||
+                            editPdfSourceChanged
+                          }
+                        >
+                          {editingPaper.pdfArchive?.status === "ready"
+                            ? "重新下载"
+                            : editingPaper.pdfArchive?.status === "stale"
+                              ? "下载新版本"
+                              : "下载到本地"}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => pdfImportInputRef.current?.click()}
+                        disabled={pdfActionBusyId === editingPaper.id}
+                      >
+                        选择本地 PDF
+                      </button>
+                      {editingPaper.pdfArchive?.status === "ready" && (
+                        <button
+                          type="button"
+                          className="pdf-archive-danger"
+                          onClick={() => void deleteLocalPdf(editingPaper)}
+                          disabled={pdfActionBusyId === editingPaper.id}
+                        >
+                          删除副本
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      ref={pdfImportInputRef}
+                      className="pdf-import-input"
+                      type="file"
+                      accept="application/pdf,.pdf"
+                      onChange={handlePdfImport}
                     />
                   </div>
 
@@ -5582,16 +5935,15 @@ export default function Home() {
                           <input
                             type="checkbox"
                             checked={selected}
-                            onChange={() =>
-                              updatePaperIntakeDraft(
-                                "categoryIds",
-                                selected
-                                  ? paperIntakeDraft.categoryIds.filter(
-                                      (id) => id !== category.id,
-                                    )
-                                  : [...paperIntakeDraft.categoryIds, category.id],
-                              )
-                            }
+                              onChange={() =>
+                                updatePaperIntakeDraft(
+                                  "categoryIds",
+                                  toggleCategorySelection(
+                                    category.id,
+                                    paperIntakeDraft.categoryIds,
+                                  ),
+                                )
+                              }
                           />
                           <span>{category.path.join(" › ")}</span>
                         </label>

@@ -22,6 +22,8 @@ export async function startLocalDevelopment({
   dbPath,
   backupDir,
   seedPath,
+  pdfDirectory,
+  pdfFetch,
   frontendArgs = ["dev"],
   spawnFrontend = true,
 } = {}) {
@@ -30,6 +32,8 @@ export async function startLocalDevelopment({
     ...(dbPath ? { dbPath } : {}),
     ...(backupDir ? { backupDir } : {}),
     ...(seedPath !== undefined ? { seedPath } : {}),
+    ...(pdfDirectory ? { pdfDirectory } : {}),
+    ...(pdfFetch ? { pdfFetch } : {}),
   });
   const address = await api.listen();
 
@@ -83,9 +87,13 @@ async function main() {
     ...(process.env.LIBRARY_SEED_PATH
       ? { seedPath: process.env.LIBRARY_SEED_PATH }
       : {}),
+    ...(process.env.LIBRARY_PDF_DIR
+      ? { pdfDirectory: process.env.LIBRARY_PDF_DIR }
+      : {}),
   });
   console.log(`本地文献数据库：${local.api.repository.dbPath}`);
   console.log(`iCloud 备份目录：${local.api.repository.backupDir}`);
+  console.log(`PDF 本地目录：${local.api.pdfArchiveService.pdfDirectory}`);
   console.log(`本地文献库 API：${local.address.url}`);
 
   let shuttingDown = false;

@@ -1368,6 +1368,17 @@ test("既有数据库幂等补列并迁移旧待看分类成员", async (t) => {
       false,
     );
     assert.equal(
+      Boolean(
+        migrated
+          .prepare(
+            `SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'paper_pdf_archives'`,
+          )
+          .get(),
+      ),
+      true,
+    );
+    assert.equal(
       Number(
         migrated
           .prepare(

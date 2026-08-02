@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
+import { createReadStream } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   createLibraryRepository,
+  NotFoundError,
   ValidationError,
 } from "./library-repository.mjs";
 import { createAiService } from "./ai/ai-service.mjs";
 import { MacOsKeychainCredentialStore } from "./ai/credential-store.mjs";
 import { createAiProviders } from "./ai/providers.mjs";
 import { createPaperIntakeService } from "./paper-intake.mjs";
+import { createPdfArchiveService } from "./pdf-archive-service.mjs";
 
 export const DEFAULT_API_PORT = 4317;
 export const API_HOST = "127.0.0.1";
@@ -76,6 +79,93 @@ function sendNoContent(response, request) {
   response.end();
 }
 
+function sendRedirect(response, request, location) {
+  response.writeHead(302, {
+    ...responseHeaders(request, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Length": "0",
+      Location: location,
+      "Referrer-Policy": "no-referrer",
+    }),
+  });
+  response.end();
+}
+
+function pdfFilename(title) {
+  const name = String(title ?? "论文")
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 120);
+  return `${name || "论文"}.pdf`;
+}
+
+function parsePdfRange(value, sizeBytes) {
+  if (!value) return { start: 0, end: sizeBytes - 1 };
+  const match = String(value).match(/^bytes=(\d*)-(\d*)$/u);
+  if (!match) return null;
+  const [, startText, endText] = match;
+  if (!startText && !endText) return null;
+  if (!startText) {
+    const suffixLength = Number(endText);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null;
+    return {
+      start: Math.max(0, sizeBytes - suffixLength),
+      end: sizeBytes - 1,
+    };
+  }
+  const start = Number(startText);
+  const end = endText ? Number(endText) : sizeBytes - 1;
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    start >= sizeBytes
+  ) {
+    return null;
+  }
+  return { start, end: Math.min(end, sizeBytes - 1) };
+}
+
+function sendPdfFile(response, request, file, title) {
+  const range = parsePdfRange(request.headers.range, file.sizeBytes);
+  if (!range) {
+    response.writeHead(416, {
+      ...responseHeaders(request, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Range": `bytes */${file.sizeBytes}`,
+        "Content-Length": "0",
+        "Accept-Ranges": "bytes",
+      }),
+    });
+    response.end();
+    return;
+  }
+  const length = range.end - range.start + 1;
+  const partial = Boolean(request.headers.range);
+  const filename = pdfFilename(title);
+  response.writeHead(partial ? 206 : 200, {
+    ...responseHeaders(request, {
+      "Content-Type": "application/pdf",
+      "Content-Length": String(length),
+      "Accept-Ranges": "bytes",
+      ...(partial
+        ? { "Content-Range": `bytes ${range.start}-${range.end}/${file.sizeBytes}` }
+        : {}),
+      "Content-Disposition": `inline; filename="paper.pdf"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "private, no-store",
+    }),
+  });
+  const stream = createReadStream(file.path, {
+    start: range.start,
+    end: range.end,
+  });
+  stream.once("error", () => response.destroy());
+  stream.pipe(response);
+}
+
 function assertAiRequestOrigin(request) {
   const origin = request.headers.origin;
   if (origin && !allowedOrigin(origin)) {
@@ -84,6 +174,34 @@ function assertAiRequestOrigin(request) {
     error.code = "ORIGIN_NOT_ALLOWED";
     throw error;
   }
+}
+
+function assertPdfRequestOrigin(request) {
+  const origin = request.headers.origin;
+  if (origin && !allowedOrigin(origin)) {
+    const error = new Error("PDF 归档接口只接受本机页面请求。");
+    error.statusCode = 403;
+    error.code = "ORIGIN_NOT_ALLOWED";
+    throw error;
+  }
+}
+
+function readPdfArchiveOptions(input) {
+  if (
+    input === null ||
+    typeof input !== "object" ||
+    Array.isArray(input)
+  ) {
+    throw new ValidationError("请求正文必须是 JSON 对象。");
+  }
+  const fields = Object.keys(input);
+  if (fields.some((field) => field !== "force")) {
+    throw new ValidationError("PDF 归档请求仅支持 force 字段。");
+  }
+  if (input.force !== undefined && typeof input.force !== "boolean") {
+    throw new ValidationError("force 必须是布尔值。");
+  }
+  return { force: input.force === true };
 }
 
 async function readJsonBody(request) {
@@ -189,7 +307,12 @@ function errorPayload(error) {
   };
 }
 
-function createRequestHandler(repository, aiService, paperIntakeService) {
+function createRequestHandler(
+  repository,
+  aiService,
+  paperIntakeService,
+  pdfArchiveService,
+) {
   return async (request, response) => {
     try {
       if (request.method === "OPTIONS") {
@@ -296,6 +419,49 @@ function createRequestHandler(repository, aiService, paperIntakeService) {
           await readJsonBody(request),
         );
         sendJson(response, request, 201, result);
+        return;
+      }
+
+      const openPdfId = routePaperId(pathname, "pdf/open");
+      if (request.method === "GET" && openPdfId !== null) {
+        const paper = repository.getPaper(openPdfId);
+        if (!paper) throw new NotFoundError("未找到论文。");
+        const localPdf = await pdfArchiveService.getLocalPdf(openPdfId);
+        if (localPdf) {
+          sendPdfFile(response, request, localPdf, paper.title);
+          return;
+        }
+        if (paper.pdfUrl) {
+          sendRedirect(response, request, paper.pdfUrl);
+          return;
+        }
+        const error = new Error("该论文尚未保存本地 PDF，也没有可访问的 PDF 来源链接。");
+        error.statusCode = 404;
+        error.code = "PDF_SOURCE_UNAVAILABLE";
+        throw error;
+      }
+
+      const archivePdfId = routePaperId(pathname, "pdf/archive");
+      if (request.method === "POST" && archivePdfId !== null) {
+        assertPdfRequestOrigin(request);
+        const options = readPdfArchiveOptions(await readOptionalJsonBody(request));
+        const result = await pdfArchiveService.archive(archivePdfId, options);
+        sendJson(response, request, 200, result);
+        return;
+      }
+
+      if (request.method === "DELETE" && archivePdfId !== null) {
+        assertPdfRequestOrigin(request);
+        const result = await pdfArchiveService.removeLocalPdf(archivePdfId);
+        sendJson(response, request, 200, result);
+        return;
+      }
+
+      const importPdfId = routePaperId(pathname, "pdf/import");
+      if (request.method === "POST" && importPdfId !== null) {
+        assertPdfRequestOrigin(request);
+        const result = await pdfArchiveService.importPdf(importPdfId, request);
+        sendJson(response, request, 200, result);
         return;
       }
 
@@ -428,6 +594,10 @@ export async function createLibraryApi({
   credentialStore,
   aiFetch,
   metadataFetch,
+  pdfArchiveService,
+  pdfDirectory,
+  pdfFetch,
+  allowPrivatePdfNetwork,
 } = {}) {
   const ownsRepository = !repository;
   const libraryRepository =
@@ -453,11 +623,20 @@ export async function createLibraryApi({
     aiService: localAiService,
     ...(metadataFetch ? { fetchImpl: metadataFetch } : {}),
   });
+  const localPdfArchiveService =
+    pdfArchiveService ??
+    createPdfArchiveService({
+      repository: libraryRepository,
+      ...(pdfDirectory ? { pdfDirectory } : {}),
+      ...(pdfFetch ? { fetchImpl: pdfFetch } : {}),
+      ...(allowPrivatePdfNetwork ? { allowPrivateNetwork: true } : {}),
+    });
   const server = createServer(
     createRequestHandler(
       libraryRepository,
       localAiService,
       paperIntakeService,
+      localPdfArchiveService,
     ),
   );
   let started = false;
@@ -467,6 +646,7 @@ export async function createLibraryApi({
     repository: libraryRepository,
     aiService: localAiService,
     paperIntakeService,
+    pdfArchiveService: localPdfArchiveService,
     server,
 
     async listen(overridePort = port) {
@@ -529,6 +709,9 @@ async function main() {
       : {}),
     ...(process.env.LIBRARY_SEED_PATH
       ? { seedPath: process.env.LIBRARY_SEED_PATH }
+      : {}),
+    ...(process.env.LIBRARY_PDF_DIR
+      ? { pdfDirectory: process.env.LIBRARY_PDF_DIR }
       : {}),
   });
   const address = await api.listen();
