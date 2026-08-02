@@ -280,7 +280,12 @@ function publicationYear(value) {
 
 function crossrefMetadata(message, doi) {
   const links = Array.isArray(message.link) ? message.link : [];
-  const pdfUrl = links.find((link) => /pdf/iu.test(link?.["content-type"] ?? ""))?.URL ?? "";
+  const pdfUrl =
+    links.find(
+      (link) =>
+        /pdf/iu.test(link?.["content-type"] ?? "") ||
+        /\/(?:e?pdf)(?:\/|$)/iu.test(link?.URL ?? ""),
+    )?.URL ?? "";
   const source =
     message["container-title"]?.[0] ||
     message.event?.name ||
@@ -867,13 +872,29 @@ async function fetchWebPage(fetchImpl, inputUrl) {
 function referenceKind(reference) {
   const doi = normalizeDoi(reference);
   const arxivId = normalizeArxivId(reference);
-  if (/^(?:doi:\s*)?10\.\d{4,9}\//iu.test(reference) || /doi\.org\//iu.test(reference)) {
-    return { kind: "doi", value: doi };
+  const url = normalizePaperUrl(reference);
+  if (
+    doi &&
+    (/^(?:doi:\s*)?10\.\d{4,9}\//iu.test(reference) ||
+      /doi\.org\//iu.test(reference) ||
+      (url && normalizeDoi(new URL(url).pathname) === doi))
+  ) {
+    const pdfUrl =
+      url &&
+      (/\/(?:e?pdf)(?:\/|$)/iu.test(new URL(url).pathname) ||
+        /\.pdf$/iu.test(new URL(url).pathname))
+        ? url
+        : "";
+    return {
+      kind: "doi",
+      value: doi,
+      ...(url ? { sourceUrl: url } : {}),
+      ...(pdfUrl ? { pdfUrl } : {}),
+    };
   }
   if (/^(?:arxiv:\s*)?(?:\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z-]+)?\/\d{7})(?:v\d+)?$/iu.test(reference) || /arxiv\.org\//iu.test(reference)) {
     return { kind: "arxiv", value: arxivId };
   }
-  const url = normalizePaperUrl(reference);
   if (url) return { kind: "url", value: url };
   if (doi) return { kind: "doi", value: doi };
   if (arxivId) return { kind: "arxiv", value: arxivId };
@@ -884,7 +905,22 @@ function referenceKind(reference) {
 
 async function resolveMetadata(fetchImpl, reference) {
   const parsed = referenceKind(reference);
-  if (parsed.kind === "doi") return fetchCrossref(fetchImpl, parsed.value);
+  if (parsed.kind === "doi") {
+    const metadata = await fetchCrossref(fetchImpl, parsed.value);
+    return {
+      ...metadata,
+      pdfUrl: parsed.pdfUrl || metadata.pdfUrl,
+      identifiers: dedupePaperIdentifiers([
+        ...(metadata.identifiers ?? []),
+        ...(parsed.sourceUrl
+          ? [{ kind: "url", value: parsed.sourceUrl }]
+          : []),
+      ]),
+      ...(!parsed.pdfUrl && parsed.sourceUrl
+        ? { resourcePageUrl: parsed.sourceUrl }
+        : {}),
+    };
+  }
   if (parsed.kind === "arxiv") return fetchArxiv(fetchImpl, parsed.value);
   return fetchWebPage(fetchImpl, parsed.value);
 }

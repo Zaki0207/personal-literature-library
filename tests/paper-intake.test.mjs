@@ -509,6 +509,58 @@ test("PDF 直链不会按网页大小拒绝，并会从对应论文页补全元�
   assert.match(prompts[0], /mesh-free neural fluid method/u);
 });
 
+test("包含 DOI 的 ACM ePDF 链接绕过浏览器挑战并保留为 PDF 资源", async (t) => {
+  const epdfUrl = "https://dl.acm.org/doi/epdf/10.1145/3680528.3687628";
+  let acmRequests = 0;
+  const fixture = await makeFixture(t, "publisher-doi-pdf", {
+    fetchImpl: async (url) => {
+      const href = String(url);
+      if (href.startsWith("https://dl.acm.org/")) {
+        acmRequests += 1;
+        return new Response("Cloudflare challenge", { status: 403 });
+      }
+      if (
+        /api\.crossref\.org\/works\/10\.1145%2F3680528\.3687628/u.test(
+          href,
+        )
+      ) {
+        return crossrefResponse({
+          doi: "10.1145/3680528.3687628",
+          title: "Neural Implicit Reduced Fluid Simulation",
+          institution: "McGill University",
+          source: "SIGGRAPH Asia 2024 Conference Papers",
+          abstract: "",
+          published: [2024, 12, 3],
+        });
+      }
+      throw new Error(`未预期的请求：${href}`);
+    },
+  });
+
+  const result = await fixture.service.analyze({ reference: epdfUrl });
+
+  assert.equal(result.status, "ready");
+  assert.equal(result.draft.title, "Neural Implicit Reduced Fluid Simulation");
+  assert.equal(result.draft.source, "SIGGRAPH Asia 2024");
+  assert.equal(result.draft.pdfUrl, epdfUrl);
+  assert.equal(result.draft.hasPdf, true);
+  assert.equal(result.draft.originalUrl, "https://doi.org/10.1145/3680528.3687628");
+  assert.equal(acmRequests, 0);
+  assert.ok(
+    result.draft.identifiers.some(
+      (identifier) =>
+        identifier.kind === "doi" &&
+        identifier.value === "10.1145/3680528.3687628",
+    ),
+  );
+  assert.ok(
+    result.draft.identifiers.some(
+      (identifier) =>
+        identifier.kind === "url" && identifier.value === epdfUrl,
+    ),
+  );
+});
+
 test("超过安全上限的普通网页仍会被拒绝", async (t) => {
   const fixture = await makeFixture(t, "oversized-html", {
     fetchImpl: async () =>
