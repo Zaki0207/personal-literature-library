@@ -293,6 +293,7 @@ type RadarItem = {
 type RadarStateResponse = {
   settings: {
     prompt: string;
+    promptTemplate: string;
     requestedCount: number;
     updatedAt?: string;
   };
@@ -357,6 +358,10 @@ type RadarAiTraceResponse = {
   trace: RadarAiTrace | null;
 };
 
+type RadarPromptTemplateResponse = {
+  promptTemplate: string;
+};
+
 type FlatCategory = Category & {
   depth: number;
   path: string[];
@@ -381,6 +386,12 @@ const paperSearchFieldLabels: Record<string, string> = {
 };
 
 const legacyWatchCategoryIds = new Set(["BGPSP4JY"]);
+const radarPromptTemplateVariables = [
+  "{{research_scope}}",
+  "{{round}}",
+  "{{requested_count}}",
+  "{{exclusions_json}}",
+] as const;
 const initialPapers: Paper[] = [];
 const initialCategories: Category[] = [];
 const initialCategoryRecords: CategoryRecord[] = [];
@@ -723,6 +734,10 @@ export default function Home() {
   const [radarAiTrace, setRadarAiTrace] = useState<RadarAiTrace | null>(null);
   const [radarAiTraceLoading, setRadarAiTraceLoading] = useState(false);
   const [radarAiTraceError, setRadarAiTraceError] = useState("");
+  const [radarPromptEditorOpen, setRadarPromptEditorOpen] = useState(false);
+  const [radarPromptTemplateDraft, setRadarPromptTemplateDraft] = useState("");
+  const [radarPromptTemplateBusy, setRadarPromptTemplateBusy] = useState(false);
+  const [radarPromptTemplateError, setRadarPromptTemplateError] = useState("");
   const [activeScope, setActiveScope] = useState("all");
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("recent");
@@ -853,8 +868,17 @@ export default function Home() {
     aiSettingsOpen ||
     categoryManagerOpen ||
     radarAiTraceOpen ||
+    radarPromptEditorOpen ||
     editingPaperId !== null ||
     titlePreviewPaperId !== null;
+  const radarPromptTemplateDirty = Boolean(
+    radarState &&
+      radarPromptTemplateDraft !== radarState.settings.promptTemplate,
+  );
+  const missingRadarPromptTemplateVariables =
+    radarPromptTemplateVariables.filter(
+      (variable) => !radarPromptTemplateDraft.includes(variable),
+    );
   const sidebarExpanded = isMobile ? mobileNavOpen : !sidebarCollapsed;
   const editingPaper = editingPaperId
     ? papers.find((paper) => paper.id === editingPaperId) ?? null
@@ -1875,6 +1899,81 @@ export default function Home() {
     setOpenMenu(null);
     setFiltersOpen(false);
     setTextSizeOpen(false);
+  };
+
+  const openRadarPromptEditor = () => {
+    modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarPromptTemplateDraft(radarState?.settings.promptTemplate ?? "");
+    setRadarPromptTemplateError("");
+    setRadarPromptEditorOpen(true);
+  };
+
+  const closeRadarPromptEditor = () => {
+    setRadarPromptEditorOpen(false);
+    setRadarPromptTemplateError("");
+  };
+
+  const requestCloseRadarPromptEditor = () => {
+    if (radarPromptTemplateBusy) return;
+    if (
+      radarPromptTemplateDirty &&
+      !window.confirm("完整提示词模板尚未保存，确定放弃修改？")
+    ) {
+      return;
+    }
+    closeRadarPromptEditor();
+  };
+
+  const restoreDefaultRadarPromptTemplate = async () => {
+    if (radarPromptTemplateBusy) return;
+    setRadarPromptTemplateBusy(true);
+    setRadarPromptTemplateError("");
+    try {
+      const response = await libraryRequest<RadarPromptTemplateResponse>(
+        "/radar/prompt-template/default",
+      );
+      setRadarPromptTemplateDraft(response.promptTemplate);
+      setToast("默认模板已载入，保存后生效");
+    } catch (error) {
+      setRadarPromptTemplateError(
+        error instanceof Error ? error.message : "默认模板读取失败。",
+      );
+    } finally {
+      setRadarPromptTemplateBusy(false);
+    }
+  };
+
+  const saveRadarPromptTemplate = async () => {
+    if (
+      radarPromptTemplateBusy ||
+      !radarPromptTemplateDirty ||
+      missingRadarPromptTemplateVariables.length
+    ) {
+      return;
+    }
+    setRadarPromptTemplateBusy(true);
+    setRadarPromptTemplateError("");
+    try {
+      const response = await libraryRequest<RadarStateResponse>(
+        "/radar/prompt-template",
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            promptTemplate: radarPromptTemplateDraft,
+          }),
+        },
+      );
+      applyRadarSnapshot(response);
+      setRadarPromptTemplateDraft(response.settings.promptTemplate);
+      setRadarPromptEditorOpen(false);
+      setToast("完整提示词模板已保存");
+    } catch (error) {
+      setRadarPromptTemplateError(
+        error instanceof Error ? error.message : "完整提示词模板保存失败。",
+      );
+    } finally {
+      setRadarPromptTemplateBusy(false);
+    }
   };
 
   const closeRadarAiTrace = () => {
@@ -4380,6 +4479,22 @@ export default function Home() {
           />
         </label>
 
+        <div className="radar-template-entry">
+          <div>
+            <strong>完整提示词模板</strong>
+            <span>高级设置；日常检索只需编辑上方要求</span>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={openRadarPromptEditor}
+            disabled={!radarState || radarBusy}
+          >
+            <span aria-hidden="true">⌘</span>
+            编辑完整提示词
+          </button>
+        </div>
+
         <div className="radar-system-context">
           <button
             type="button"
@@ -5879,6 +5994,127 @@ export default function Home() {
                 </section>
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {radarPromptEditorOpen && (
+        <div
+          className="modal-layer"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) {
+              requestCloseRadarPromptEditor();
+            }
+          }}
+        >
+          <section
+            ref={modalRef}
+            className="modal radar-prompt-template-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="radar-prompt-template-title"
+            aria-describedby="radar-prompt-template-description"
+            aria-busy={radarPromptTemplateBusy}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                requestCloseRadarPromptEditor();
+                return;
+              }
+              handleModalKeyDown(event);
+            }}
+          >
+            <div className="modal-heading radar-prompt-template-heading">
+              <div>
+                <h2 id="radar-prompt-template-title">编辑完整提示词</h2>
+                <p id="radar-prompt-template-description">
+                  除动态变量外，系统角色、来源要求、排重规则和输出格式均可编辑。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={requestCloseRadarPromptEditor}
+                aria-label="关闭完整提示词编辑器"
+                disabled={radarPromptTemplateBusy}
+                autoFocus
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="radar-prompt-template-content">
+              <div className="radar-template-variable-guide">
+                <strong>必须保留的动态变量</strong>
+                <p>运行时系统会把这些变量替换为本次实际内容。</p>
+                <div>
+                  <span><code>{"{{research_scope}}"}</code> 检索要求</span>
+                  <span><code>{"{{round}}"}</code> 当前轮次</span>
+                  <span><code>{"{{requested_count}}"}</code> 候选数量</span>
+                  <span><code>{"{{exclusions_json}}"}</code> 本机排除清单</span>
+                </div>
+              </div>
+
+              <label className="radar-prompt-template-field">
+                <span>完整提示词模板</span>
+                <textarea
+                  value={radarPromptTemplateDraft}
+                  onChange={(event) => {
+                    setRadarPromptTemplateDraft(event.target.value);
+                    setRadarPromptTemplateError("");
+                  }}
+                  maxLength={50_000}
+                  spellCheck={false}
+                  disabled={radarPromptTemplateBusy}
+                />
+              </label>
+
+              {missingRadarPromptTemplateVariables.length > 0 && (
+                <p className="radar-template-variable-error" role="alert">
+                  缺少必要变量：{missingRadarPromptTemplateVariables.join("、")}
+                </p>
+              )}
+              {radarPromptTemplateError && (
+                <p className="radar-error" role="alert">
+                  {radarPromptTemplateError}
+                </p>
+              )}
+            </div>
+
+            <footer className="radar-prompt-template-footer">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void restoreDefaultRadarPromptTemplate()}
+                disabled={radarPromptTemplateBusy}
+              >
+                恢复默认模板
+              </button>
+              <div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={requestCloseRadarPromptEditor}
+                  disabled={radarPromptTemplateBusy}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => void saveRadarPromptTemplate()}
+                  disabled={
+                    radarPromptTemplateBusy ||
+                    !radarPromptTemplateDirty ||
+                    missingRadarPromptTemplateVariables.length > 0 ||
+                    !radarPromptTemplateDraft.trim()
+                  }
+                >
+                  {radarPromptTemplateBusy ? "正在保存…" : "保存模板"}
+                </button>
+              </div>
+            </footer>
           </section>
         </div>
       )}

@@ -377,6 +377,30 @@ function createRequestHandler(
         return;
       }
 
+      if (
+        request.method === "GET" &&
+        pathname === "/api/radar/prompt-template/default"
+      ) {
+        assertAiRequestOrigin(request);
+        sendJson(response, request, 200, {
+          promptTemplate: literatureRadarService.getDefaultPromptTemplate(),
+        });
+        return;
+      }
+
+      if (
+        request.method === "PUT" &&
+        pathname === "/api/radar/prompt-template"
+      ) {
+        assertAiRequestOrigin(request);
+        const body = await readJsonBody(request);
+        const result = await literatureRadarService.savePromptTemplate(
+          body?.promptTemplate,
+        );
+        sendJson(response, request, 200, result);
+        return;
+      }
+
       if (request.method === "POST" && pathname === "/api/radar/run") {
         assertAiRequestOrigin(request);
         const result = await literatureRadarService.run(

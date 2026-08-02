@@ -4267,6 +4267,38 @@ a:focus-visible {
   outline: none;
 }
 
+.radar-template-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafbf9;
+}
+
+.radar-template-entry > div {
+  display: grid;
+  gap: 3px;
+}
+
+.radar-template-entry strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.radar-template-entry span {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.radar-template-entry > button {
+  min-height: 36px;
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
 .radar-system-context {
   overflow: hidden;
   border: 1px solid #d9e7e1;
@@ -4373,6 +4405,133 @@ a:focus-visible {
 .radar-trace-button {
   color: var(--ink);
   font-size: 12px;
+}
+
+.radar-prompt-template-modal {
+  display: grid;
+  width: min(980px, 100%);
+  height: min(820px, calc(100vh - 48px));
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 0;
+  overflow: hidden;
+}
+
+.radar-prompt-template-heading {
+  margin: 0;
+  padding: 23px 25px 19px;
+  border-bottom: 1px solid var(--line);
+}
+
+.radar-prompt-template-heading p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.radar-prompt-template-content {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  gap: 13px;
+  padding: 18px 22px 20px;
+  overflow: hidden;
+  background: #f7f8f6;
+}
+
+.radar-template-variable-guide {
+  padding: 12px 13px;
+  border: 1px solid #d9e7e1;
+  border-radius: 10px;
+  background: #f3f8f5;
+}
+
+.radar-template-variable-guide > strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.radar-template-variable-guide > p {
+  margin: 4px 0 9px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.radar-template-variable-guide > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.radar-template-variable-guide span {
+  padding: 5px 7px;
+  border: 1px solid #d7e3de;
+  border-radius: 7px;
+  background: white;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.radar-template-variable-guide code {
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.radar-prompt-template-field {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 7px;
+}
+
+.radar-prompt-template-field > span {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.radar-prompt-template-field textarea {
+  width: 100%;
+  min-height: 360px;
+  resize: none;
+  padding: 15px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: white;
+  color: #263632;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  tab-size: 2;
+}
+
+.radar-prompt-template-field textarea:focus {
+  border-color: #8faea5;
+  box-shadow: 0 0 0 4px rgba(21, 63, 59, 0.07);
+  outline: none;
+}
+
+.radar-template-variable-error {
+  margin: 0;
+  color: #94452f;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.radar-prompt-template-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--line);
+  background: var(--card);
+}
+
+.radar-prompt-template-footer > div {
+  display: flex;
+  gap: 8px;
 }
 
 .radar-ai-trace-modal {
@@ -4888,7 +5047,9 @@ a:focus-visible {
 
   .radar-composer-buttons,
   .radar-ai-trace-footer,
-  .radar-ai-trace-exchange > header {
+  .radar-ai-trace-exchange > header,
+  .radar-template-entry,
+  .radar-prompt-template-footer {
     align-items: stretch;
     flex-direction: column;
   }
@@ -4905,6 +5066,37 @@ a:focus-visible {
 
   .radar-ai-trace-modal {
     height: calc(100vh - 24px);
+  }
+
+  .radar-prompt-template-modal {
+    height: calc(100vh - 24px);
+  }
+
+  .radar-prompt-template-heading {
+    padding: 20px 18px 16px;
+  }
+
+  .radar-prompt-template-content {
+    padding: 14px 13px 16px;
+    overflow-y: auto;
+  }
+
+  .radar-prompt-template-field textarea {
+    min-height: 420px;
+  }
+
+  .radar-prompt-template-footer {
+    padding: 13px;
+  }
+
+  .radar-prompt-template-footer > button,
+  .radar-prompt-template-footer > div,
+  .radar-template-entry > button {
+    width: 100%;
+  }
+
+  .radar-prompt-template-footer > div > button {
+    flex: 1;
   }
 
   .radar-ai-trace-heading {

@@ -4,6 +4,7 @@ import {
   normalizePaperTitle,
   normalizePaperUrl,
 } from "./paper-identifiers.mjs";
+import { DEFAULT_RADAR_PROMPT_TEMPLATE } from "./library-repository.mjs";
 
 const MAX_ROUNDS = 3;
 const MAX_AI_EXCLUSION_CHARS = 80_000;
@@ -204,25 +205,18 @@ function compactExclusions(exclusions) {
   };
 }
 
-function searchPrompt({ userPrompt, requested, exclusions, round }) {
-  return `你是网站内置的文献雷达。必须使用联网检索查找真实论文，并核验标题、作者、出处和原文链接。
-
-用户可编辑的研究范围：
-${userPrompt}
-
-本轮任务：
-- 这是第 ${round} 轮检索。
-- 请返回 ${requested} 篇候选论文，尽量覆盖不同工作。
-- 不得推荐下面排除清单中的任何论文，也不得推荐同一论文的不同链接或标题变体。
-- 只返回有 DOI、arXiv 编号或可核验原文 URL 的论文。
-- recommendationReason 说明它与用户研究范围的具体关系；aiSummary 用中文简要概括论文贡献。
-- 不要编造论文、作者、出处或链接。
-
-排除清单（来自当前知识库、历史待审/已加入/已丢弃记录及本次检索结果）：
-${JSON.stringify(exclusions)}
-
-只输出一个合法 JSON 对象，不要输出 Markdown 或额外文字。格式必须是：
-{"papers":[{"title":"英文原题","zhTitle":"中文译题","authors":"作者，多个作者用逗号分隔","institution":"主要机构","source":"期刊/会议/arXiv","date":"YYYY-MM-DD 或 YYYY","aiSummary":"中文摘要","recommendationReason":"中文推荐理由","originalUrl":"论文原文或 DOI/arXiv 页面","pdfUrl":"可选 PDF URL","identifiers":[{"kind":"doi|arxiv|url","value":"规范标识"}]}]}`;
+function searchPrompt({ template, userPrompt, requested, exclusions, round }) {
+  const replacements = new Map([
+    ["{{research_scope}}", userPrompt],
+    ["{{round}}", String(round)],
+    ["{{requested_count}}", String(requested)],
+    ["{{exclusions_json}}", JSON.stringify(exclusions)],
+  ]);
+  let rendered = template;
+  for (const [variable, replacement] of replacements) {
+    rendered = rendered.replaceAll(variable, () => replacement);
+  }
+  return rendered;
 }
 
 export function createLiteratureRadarService({ repository, aiService }) {
@@ -239,9 +233,22 @@ export function createLiteratureRadarService({ repository, aiService }) {
       return repository.getRadarAiTrace();
     },
 
+    getDefaultPromptTemplate() {
+      return DEFAULT_RADAR_PROMPT_TEMPLATE;
+    },
+
+    async savePromptTemplate(value) {
+      await repository.saveRadarPromptTemplate(value);
+      return repository.getRadarState();
+    },
+
     async run(input) {
       const { prompt, count } = validateRunInput(input);
-      await repository.saveRadarSettings({ prompt, count });
+      const savedSettings = await repository.saveRadarSettings({
+        prompt,
+        count,
+      });
+      const promptTemplate = savedSettings.settings.promptTemplate;
 
       const trace = {
         status: "running",
@@ -281,6 +288,7 @@ export function createLiteratureRadarService({ repository, aiService }) {
           const remaining = count - accepted.length;
           const requested = Math.min(30, remaining + Math.min(5, remaining));
           const aiPrompt = searchPrompt({
+            template: promptTemplate,
             userPrompt: prompt,
             requested,
             exclusions: [...compact.provided, ...transientExclusions],

@@ -55,6 +55,43 @@ const PAPER_SOURCES_NORMALIZATION_MIGRATION_ID =
   "normalize-paper-publication-sources-v1";
 export const DEFAULT_RADAR_PROMPT =
   "请检索与我的研究方向高度相关、近期值得阅读的论文。优先推荐有明确学术来源、可核验原文链接，并说明每篇论文为什么值得我关注。";
+export const DEFAULT_RADAR_PROMPT_TEMPLATE = `你是网站内置的文献雷达。必须使用联网检索查找真实论文，并核验标题、作者、出处和原文链接。
+
+用户可编辑的研究范围：
+{{research_scope}}
+
+本轮任务：
+- 这是第 {{round}} 轮检索。
+- 请返回 {{requested_count}} 篇候选论文，尽量覆盖不同工作。
+- 不得推荐下面排除清单中的任何论文，也不得推荐同一论文的不同链接、标题或发表版本。
+- 只返回有 DOI、arXiv 编号或可核验原文 URL 的论文。
+- recommendationReason 必须具体说明论文与用户研究范围的关系，以及相对现有知识库带来的新增价值。
+- aiSummary 使用中文概括论文解决的问题、核心方法和主要贡献。
+- 不要编造论文、作者、出处、录用状态或链接。
+
+检索来源要求：
+- 不得只检索 arXiv，必须同时搜索正式会议论文集、期刊官网和权威论文数据库。
+- 计算机图形学与视觉方向优先覆盖 ACM SIGGRAPH、SIGGRAPH Asia、ACM Transactions on Graphics（TOG）、CVPR、ICCV、ECCV、Eurographics、Computer Graphics Forum 和 SCA。
+- 人工智能与机器学习方向可覆盖 NeurIPS、ICLR、ICML 和 AAAI，但仅推荐与用户研究范围直接相关的论文。
+- 相关顶级期刊优先覆盖 IEEE TPAMI、IJCV、IEEE TVCG、IEEE TIP，以及该研究方向公认的高质量同行评审期刊。
+- 优先核查 ACM Digital Library、CVF Open Access、IEEE Xplore、SpringerLink、OpenReview、PMLR、期刊官网或会议官网。
+- 优先推荐近 3 年正式发表或已被会议接收的论文；特别重要的经典工作可以不受时间限制。
+- 在数量允许时，正式会议或期刊论文应占多数；arXiv 仅用于补充尚未正式发表的最新工作。
+- 如果 arXiv 论文已有正式会议或期刊版本，必须优先推荐正式版本，并使用正式出处和 DOI。
+- 同一论文的 arXiv、会议、期刊、作者主页和项目页版本只能推荐一次。
+- 如果没有足够数量的高可信度、不重复论文，应少返回，不得用低质量、重复或无法核验的论文补足。
+
+排除清单（来自当前知识库、历史待审/已加入/已丢弃记录及本次检索结果）：
+{{exclusions_json}}
+
+只输出一个合法 JSON 对象，不要输出 Markdown 或额外文字。格式必须是：
+{"papers":[{"title":"英文原题","zhTitle":"中文译题","authors":"作者，多个作者用逗号分隔","institution":"主要机构","source":"期刊/会议/arXiv","date":"YYYY-MM-DD 或 YYYY","aiSummary":"中文摘要","recommendationReason":"中文推荐理由","originalUrl":"论文正式页面、原文或 DOI/arXiv 页面","pdfUrl":"可选 PDF URL","identifiers":[{"kind":"doi|arxiv|url","value":"规范标识"}]}]}`;
+export const RADAR_PROMPT_TEMPLATE_VARIABLES = Object.freeze([
+  "{{research_scope}}",
+  "{{round}}",
+  "{{requested_count}}",
+  "{{exclusions_json}}",
+]);
 const RADAR_ITEM_STATUSES = new Set(["pending", "added", "discarded"]);
 const RADAR_AI_TRACE_STATUSES = new Set(["running", "completed", "failed"]);
 const MAX_CATEGORY_DEPTH = 3;
@@ -335,6 +372,29 @@ function validateRadarPrompt(value) {
     });
   }
   return prompt;
+}
+
+function validateRadarPromptTemplate(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ValidationError("完整提示词模板不能为空。", {
+      field: "promptTemplate",
+    });
+  }
+  if (value.length > 50_000) {
+    throw new ValidationError("完整提示词模板不能超过 50000 个字符。", {
+      field: "promptTemplate",
+    });
+  }
+  const missingVariables = RADAR_PROMPT_TEMPLATE_VARIABLES.filter(
+    (variable) => !value.includes(variable),
+  );
+  if (missingVariables.length) {
+    throw new ValidationError(
+      `完整提示词模板缺少必要变量：${missingVariables.join("、")}`,
+      { field: "promptTemplate", missingVariables },
+    );
+  }
+  return value.trim();
 }
 
 function validateRadarCount(value) {
@@ -1114,6 +1174,7 @@ export class LibraryRepository {
       CREATE TABLE IF NOT EXISTS radar_settings (
         id TEXT PRIMARY KEY CHECK (id = 'default'),
         prompt TEXT NOT NULL,
+        prompt_template TEXT NOT NULL DEFAULT '',
         requested_count INTEGER NOT NULL
           CHECK (requested_count BETWEEN 1 AND 30),
         updated_at TEXT NOT NULL
@@ -1187,6 +1248,10 @@ export class LibraryRepository {
         .prepare("PRAGMA table_info(papers)")
         .all()
         .map((column) => column.name);
+      const radarSettingColumns = this.db
+        .prepare("PRAGMA table_info(radar_settings)")
+        .all()
+        .map((column) => column.name);
       const alterations = [];
       if (!categoryColumns.includes("deleted_at")) {
         alterations.push(
@@ -1207,11 +1272,23 @@ export class LibraryRepository {
              CHECK (watch_later IN (0, 1))`,
         );
       }
+      if (!radarSettingColumns.includes("prompt_template")) {
+        alterations.push(
+          "ALTER TABLE radar_settings ADD COLUMN prompt_template TEXT NOT NULL DEFAULT ''",
+        );
+      }
       const removedKeywords = paperColumns.includes("keywords_json");
       if (removedKeywords) {
         alterations.push("ALTER TABLE papers DROP COLUMN keywords_json");
       }
       for (const statement of alterations) this.db.exec(statement);
+      this.db
+        .prepare(
+          `UPDATE radar_settings
+           SET prompt_template = ?
+           WHERE id = 'default' AND prompt_template = ''`,
+        )
+        .run(DEFAULT_RADAR_PROMPT_TEMPLATE);
       if (alterations.length) this.schemaMigrated = true;
       if (removedKeywords) {
         this.db
@@ -2035,13 +2112,16 @@ export class LibraryRepository {
     this.#assertOpen();
     const row = this.db
       .prepare(
-        `SELECT prompt, requested_count AS requestedCount,
+        `SELECT prompt, prompt_template AS promptTemplate,
+                requested_count AS requestedCount,
                 updated_at AS updatedAt
          FROM radar_settings WHERE id = 'default'`,
       )
       .get();
     return {
       prompt: row?.prompt ?? DEFAULT_RADAR_PROMPT,
+      promptTemplate:
+        row?.promptTemplate || DEFAULT_RADAR_PROMPT_TEMPLATE,
       requestedCount: Number(row?.requestedCount ?? 5),
       ...(row?.updatedAt ? { updatedAt: row.updatedAt } : {}),
     };
@@ -2925,6 +3005,26 @@ export class LibraryRepository {
       const backup = await this.#createBackup();
       return { settings: this.getRadarSettings(), backup };
     });
+  }
+
+  async saveRadarPromptTemplate(value) {
+    return this.#queueMutation(async () => {
+      const promptTemplate = validateRadarPromptTemplate(value);
+      const updatedAt = this.now().toISOString();
+      this.db
+        .prepare(
+          `UPDATE radar_settings
+           SET prompt_template = ?, updated_at = ?
+           WHERE id = 'default'`,
+        )
+        .run(promptTemplate, updatedAt);
+      const backup = await this.#createBackup();
+      return { settings: this.getRadarSettings(), backup };
+    });
+  }
+
+  async resetRadarPromptTemplate() {
+    return this.saveRadarPromptTemplate(DEFAULT_RADAR_PROMPT_TEMPLATE);
   }
 
   async saveRadarAiTrace(value) {

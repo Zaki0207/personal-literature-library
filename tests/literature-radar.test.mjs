@@ -120,6 +120,9 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
     body: JSON.stringify({ prompt: "检索测试方向的论文", count: 2 }),
   });
   assert.equal(firstRun.response.status, 200);
+  assert.match(firstRun.body.settings.promptTemplate, /SIGGRAPH/u);
+  assert.match(firstRun.body.settings.promptTemplate, /CVPR/u);
+  assert.match(firstRun.body.settings.promptTemplate, /IEEE TPAMI/u);
   assert.equal(firstRun.body.pending.length, 2);
   assert.deepEqual(
     firstRun.body.pending.map((item) => item.title).sort(),
@@ -147,6 +150,44 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
     webSearchReplies[0],
   );
   assert.match(firstTrace.body.trace.exchanges[0].prompt, /Existing Paper/u);
+  assert.match(firstTrace.body.trace.exchanges[0].prompt, /SIGGRAPH/u);
+
+  const invalidTemplate = await jsonRequest(
+    baseUrl,
+    "/api/radar/prompt-template",
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        promptTemplate: "只有 {{research_scope}}，缺少其他变量",
+      }),
+    },
+  );
+  assert.equal(invalidTemplate.response.status, 400);
+  assert.match(invalidTemplate.body.error.message, /exclusions_json/u);
+
+  const defaultTemplate = await jsonRequest(
+    baseUrl,
+    "/api/radar/prompt-template/default",
+  );
+  assert.equal(defaultTemplate.response.status, 200);
+  assert.match(defaultTemplate.body.promptTemplate, /SIGGRAPH Asia/u);
+
+  const customTemplate = [
+    "研究范围={{research_scope}}",
+    "第{{round}}轮；返回{{requested_count}}篇。",
+    "排除={{exclusions_json}}",
+    '只输出 {"papers":[]} 结构。',
+  ].join("\n");
+  const savedTemplate = await jsonRequest(
+    baseUrl,
+    "/api/radar/prompt-template",
+    {
+      method: "PUT",
+      body: JSON.stringify({ promptTemplate: customTemplate }),
+    },
+  );
+  assert.equal(savedTemplate.response.status, 200);
+  assert.equal(savedTemplate.body.settings.promptTemplate, customTemplate);
 
   const paperA = firstRun.body.pending.find((item) => item.title === "New Paper A");
   const discarded = await jsonRequest(
@@ -165,6 +206,10 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.equal(secondRun.body.lastRun.excludedHistory, 1);
   assert.equal(secondRun.body.pending.some((item) => item.title === "New Paper A"), false);
   assert.equal(secondRun.body.pending.some((item) => item.title === "New Paper C"), true);
+  assert.match(webSearchBodies[2].input, /研究范围=检索测试方向的论文/u);
+  assert.match(webSearchBodies[2].input, /第1轮；返回2篇/u);
+  assert.match(webSearchBodies[2].input, /New Paper A/u);
+  assert.doesNotMatch(webSearchBodies[2].input, /\{\{research_scope\}\}/u);
 
   const paperB = secondRun.body.pending.find((item) => item.title === "New Paper B");
   const added = await jsonRequest(
@@ -181,6 +226,7 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   const state = await jsonRequest(baseUrl, "/api/radar");
   assert.equal(state.response.status, 200);
   assert.equal(state.body.settings.prompt, "检索测试方向的论文");
+  assert.equal(state.body.settings.promptTemplate, customTemplate);
   assert.equal(state.body.counts.library, 2);
   assert.equal(state.body.pending.some((item) => item.title === "New Paper B"), false);
 });
