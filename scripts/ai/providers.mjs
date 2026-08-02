@@ -54,6 +54,7 @@ export function createProxyAwareFetch(environment = process.env) {
 }
 
 const defaultProviderFetch = createProxyAwareFetch();
+const WEB_SEARCH_TIMEOUT_MS = 20 * 60_000;
 
 export const AI_PROVIDER_DEFINITIONS = Object.freeze({
   openai: Object.freeze({
@@ -238,7 +239,7 @@ export class OpenAiProvider extends BaseProvider {
                 }
               : {}),
           },
-          ...(webSearch ? { timeoutMs: 120_000 } : {}),
+          ...(webSearch ? { timeoutMs: WEB_SEARCH_TIMEOUT_MS } : {}),
         },
       );
     } catch (error) {

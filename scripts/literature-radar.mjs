@@ -57,29 +57,71 @@ function stringValue(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function jsonObjectCandidates(value) {
+  const candidates = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (character === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        candidates.push(value.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  return candidates;
+}
+
 function parsePaperResponse(text) {
-  const raw = String(text ?? "").trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "");
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start < 0 || end <= start) {
+  const raw = String(text ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/iu, "")
+    .replace(/\s*```$/u, "");
+  const candidates = [...new Set([raw, ...jsonObjectCandidates(raw)])].filter(
+    Boolean,
+  );
+  if (!candidates.length) {
     throw new LiteratureRadarError("AI 没有返回可识别的论文列表，请重试。", {
       code: "RADAR_INVALID_AI_RESPONSE",
     });
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw.slice(start, end + 1));
-  } catch {
-    throw new LiteratureRadarError("AI 返回的论文列表格式无效，请重试。", {
-      code: "RADAR_INVALID_AI_RESPONSE",
-    });
+  let parsedObject = false;
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      parsedObject = true;
+      if (Array.isArray(parsed?.papers)) return parsed.papers;
+    } catch {
+      // Continue in case the model placed a valid JSON object after prose or citations.
+    }
   }
-  if (!Array.isArray(parsed?.papers)) {
+  if (parsedObject) {
     throw new LiteratureRadarError("AI 返回结果中缺少 papers 数组，请重试。", {
       code: "RADAR_INVALID_AI_RESPONSE",
     });
   }
-  return parsed.papers;
+  throw new LiteratureRadarError("AI 返回的论文列表格式无效，请重试。", {
+    code: "RADAR_INVALID_AI_RESPONSE",
+  });
 }
 
 function candidateFromAi(raw) {
@@ -210,7 +252,10 @@ export function createLiteratureRadarService({ repository, aiService }) {
         excludedHistory: 0,
         excludedWithinRun: 0,
         invalid: 0,
+        invalidResponses: 0,
       };
+      let validResponseCount = 0;
+      let lastInvalidResponseError = null;
 
       for (let round = 1; round <= MAX_ROUNDS && accepted.length < count; round += 1) {
         const remaining = count - accepted.length;
@@ -225,7 +270,16 @@ export function createLiteratureRadarService({ repository, aiService }) {
           webSearch: true,
         });
         stats.rounds = round;
-        const rawPapers = parsePaperResponse(result.text);
+        let rawPapers;
+        try {
+          rawPapers = parsePaperResponse(result.text);
+          validResponseCount += 1;
+        } catch (error) {
+          if (error?.code !== "RADAR_INVALID_AI_RESPONSE") throw error;
+          stats.invalidResponses += 1;
+          lastInvalidResponseError = error;
+          continue;
+        }
         stats.examined += rawPapers.length;
 
         for (const rawPaper of rawPapers) {
@@ -270,6 +324,10 @@ export function createLiteratureRadarService({ repository, aiService }) {
           accepted.push(candidate);
           if (accepted.length >= count) break;
         }
+      }
+
+      if (!validResponseCount && lastInvalidResponseError) {
+        throw lastInvalidResponseError;
       }
 
       const saved = await repository.saveRadarCandidates(accepted);

@@ -116,21 +116,6 @@ function validateServiceName(name, baseUrl) {
   return value.trim();
 }
 
-function hostedWebSearchUnavailable(model) {
-  let hostname = "";
-  try {
-    hostname = new URL(model?.service?.baseUrl ?? "").hostname
-      .toLocaleLowerCase("en")
-      .replace(/^www\./u, "");
-  } catch {
-    // Base URLs have already been validated before persistence.
-  }
-  return (
-    hostname === "api.deepseek.com" ||
-    /^deepseek(?:[-/]|$)/iu.test(model?.model ?? "")
-  );
-}
-
 export function createAiService({
   repository,
   credentialStore = new MacOsKeychainCredentialStore(),
@@ -456,16 +441,6 @@ export function createAiService({
           : null;
       }
       if (!selected) throw new AiServiceError("AI_NOT_CONFIGURED");
-      if (webSearch && hostedWebSearchUnavailable(selected)) {
-        throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
-          provider: selected.service.name,
-          message: `当前激活模型 ${selected.model} 不支持文献雷达所需的联网检索。`,
-          diagnostics: {
-            model: selected.model,
-            baseUrlHost: new URL(selected.service.baseUrl).hostname,
-          },
-        });
-      }
       const apiKey = await readCredential(selected.service.credentialKey);
       if (!apiKey) throw new AiServiceError("AI_NOT_CONFIGURED");
       return compatibleProvider.generateText({

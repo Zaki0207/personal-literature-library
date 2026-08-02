@@ -320,6 +320,7 @@ type RadarStateResponse = {
     excludedHistory: number;
     excludedWithinRun: number;
     invalid: number;
+    invalidResponses?: number;
   };
 };
 
@@ -4328,7 +4329,9 @@ export default function Home() {
             disabled={radarBusy || !radarPrompt.trim()}
           >
             <span aria-hidden="true">✦</span>
-            {radarBusy ? "正在联网检索并排重…" : "开始本次检索"}
+            {radarBusy
+              ? "正在联网检索并排重，最长约 20 分钟…"
+              : "开始本次检索"}
           </button>
         </div>
       </form>
