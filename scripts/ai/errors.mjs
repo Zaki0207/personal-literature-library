@@ -75,6 +75,12 @@ const PUBLIC_ERRORS = {
     statusCode: 400,
     retryable: false,
   },
+  WEB_SEARCH_UNSUPPORTED: {
+    message: "当前 AI 服务或模型不支持联网检索。",
+    action: "请切换到支持 Responses API Web Search 的模型后重试。",
+    statusCode: 400,
+    retryable: false,
+  },
   KEYCHAIN_UNAVAILABLE: {
     message: "无法访问 macOS 钥匙串。",
     action: "请允许钥匙串访问后重试。",

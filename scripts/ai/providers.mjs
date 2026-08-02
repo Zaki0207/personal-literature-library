@@ -126,10 +126,10 @@ class BaseProvider {
     this.timeoutMs = timeoutMs;
   }
 
-  async request(url, { provider, apiKey, body }) {
+  async request(url, { provider, apiKey, body, timeoutMs = this.timeoutMs }) {
     const startedAt = performance.now();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await this.fetchImpl(url, {
         method: "POST",
@@ -177,7 +177,13 @@ export class OpenAiProvider extends BaseProvider {
   id = "openai";
   chatCompatibleBaseUrls = new Set();
 
-  async generateChatCompletion({ apiKey, model, input, baseUrl }) {
+  async generateChatCompletion({ apiKey, model, input, baseUrl, webSearch }) {
+    if (webSearch) {
+      throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
+        provider: this.id,
+        diagnostics: { endpoint: "chat/completions" },
+      });
+    }
     const result = await this.request(
       providerEndpoint(baseUrl, "chat/completions"),
       {
@@ -202,7 +208,7 @@ export class OpenAiProvider extends BaseProvider {
     };
   }
 
-  async generateText({ apiKey, model, input, baseUrl }) {
+  async generateText({ apiKey, model, input, baseUrl, webSearch = false }) {
     const resolvedBaseUrl = baseUrl ?? AI_PROVIDER_DEFINITIONS.openai.baseUrl;
     if (this.chatCompatibleBaseUrls.has(resolvedBaseUrl)) {
       return this.generateChatCompletion({
@@ -210,6 +216,7 @@ export class OpenAiProvider extends BaseProvider {
         model,
         input,
         baseUrl: resolvedBaseUrl,
+        webSearch,
       });
     }
 
@@ -224,11 +231,27 @@ export class OpenAiProvider extends BaseProvider {
             model,
             input,
             store: false,
+            ...(webSearch
+              ? {
+                  tools: [{ type: "web_search" }],
+                  tool_choice: "required",
+                }
+              : {}),
           },
+          ...(webSearch ? { timeoutMs: 60_000 } : {}),
         },
       );
     } catch (error) {
       if (!shouldTryChatCompletions(error)) throw error;
+      if (webSearch) {
+        throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
+          provider: this.id,
+          diagnostics: {
+            httpStatus: error.diagnostics?.httpStatus,
+            upstreamCode: error.diagnostics?.upstreamCode,
+          },
+        });
+      }
       const fallback = await this.generateChatCompletion({
         apiKey,
         model,
@@ -253,6 +276,7 @@ export class OpenAiProvider extends BaseProvider {
       usage: result.payload.usage ?? null,
       latencyMs: result.latencyMs,
       requestId: result.requestId,
+      webSearchUsed: webSearch,
     };
   }
 }

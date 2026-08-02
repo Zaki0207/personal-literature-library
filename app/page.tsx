@@ -3,6 +3,7 @@
 import {
   ChangeEvent,
   DragEvent as ReactDragEvent,
+  Fragment,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
@@ -268,6 +269,64 @@ type AiVerificationResponse = AiSettingsMutationResponse & {
     latencyMs: number;
     verifiedAt: string;
   };
+};
+
+type RadarItem = {
+  id: string;
+  title: string;
+  zhTitle: string;
+  authors: string;
+  institution: string;
+  source: string;
+  date: string;
+  aiSummary: string;
+  recommendationReason: string;
+  originalUrl?: string;
+  pdfUrl?: string;
+  identifiers: PaperIdentifier[];
+  status: "pending" | "added" | "discarded";
+  addedPaperId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type RadarStateResponse = {
+  settings: {
+    prompt: string;
+    requestedCount: number;
+    updatedAt?: string;
+  };
+  pending: RadarItem[];
+  discarded: RadarItem[];
+  counts: {
+    library: number;
+    pending: number;
+    discarded: number;
+    added: number;
+  };
+  backup?: BackupStatus;
+  context?: {
+    providedToAi: number;
+    totalExclusions: number;
+    locallyChecked: number;
+  };
+  lastRun?: {
+    requested: number;
+    added: number;
+    insufficient: boolean;
+    rounds: number;
+    examined: number;
+    excludedLibrary: number;
+    excludedHistory: number;
+    excludedWithinRun: number;
+    invalid: number;
+  };
+};
+
+type RadarAddResponse = {
+  paper: Paper;
+  library: LibraryResponse;
+  radar: RadarStateResponse;
 };
 
 type FlatCategory = Category & {
@@ -605,6 +664,19 @@ function normalizeCategoryRecords(
 export default function Home() {
   const [papers, setPapers] = useState(initialPapers);
   const [categories, setCategories] = useState(initialCategories);
+  const [activeSurface, setActiveSurface] = useState<"library" | "radar">(
+    "library",
+  );
+  const [radarState, setRadarState] = useState<RadarStateResponse | null>(null);
+  const [radarPrompt, setRadarPrompt] = useState("");
+  const [radarCount, setRadarCount] = useState(5);
+  const [radarView, setRadarView] = useState<"pending" | "discarded">(
+    "pending",
+  );
+  const [radarBusy, setRadarBusy] = useState(false);
+  const [radarItemBusy, setRadarItemBusy] = useState<string | null>(null);
+  const [radarError, setRadarError] = useState("");
+  const [radarContextOpen, setRadarContextOpen] = useState(false);
   const [activeScope, setActiveScope] = useState("all");
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("recent");
@@ -832,6 +904,29 @@ export default function Home() {
     return () => {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadRadar = async () => {
+      try {
+        const response = await libraryRequest<RadarStateResponse>("/radar");
+        if (cancelled) return;
+        setRadarState(response);
+        setRadarPrompt(response.settings.prompt);
+        setRadarCount(response.settings.requestedCount);
+        if (response.backup) setBackupStatus(response.backup);
+      } catch (error) {
+        if (cancelled) return;
+        setRadarError(
+          error instanceof Error ? error.message : "文献雷达暂时不可用。",
+        );
+      }
+    };
+    loadRadar();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -1314,6 +1409,7 @@ export default function Home() {
   const activeFilterCount = [codeOnly, projectOnly].filter(Boolean).length;
 
   const selectScope = (scope: string) => {
+    setActiveSurface("library");
     setActiveScope(scope);
     const selectedCategory = flattenedCategories.find(
       (category) => category.id === scope,
@@ -1330,6 +1426,7 @@ export default function Home() {
   };
 
   const resetLibraryView = () => {
+    setActiveSurface("library");
     setActiveScope("all");
     setFavoriteOnly(false);
     setWatchLaterOnly(false);
@@ -1711,6 +1808,102 @@ export default function Home() {
       scopeIsInsideHiddenRoot(nextCategories, current) ? "all" : current,
     );
     applyBackupStatus(library.backup);
+  };
+
+  const applyRadarSnapshot = (
+    response: RadarStateResponse,
+    { syncSettings = false } = {},
+  ) => {
+    setRadarState(response);
+    if (syncSettings) {
+      setRadarPrompt(response.settings.prompt);
+      setRadarCount(response.settings.requestedCount);
+    }
+    applyBackupStatus(response.backup);
+  };
+
+  const openLiteratureRadar = () => {
+    setActiveSurface("radar");
+    setMobileNavOpen(false);
+    setOpenMenu(null);
+    setFiltersOpen(false);
+    setTextSizeOpen(false);
+  };
+
+  const runLiteratureRadar = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!radarPrompt.trim() || radarBusy) return;
+    setRadarBusy(true);
+    setRadarError("");
+    try {
+      const response = await libraryRequest<RadarStateResponse>("/radar/run", {
+        method: "POST",
+        body: JSON.stringify({ prompt: radarPrompt, count: radarCount }),
+      });
+      applyRadarSnapshot(response, { syncSettings: true });
+      setRadarView("pending");
+      const added = response.lastRun?.added ?? 0;
+      const requested = response.lastRun?.requested ?? radarCount;
+      setToast(
+        response.lastRun?.insufficient
+          ? `已找到 ${added} 篇不重复论文；没有用重复结果补足 ${requested} 篇`
+          : `已推送 ${added} 篇不重复论文，等待审核`,
+      );
+    } catch (error) {
+      setRadarError(
+        error instanceof Error ? error.message : "文献检索失败，请重试。",
+      );
+    } finally {
+      setRadarBusy(false);
+    }
+  };
+
+  const changeRadarItem = async (
+    item: RadarItem,
+    action: "discard" | "restore",
+  ) => {
+    if (radarItemBusy) return;
+    setRadarItemBusy(item.id);
+    setRadarError("");
+    try {
+      const response = await libraryRequest<RadarStateResponse>(
+        `/radar/items/${encodeURIComponent(item.id)}/${action}`,
+        { method: "POST", body: "{}" },
+      );
+      applyRadarSnapshot(response);
+      setToast(
+        action === "discard"
+          ? "已丢弃，并加入永久排除记录"
+          : "已恢复到待审核列表",
+      );
+    } catch (error) {
+      setRadarError(
+        error instanceof Error ? error.message : "操作失败，请重试。",
+      );
+    } finally {
+      setRadarItemBusy(null);
+    }
+  };
+
+  const addRadarItem = async (item: RadarItem) => {
+    if (radarItemBusy) return;
+    setRadarItemBusy(item.id);
+    setRadarError("");
+    try {
+      const response = await libraryRequest<RadarAddResponse>(
+        `/radar/items/${encodeURIComponent(item.id)}/add`,
+        { method: "POST", body: "{}" },
+      );
+      applyLibrarySnapshot(response.library);
+      applyRadarSnapshot(response.radar);
+      setToast("论文已加入知识库，后续检索将自动排除");
+    } catch (error) {
+      setRadarError(
+        error instanceof Error ? error.message : "添加失败，请重试。",
+      );
+    } finally {
+      setRadarItemBusy(null);
+    }
   };
 
   const applyCategoryListResponse = (
@@ -3297,10 +3490,14 @@ export default function Home() {
           <button
             type="button"
             className={`nav-item category-link ${
-              activeScope === category.id ? "is-active" : ""
+              activeSurface === "library" && activeScope === category.id
+                ? "is-active"
+                : ""
             }`}
             onClick={() => selectScope(category.id)}
-            aria-pressed={activeScope === category.id}
+            aria-pressed={
+              activeSurface === "library" && activeScope === category.id
+            }
             title={category.name}
           >
             <span className="category-link-name">{category.name}</span>
@@ -3585,22 +3782,37 @@ export default function Home() {
 
   const renderPaperCard = (paper: Paper) => {
     const paperSearchMatch = paperSearchMatches.get(paper.id);
-    const scopedCategoryIds = new Set(paper.scopes);
-    const visibleTags = flattenedCategories
-      .filter((category) => scopedCategoryIds.has(category.id))
-      .map((category) => ({
-        tag: {
-          label: category.name,
-          scope: category.id,
-        },
-        category,
-      }));
-    const visibleTagScopes = new Set(
-      visibleTags.map(({ tag }) => tag.scope),
+    const directCategoryIds = new Set(
+      paper.categoryIds ??
+        paper.tags
+          .map((tag) => tag.scope)
+          .filter((scope) => scope !== "uncategorized"),
     );
+    const selectedCategories = flattenedCategories.filter((category) =>
+      directCategoryIds.has(category.id),
+    );
+    const terminalCategories = selectedCategories.filter(
+      (category) =>
+        !selectedCategories.some(
+          (candidate) =>
+            candidate.id !== category.id &&
+            candidate.ancestorIds?.includes(category.id),
+        ),
+    );
+    const representedCategoryIds = new Set<string>();
+    const visiblePaths = terminalCategories.map((category) => {
+      representedCategoryIds.add(category.id);
+      category.ancestorIds?.forEach((ancestorId) =>
+        representedCategoryIds.add(ancestorId),
+      );
+      return { category, path: category.path };
+    });
     paper.tags.forEach((tag) => {
-      if (!visibleTagScopes.has(tag.scope)) {
-        visibleTags.push({ tag, category: undefined });
+      if (!representedCategoryIds.has(tag.scope)) {
+        visiblePaths.push({
+          category: undefined,
+          path: [tag.label],
+        });
       }
     });
     const pdfUrl = safeExternalUrl(paper.pdfUrl);
@@ -3643,16 +3855,24 @@ export default function Home() {
       <article className="paper-card" key={paper.id}>
         <div className="paper-card-top">
           <div className="paper-badges">
-            {visibleTags.map(({ tag, category }) => (
+            {visiblePaths.map(({ category, path }, pathIndex) => (
               <span
-                className={`category-badge category-badge-depth-${Math.min(
-                  category?.depth ?? 0,
-                  2,
-                )}`}
-                key={`${tag.scope}:${tag.label}`}
-                title={category?.path.join(" › ")}
+                className={`category-path ${
+                  category ? "category-path-root" : ""
+                }`}
+                key={`${category?.id ?? "tag"}:${path.join("/")}:${pathIndex}`}
+                title={path.join(" > ")}
               >
-                {tag.label}
+                {path.map((segment, index) => (
+                  <Fragment key={`${segment}:${index}`}>
+                    {index > 0 && (
+                      <span className="category-path-separator" aria-hidden="true">
+                        →
+                      </span>
+                    )}
+                    <span className="category-path-segment">{segment}</span>
+                  </Fragment>
+                ))}
               </span>
             ))}
           </div>
@@ -3913,6 +4133,251 @@ export default function Home() {
     );
   };
 
+  const visibleRadarItems =
+    radarView === "pending"
+      ? radarState?.pending ?? []
+      : radarState?.discarded ?? [];
+  const radarTotalExclusions = radarState
+    ? radarState.counts.library +
+      radarState.counts.pending +
+      radarState.counts.discarded +
+      radarState.counts.added
+    : papers.length;
+
+  const renderRadarItem = (item: RadarItem) => {
+    const originalUrl = safeExternalUrl(item.originalUrl);
+    const busy = radarItemBusy === item.id;
+    const metadata = [
+      item.authors,
+      item.institution,
+      item.source,
+      item.date,
+    ].filter(Boolean);
+    return (
+      <article className="radar-paper-card" key={item.id}>
+        <header className="radar-paper-header">
+          <div>
+            <span className="radar-unique-badge">
+              <span aria-hidden="true">✓</span>
+              已通过知识库与历史记录排重
+            </span>
+            <h2>{item.title}</h2>
+            {item.zhTitle && <p className="radar-paper-zh-title">{item.zhTitle}</p>}
+          </div>
+          {originalUrl && (
+            <a
+              className="radar-source-link"
+              href={originalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              查看原文 ↗
+            </a>
+          )}
+        </header>
+
+        {metadata.length > 0 && (
+          <p className="radar-paper-meta">{metadata.join(" · ")}</p>
+        )}
+
+        {item.recommendationReason && (
+          <div className="radar-reason">
+            <span>推荐理由</span>
+            <p>{item.recommendationReason}</p>
+          </div>
+        )}
+        {item.aiSummary && (
+          <div className="radar-summary">
+            <span>AI 摘要</span>
+            <p>{item.aiSummary}</p>
+          </div>
+        )}
+
+        <footer className="radar-paper-footer">
+          <div className="radar-identifiers" aria-label="排重标识">
+            {item.identifiers
+              .filter((identifier) => identifier.kind !== "url")
+              .slice(0, 3)
+              .map((identifier) => (
+                <span key={`${identifier.kind}:${identifier.value}`}>
+                  {identifier.kind.toUpperCase()} · {identifier.value}
+                </span>
+              ))}
+          </div>
+          <div className="radar-review-actions">
+            {item.status === "discarded" ? (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => changeRadarItem(item, "restore")}
+                disabled={Boolean(radarItemBusy)}
+              >
+                {busy ? "正在恢复…" : "恢复到待审核"}
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="radar-discard-button"
+                  onClick={() => changeRadarItem(item, "discard")}
+                  disabled={Boolean(radarItemBusy)}
+                >
+                  {busy ? "处理中…" : "丢弃并不再推荐"}
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => addRadarItem(item)}
+                  disabled={Boolean(radarItemBusy)}
+                >
+                  {busy ? "正在加入…" : "一键加入文献库"}
+                </button>
+              </>
+            )}
+          </div>
+        </footer>
+      </article>
+    );
+  };
+
+  const renderRadarSurface = () => (
+    <div className="radar-page">
+      <section className="radar-hero" aria-labelledby="radar-title">
+        <div>
+          <span className="radar-eyebrow">AI 文献发现</span>
+          <h1 id="radar-title">文献雷达</h1>
+          <p>按你的研究范围联网检索；每篇论文先排重，再交给你决定加入或永久丢弃。</p>
+        </div>
+        <div className="radar-hero-stats" aria-label="排重范围">
+          <span><strong>{radarState?.counts.library ?? papers.length}</strong> 知识库论文</span>
+          <span><strong>{radarState?.counts.discarded ?? 0}</strong> 永久排除</span>
+        </div>
+      </section>
+
+      <form className="radar-composer" onSubmit={runLiteratureRadar}>
+        <div className="radar-composer-heading">
+          <div>
+            <h2>本次检索要求</h2>
+            <p>提示词每次都可编辑；保存后将作为下一次默认值。</p>
+          </div>
+          <label className="radar-count-field">
+            <span>推送数量</span>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={radarCount}
+              onChange={(event) =>
+                setRadarCount(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
+              }
+              disabled={radarBusy}
+            />
+            <small>篇</small>
+          </label>
+        </div>
+        <label className="radar-prompt-field">
+          <span className="sr-only">文献检索提示词</span>
+          <textarea
+            value={radarPrompt}
+            onChange={(event) => setRadarPrompt(event.target.value)}
+            rows={5}
+            maxLength={10_000}
+            placeholder="例如：检索与多模态情感识别、微表情分析和生理信号融合相关的近期论文……"
+            disabled={radarBusy}
+          />
+        </label>
+
+        <div className="radar-system-context">
+          <button
+            type="button"
+            onClick={() => setRadarContextOpen((current) => !current)}
+            aria-expanded={radarContextOpen}
+          >
+            <span aria-hidden="true">⌁</span>
+            系统排重上下文（只读）
+            <strong>{radarTotalExclusions} 条</strong>
+            <span aria-hidden="true">{radarContextOpen ? "⌃" : "⌄"}</span>
+          </button>
+          {radarContextOpen && (
+            <div className="radar-context-detail">
+              <p>
+                AI 检索前会收到知识库与历史审核记录的标题、DOI、arXiv 和 URL 摘要；
+                返回后，本机数据库还会对全部 {radarTotalExclusions} 条记录再次严格排重。
+              </p>
+              <dl>
+                <div><dt>当前知识库</dt><dd>{radarState?.counts.library ?? papers.length}</dd></div>
+                <div><dt>待审核</dt><dd>{radarState?.counts.pending ?? 0}</dd></div>
+                <div><dt>已加入历史</dt><dd>{radarState?.counts.added ?? 0}</dd></div>
+                <div><dt>已丢弃历史</dt><dd>{radarState?.counts.discarded ?? 0}</dd></div>
+              </dl>
+              {radarState?.context && (
+                <small>
+                  上次检索：AI 收到 {radarState.context.providedToAi} 条摘要，本机核查 {radarState.context.locallyChecked} 条。
+                </small>
+              )}
+            </div>
+          )}
+        </div>
+
+        {radarError && <p className="radar-error" role="alert">{radarError}</p>}
+        <div className="radar-composer-actions">
+          <p><span aria-hidden="true">✓</span> 数量不足时不会用重复论文补齐</p>
+          <button
+            type="submit"
+            className="primary-button radar-run-button"
+            disabled={radarBusy || !radarPrompt.trim()}
+          >
+            <span aria-hidden="true">✦</span>
+            {radarBusy ? "正在联网检索并排重…" : "开始本次检索"}
+          </button>
+        </div>
+      </form>
+
+      <section className="radar-review-section" aria-labelledby="radar-review-title">
+        <div className="radar-review-heading">
+          <div>
+            <h2 id="radar-review-title">个人审核</h2>
+            <p>加入或丢弃之前，不会改动你的知识库。</p>
+          </div>
+          <div className="radar-tabs" role="tablist" aria-label="文献雷达审核状态">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={radarView === "pending"}
+              className={radarView === "pending" ? "is-active" : ""}
+              onClick={() => setRadarView("pending")}
+            >
+              待审核 <span>{radarState?.counts.pending ?? 0}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={radarView === "discarded"}
+              className={radarView === "discarded" ? "is-active" : ""}
+              onClick={() => setRadarView("discarded")}
+            >
+              已丢弃 <span>{radarState?.counts.discarded ?? 0}</span>
+            </button>
+          </div>
+        </div>
+
+        {visibleRadarItems.length ? (
+          <div className="radar-paper-list">{visibleRadarItems.map(renderRadarItem)}</div>
+        ) : (
+          <div className="radar-empty-state">
+            <span aria-hidden="true">✦</span>
+            <h3>{radarView === "pending" ? "暂无待审核论文" : "暂无已丢弃论文"}</h3>
+            <p>
+              {radarView === "pending"
+                ? "编辑上方提示词并开始检索，新的不重复论文会出现在这里。"
+                : "你丢弃的论文会永久保留在排除记录中，并可随时恢复。"}
+            </p>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+
   return (
     <div className="library-app">
       {isMobile && mobileNavOpen && (
@@ -3944,6 +4409,7 @@ export default function Home() {
           <div className="library-shortcuts" aria-label="文献范围与标记">
             <button
               className={`nav-item ${
+                activeSurface === "library" &&
                 activeScope === "all" &&
                 !favoriteOnly &&
                 !watchLaterOnly
@@ -3952,6 +4418,7 @@ export default function Home() {
               }`}
               onClick={resetLibraryView}
               aria-pressed={
+                activeSurface === "library" &&
                 activeScope === "all" &&
                 !favoriteOnly &&
                 !watchLaterOnly
@@ -3961,8 +4428,9 @@ export default function Home() {
               <span className="nav-count">{scopeCounts.all}</span>
             </button>
             <button
-              className={`nav-item ${favoriteOnly ? "is-active" : ""}`}
+              className={`nav-item ${activeSurface === "library" && favoriteOnly ? "is-active" : ""}`}
               onClick={() => {
+                setActiveSurface("library");
                 setFavoriteOnly((current) => !current);
                 setOpenMenu(null);
               }}
@@ -3973,8 +4441,9 @@ export default function Home() {
               <span className="nav-count">{scopeCounts.favorites}</span>
             </button>
             <button
-              className={`nav-item ${watchLaterOnly ? "is-active" : ""}`}
+              className={`nav-item ${activeSurface === "library" && watchLaterOnly ? "is-active" : ""}`}
               onClick={() => {
+                setActiveSurface("library");
                 setWatchLaterOnly((current) => !current);
                 setOpenMenu(null);
               }}
@@ -3985,15 +4454,32 @@ export default function Home() {
               <span className="nav-count">{scopeCounts.watchLater}</span>
             </button>
             <button
+              className={`nav-item radar-nav-item ${
+                activeSurface === "radar" ? "is-active" : ""
+              }`}
+              onClick={openLiteratureRadar}
+              aria-pressed={activeSurface === "radar"}
+            >
+              <span>
+                <span className="radar-nav-symbol" aria-hidden="true">✦</span>
+                文献雷达
+              </span>
+              <span className="nav-count">{radarState?.counts.pending ?? 0}</span>
+            </button>
+            <button
               className={`nav-item ${
-                activeScope === "uncategorized" ? "is-active" : ""
+                activeSurface === "library" && activeScope === "uncategorized"
+                  ? "is-active"
+                  : ""
               }`}
               onClick={() =>
                 selectScope(
                   activeScope === "uncategorized" ? "all" : "uncategorized",
                 )
               }
-              aria-pressed={activeScope === "uncategorized"}
+              aria-pressed={
+                activeSurface === "library" && activeScope === "uncategorized"
+              }
             >
               <span>未分类</span>
               <span className="nav-count">
@@ -4063,7 +4549,11 @@ export default function Home() {
               type="search"
               placeholder="搜索题目、作者、机构、年份、来源或主题"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onFocus={() => setActiveSurface("library")}
+              onChange={(event) => {
+                setActiveSurface("library");
+                setQuery(event.target.value);
+              }}
             />
             <kbd>⌘ K</kbd>
           </label>
@@ -4071,7 +4561,10 @@ export default function Home() {
           <div className="filter-anchor">
             <button
               className={`toolbar-button ${filtersOpen || activeFilterCount ? "is-engaged" : ""}`}
-              onClick={() => setFiltersOpen((current) => !current)}
+              onClick={() => {
+                setActiveSurface("library");
+                setFiltersOpen((current) => !current);
+              }}
               aria-expanded={filtersOpen}
               aria-controls="filter-popover"
             >
@@ -4118,7 +4611,10 @@ export default function Home() {
             <span className="sr-only">论文排序</span>
             <select
               value={normalizedQuery ? "relevance" : sortBy}
-              onChange={(event) => setSortBy(event.target.value)}
+              onChange={(event) => {
+                setActiveSurface("library");
+                setSortBy(event.target.value);
+              }}
               disabled={Boolean(normalizedQuery)}
             >
               {normalizedQuery && (
@@ -4151,6 +4647,10 @@ export default function Home() {
           </button>
         </header>
 
+        {activeSurface === "radar" ? (
+          renderRadarSurface()
+        ) : (
+          <>
         <section
           className="view-overview"
           aria-labelledby="view-overview-title"
@@ -4392,6 +4892,8 @@ export default function Home() {
             </div>
           )}
           </section>
+        )}
+          </>
         )}
       </main>
 

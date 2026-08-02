@@ -13,6 +13,7 @@ import { MacOsKeychainCredentialStore } from "./ai/credential-store.mjs";
 import { createAiProviders } from "./ai/providers.mjs";
 import { createPaperIntakeService } from "./paper-intake.mjs";
 import { createPdfArchiveService } from "./pdf-archive-service.mjs";
+import { createLiteratureRadarService } from "./literature-radar.mjs";
 
 export const DEFAULT_API_PORT = 4317;
 export const API_HOST = "127.0.0.1";
@@ -294,6 +295,17 @@ function routeAiModel(pathname, suffix = "") {
   }
 }
 
+function routeRadarItem(pathname, suffix) {
+  const pattern = new RegExp(`^/api/radar/items/([^/]+)/${suffix}$`);
+  const match = pathname.match(pattern);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    throw new ValidationError("文献雷达条目 ID 编码无效。");
+  }
+}
+
 function errorPayload(error) {
   return {
     error: {
@@ -312,6 +324,7 @@ function createRequestHandler(
   aiService,
   paperIntakeService,
   pdfArchiveService,
+  literatureRadarService,
 ) {
   return async (request, response) => {
     try {
@@ -347,6 +360,70 @@ function createRequestHandler(
       if (request.method === "GET" && pathname === "/api/ai/settings") {
         assertAiRequestOrigin(request);
         sendJson(response, request, 200, await aiService.getSettings());
+        return;
+      }
+
+      if (request.method === "GET" && pathname === "/api/radar") {
+        assertAiRequestOrigin(request);
+        sendJson(response, request, 200, literatureRadarService.getState());
+        return;
+      }
+
+      if (request.method === "POST" && pathname === "/api/radar/run") {
+        assertAiRequestOrigin(request);
+        const result = await literatureRadarService.run(
+          await readJsonBody(request),
+        );
+        sendJson(response, request, 200, result);
+        return;
+      }
+
+      const discardRadarItemId = routeRadarItem(pathname, "discard");
+      if (request.method === "POST" && discardRadarItemId !== null) {
+        assertAiRequestOrigin(request);
+        await repository.discardRadarItem(discardRadarItemId);
+        sendJson(response, request, 200, repository.getRadarState());
+        return;
+      }
+
+      const restoreRadarItemId = routeRadarItem(pathname, "restore");
+      if (request.method === "POST" && restoreRadarItemId !== null) {
+        assertAiRequestOrigin(request);
+        await repository.restoreRadarItem(restoreRadarItemId);
+        sendJson(response, request, 200, repository.getRadarState());
+        return;
+      }
+
+      const addRadarItemId = routeRadarItem(pathname, "add");
+      if (request.method === "POST" && addRadarItemId !== null) {
+        assertAiRequestOrigin(request);
+        const item = repository.getRadarItem(addRadarItemId);
+        if (!item) throw new NotFoundError("未找到文献雷达条目。");
+        if (item.status !== "pending") {
+          const error = new Error("只有待审核论文可以加入知识库。");
+          error.statusCode = 409;
+          error.code = "CONFLICT";
+          throw error;
+        }
+        const created = await repository.createPaper({
+          title: item.title,
+          zhTitle: item.zhTitle,
+          authors: item.authors,
+          institution: item.institution,
+          source: item.source,
+          date: item.date,
+          aiSummary: item.aiSummary,
+          originalUrl: item.originalUrl,
+          pdfUrl: item.pdfUrl,
+          hasPdf: Boolean(item.pdfUrl),
+          identifiers: item.identifiers,
+        });
+        await repository.markRadarItemAdded(addRadarItemId, created.paper.id);
+        sendJson(response, request, 201, {
+          paper: created.paper,
+          library: repository.getLibrary(),
+          radar: repository.getRadarState(),
+        });
         return;
       }
 
@@ -595,6 +672,7 @@ export async function createLibraryApi({
   aiFetch,
   metadataFetch,
   pdfArchiveService,
+  literatureRadarService,
   pdfDirectory,
   pdfFetch,
   allowPrivatePdfNetwork,
@@ -631,12 +709,19 @@ export async function createLibraryApi({
       ...(pdfFetch ? { fetchImpl: pdfFetch } : {}),
       ...(allowPrivatePdfNetwork ? { allowPrivateNetwork: true } : {}),
     });
+  const localLiteratureRadarService =
+    literatureRadarService ??
+    createLiteratureRadarService({
+      repository: libraryRepository,
+      aiService: localAiService,
+    });
   const server = createServer(
     createRequestHandler(
       libraryRepository,
       localAiService,
       paperIntakeService,
       localPdfArchiveService,
+      localLiteratureRadarService,
     ),
   );
   let started = false;
@@ -647,6 +732,7 @@ export async function createLibraryApi({
     aiService: localAiService,
     paperIntakeService,
     pdfArchiveService: localPdfArchiveService,
+    literatureRadarService: localLiteratureRadarService,
     server,
 
     async listen(overridePort = port) {
