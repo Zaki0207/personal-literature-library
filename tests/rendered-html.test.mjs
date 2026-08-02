@@ -99,6 +99,11 @@ test("keeps the agreed navigation and resource states in the product source", as
   assert.match(page, /className="resource-slot is-available"/);
   assert.match(page, /className="resource-slot is-missing"/);
   assert.match(page, /paper\.hasPdf/);
+  assert.match(page, /pdfArchive/);
+  assert.match(page, /\/pdf\/open/);
+  assert.match(page, /\/pdf\/archive/);
+  assert.match(page, /本地副本/);
+  assert.match(page, /选择本地 PDF/);
   assert.match(page, /href=\{codeUrl\}/);
   assert.match(page, /href=\{projectUrl\}/);
   assert.match(page, /target="_blank"/);
