@@ -178,7 +178,14 @@ export class OpenAiProvider extends BaseProvider {
   id = "openai";
   chatCompatibleBaseUrls = new Set();
 
-  async generateChatCompletion({ apiKey, model, input, baseUrl, webSearch }) {
+  async generateChatCompletion({
+    apiKey,
+    model,
+    input,
+    baseUrl,
+    webSearch,
+    timeoutMs,
+  }) {
     if (webSearch) {
       throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
         provider: this.id,
@@ -195,6 +202,7 @@ export class OpenAiProvider extends BaseProvider {
           messages: [{ role: "user", content: input }],
           stream: false,
         },
+        ...(timeoutMs ? { timeoutMs } : {}),
       },
     );
     return {
@@ -209,7 +217,14 @@ export class OpenAiProvider extends BaseProvider {
     };
   }
 
-  async generateText({ apiKey, model, input, baseUrl, webSearch = false }) {
+  async generateText({
+    apiKey,
+    model,
+    input,
+    baseUrl,
+    webSearch = false,
+    timeoutMs,
+  }) {
     const resolvedBaseUrl = baseUrl ?? AI_PROVIDER_DEFINITIONS.openai.baseUrl;
     if (this.chatCompatibleBaseUrls.has(resolvedBaseUrl)) {
       return this.generateChatCompletion({
@@ -218,6 +233,7 @@ export class OpenAiProvider extends BaseProvider {
         input,
         baseUrl: resolvedBaseUrl,
         webSearch,
+        timeoutMs,
       });
     }
 
@@ -239,7 +255,11 @@ export class OpenAiProvider extends BaseProvider {
                 }
               : {}),
           },
-          ...(webSearch ? { timeoutMs: WEB_SEARCH_TIMEOUT_MS } : {}),
+          ...(webSearch
+            ? { timeoutMs: WEB_SEARCH_TIMEOUT_MS }
+            : timeoutMs
+              ? { timeoutMs }
+              : {}),
         },
       );
     } catch (error) {
@@ -258,6 +278,7 @@ export class OpenAiProvider extends BaseProvider {
         model,
         input,
         baseUrl: resolvedBaseUrl,
+        timeoutMs,
       });
       this.chatCompatibleBaseUrls.add(resolvedBaseUrl);
       return fallback;
@@ -285,7 +306,7 @@ export class OpenAiProvider extends BaseProvider {
 export class DeepSeekProvider extends BaseProvider {
   id = "deepseek";
 
-  async generateText({ apiKey, model, input, baseUrl }) {
+  async generateText({ apiKey, model, input, baseUrl, timeoutMs }) {
     const result = await this.request(
       providerEndpoint(
         baseUrl ?? AI_PROVIDER_DEFINITIONS.deepseek.baseUrl,
@@ -299,6 +320,7 @@ export class DeepSeekProvider extends BaseProvider {
           messages: [{ role: "user", content: input }],
           stream: false,
         },
+        ...(timeoutMs ? { timeoutMs } : {}),
       },
     );
     return {

@@ -13,6 +13,7 @@ import { normalizePublicationSource } from "../lib/publication-source.mjs";
 const MAX_INPUT_LENGTH = 4_096;
 const MAX_REMOTE_BYTES = 2 * 1_024 * 1_024;
 const FETCH_TIMEOUT_MS = 20_000;
+const AI_ENRICHMENT_TIMEOUT_MS = 3 * 60_000;
 
 class PaperIntakeError extends Error {
   constructor(message, { statusCode = 400, code = "PAPER_INTAKE_ERROR", details } = {}) {
@@ -1084,6 +1085,7 @@ export function createPaperIntakeService({
       try {
         const generated = await aiService.generateText({
           input: aiPrompt(enrichedMetadata, candidates),
+          timeoutMs: AI_ENRICHMENT_TIMEOUT_MS,
           ...(input.modelId ? { modelId: input.modelId } : {}),
         });
         ai = {

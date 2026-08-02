@@ -115,6 +115,7 @@ function emptyCrossrefSearchResponse() {
 
 test("DOI 先获取权威元数据，再让 AI 只补全知识库需要的字段", async (t) => {
   const prompts = [];
+  const aiTimeouts = [];
   const fixture = await makeFixture(t, "doi", {
     fetchImpl: async (url) => {
       const href = String(url);
@@ -133,8 +134,9 @@ test("DOI 先获取权威元数据，再让 AI 只补全知识库需要的字段
       throw new Error(`未预期的请求：${href}`);
     },
     aiService: {
-      async generateText({ input }) {
+      async generateText({ input, timeoutMs }) {
         prompts.push(input);
+        aiTimeouts.push(timeoutMs);
         return {
           resolvedModel: "deepseek-v4-pro",
           text: '{"zhTitle":"烟雾体重建","institution":"Tsinghua University, Beijing National Research Center for Information Science and Technology (BNRist), Department of Computer Science and Technology","source":"2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)","aiSummary":"本文研究烟雾体的三维重建方法，并依据论文摘要整理其问题、方法与贡献。","categoryIds":["SMOKE001","UNKNOWN"]}',
@@ -169,6 +171,7 @@ test("DOI 先获取权威元数据，再让 AI 只补全知识库需要的字段
   assert.equal(result.draft.projectUrl, "https://project.example/smoke");
   assert.equal(result.metadata.codeEvidence, "论文页面直接链接");
   assert.equal(prompts.length, 1);
+  assert.deepEqual(aiTimeouts, [3 * 60_000]);
   assert.match(prompts[0], /只返回一个 JSON 对象/u);
   assert.match(
     prompts[0],

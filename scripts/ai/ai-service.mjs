@@ -427,7 +427,12 @@ export function createAiService({
       return reconcileActiveModel(deleted.backup);
     },
 
-    async generateText({ input, modelId, webSearch = false } = {}) {
+    async generateText({
+      input,
+      modelId,
+      webSearch = false,
+      timeoutMs,
+    } = {}) {
       if (typeof input !== "string" || !input.trim()) {
         throw validationError("AI 输入不能为空。", "input");
       }
@@ -449,6 +454,7 @@ export function createAiService({
         baseUrl: selected.service.baseUrl,
         input: input.trim(),
         webSearch: webSearch === true,
+        ...(timeoutMs ? { timeoutMs } : {}),
       });
     },
   };
