@@ -23,6 +23,7 @@ const ALLOWED_LOCAL_ORIGINS = new Set([
   "http://localhost:3000",
   "http://127.0.0.1:3000",
   "http://[::1]:3000",
+  "https://personal-literature-library-zhaozizyu.taxable-orbital-9dke.chatgpt.site",
 ]);
 
 function allowedOrigin(origin) {

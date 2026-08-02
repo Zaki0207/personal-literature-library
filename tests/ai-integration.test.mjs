@@ -724,7 +724,7 @@ test("连接名称可独立保存，地址和密钥仍必须通过模型验证",
   );
 });
 
-test("AI 配置接口只允许当前本地网站来源", async (t) => {
+test("AI 配置接口只允许本地开发页和已发布的私人站点来源", async (t) => {
   const fixture = await makeAiFixture(t, "origin-restriction");
 
   const allowed = await jsonRequest(fixture.baseUrl, "/api/ai/settings", {
@@ -734,6 +734,17 @@ test("AI 配置接口只允许当前本地网站来源", async (t) => {
   assert.equal(
     allowed.response.headers.get("access-control-allow-origin"),
     "http://localhost:3000",
+  );
+
+  const privateSiteOrigin =
+    "https://personal-literature-library-zhaozizyu.taxable-orbital-9dke.chatgpt.site";
+  const privateSite = await jsonRequest(fixture.baseUrl, "/api/ai/settings", {
+    headers: { Origin: privateSiteOrigin },
+  });
+  assert.equal(privateSite.response.status, 200);
+  assert.equal(
+    privateSite.response.headers.get("access-control-allow-origin"),
+    privateSiteOrigin,
   );
 
   const rejected = await jsonRequest(fixture.baseUrl, "/api/ai/settings", {
