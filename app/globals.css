@@ -3564,6 +3564,45 @@ a:focus-visible {
   content: "✓";
 }
 
+.paper-intake-radar-context {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 27px;
+  border-bottom: 1px solid #cdded6;
+  background: #eef5f1;
+  color: var(--ink);
+}
+
+.paper-intake-radar-context > span {
+  flex: 0 0 auto;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.paper-intake-radar-context p {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  margin: 0;
+}
+
+.paper-intake-radar-context strong,
+.paper-intake-radar-context small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.paper-intake-radar-context strong {
+  font-size: 11px;
+}
+
+.paper-intake-radar-context small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
 .paper-intake-start {
   display: grid;
   min-height: 360px;
@@ -3815,6 +3854,11 @@ a:focus-visible {
   max-height: calc(min(860px, 100vh - 48px) - 156px);
   padding: 22px 28px 26px;
   overflow-y: auto;
+}
+
+.paper-intake-modal.has-radar-context .paper-intake-start,
+.paper-intake-modal.has-radar-context .paper-intake-review {
+  max-height: calc(min(860px, 100vh - 48px) - 207px);
 }
 
 .paper-intake-review-meta {

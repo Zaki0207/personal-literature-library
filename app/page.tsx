@@ -538,6 +538,22 @@ function providerForUrl(url: string) {
   return "项目站";
 }
 
+function referenceForRadarItem(item: RadarItem) {
+  const originalUrl = safeExternalUrl(item.originalUrl);
+  if (originalUrl) return originalUrl;
+
+  const doi = item.identifiers.find((identifier) => identifier.kind === "doi");
+  if (doi) return `https://doi.org/${doi.value}`;
+
+  const arxiv = item.identifiers.find(
+    (identifier) => identifier.kind === "arxiv",
+  );
+  if (arxiv) return `https://arxiv.org/abs/${arxiv.value}`;
+
+  const url = item.identifiers.find((identifier) => identifier.kind === "url");
+  return safeExternalUrl(url?.value) ?? "";
+}
+
 function draftFromPaper(paper: Paper): PaperEditDraft {
   return {
     title: paper.title,
@@ -762,6 +778,7 @@ export default function Home() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [addPaperOpen, setAddPaperOpen] = useState(false);
+  const [radarIntakeItem, setRadarIntakeItem] = useState<RadarItem | null>(null);
   const [addingPaper, setAddingPaper] = useState(false);
   const [paperReference, setPaperReference] = useState("");
   const [paperIntakeResult, setPaperIntakeResult] =
@@ -926,6 +943,7 @@ export default function Home() {
         setOpenMenu(null);
         setTitlePreviewPaperId(null);
         setAddPaperOpen(false);
+        setRadarIntakeItem(null);
         if (!aiBusyAction) setAiSettingsOpen(false);
         setMobileNavOpen(false);
       }
@@ -1800,6 +1818,7 @@ export default function Home() {
     setProjectOnly(false);
     setQuery(duplicate.title);
     setAddPaperOpen(false);
+    setRadarIntakeItem(null);
   };
 
   const addPaper = async (event: FormEvent<HTMLFormElement>) => {
@@ -1847,19 +1866,36 @@ export default function Home() {
     addingPaperRef.current = true;
     setAddingPaper(true);
     try {
-      const response = await libraryRequest<PaperMutationResponse>("/papers", {
-        method: "POST",
-        body: JSON.stringify(paper),
-      });
-      setPapers((current) => [response.paper, ...current]);
-      applyBackupStatus(response.backup);
+      if (radarIntakeItem) {
+        const response = await libraryRequest<RadarAddResponse>(
+          `/radar/items/${encodeURIComponent(radarIntakeItem.id)}/add`,
+          {
+            method: "POST",
+            body: JSON.stringify(paper),
+          },
+        );
+        applyLibrarySnapshot(response.library);
+        applyRadarSnapshot(response.radar);
+        setToast("论文已确认加入知识库，后续检索将自动排除");
+      } else {
+        const response = await libraryRequest<PaperMutationResponse>(
+          "/papers",
+          {
+            method: "POST",
+            body: JSON.stringify(paper),
+          },
+        );
+        setPapers((current) => [response.paper, ...current]);
+        applyBackupStatus(response.backup);
+        setToast(savedMessage("论文已添加", response.backup));
+      }
       setAddPaperOpen(false);
+      setRadarIntakeItem(null);
       setPaperReference("");
       setPaperIntakeResult(null);
       setPaperIntakeDraft(null);
       setPaperIntakeError("");
       setActiveScope("all");
-      setToast(savedMessage("论文已添加", response.backup));
     } catch (error) {
       setPaperIntakeError(
         error instanceof Error ? error.message : "添加失败，请重试。",
@@ -2077,25 +2113,23 @@ export default function Home() {
     }
   };
 
-  const addRadarItem = async (item: RadarItem) => {
+  const reviewRadarItemForAddition = (item: RadarItem) => {
     if (radarItemBusy) return;
-    setRadarItemBusy(item.id);
-    setRadarError("");
-    try {
-      const response = await libraryRequest<RadarAddResponse>(
-        `/radar/items/${encodeURIComponent(item.id)}/add`,
-        { method: "POST", body: "{}" },
-      );
-      applyLibrarySnapshot(response.library);
-      applyRadarSnapshot(response.radar);
-      setToast("论文已加入知识库，后续检索将自动排除");
-    } catch (error) {
-      setRadarError(
-        error instanceof Error ? error.message : "添加失败，请重试。",
-      );
-    } finally {
-      setRadarItemBusy(null);
+    const reference = referenceForRadarItem(item);
+    if (!reference) {
+      setRadarError("这篇论文缺少可再次核验的链接或标识，暂时无法进入添加流程。");
+      return;
     }
+
+    modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarError("");
+    setRadarIntakeItem(item);
+    setPaperReference(reference);
+    setPaperIntakeResult(null);
+    setPaperIntakeDraft(null);
+    setPaperDuplicateBusyId(null);
+    setPaperIntakeError("");
+    setAddPaperOpen(true);
   };
 
   const applyCategoryListResponse = (
@@ -3294,6 +3328,7 @@ export default function Home() {
 
   const openAddPaperModal = () => {
     modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarIntakeItem(null);
     setPaperReference("");
     setPaperIntakeResult(null);
     setPaperIntakeDraft(null);
@@ -4419,10 +4454,10 @@ export default function Home() {
                 <button
                   type="button"
                   className="primary-button"
-                  onClick={() => addRadarItem(item)}
+                  onClick={() => reviewRadarItemForAddition(item)}
                   disabled={Boolean(radarItemBusy)}
                 >
-                  {busy ? "正在加入…" : "一键加入文献库"}
+                  核对并加入
                 </button>
               </>
             )}
@@ -6650,12 +6685,17 @@ export default function Home() {
         <div
           className="modal-layer"
           onMouseDown={(event) => {
-            if (event.currentTarget === event.target) setAddPaperOpen(false);
+            if (event.currentTarget === event.target) {
+              setAddPaperOpen(false);
+              setRadarIntakeItem(null);
+            }
           }}
         >
           <section
             ref={modalRef}
-            className="modal paper-intake-modal"
+            className={`modal paper-intake-modal${
+              radarIntakeItem ? " has-radar-context" : ""
+            }`}
             role="dialog"
             aria-modal="true"
             aria-labelledby="add-paper-title"
@@ -6663,12 +6703,21 @@ export default function Home() {
           >
             <div className="modal-heading">
               <div>
-                <h2 id="add-paper-title">添加论文</h2>
-                <p>粘贴论文地址，核对 AI 整理后的信息再保存。</p>
+                <h2 id="add-paper-title">
+                  {radarIntakeItem ? "核对并加入论文" : "添加论文"}
+                </h2>
+                <p>
+                  {radarIntakeItem
+                    ? "再次识别和查重，手动核对全部信息后再加入知识库。"
+                    : "粘贴论文地址，核对 AI 整理后的信息再保存。"}
+                </p>
               </div>
               <button
                 className="modal-close"
-                onClick={() => setAddPaperOpen(false)}
+                onClick={() => {
+                  setAddPaperOpen(false);
+                  setRadarIntakeItem(null);
+                }}
                 aria-label="关闭"
                 disabled={paperIntakeBusy || addingPaper}
               >
@@ -6698,6 +6747,18 @@ export default function Home() {
                 人工确认
               </li>
             </ol>
+
+            {radarIntakeItem && (
+              <div className="paper-intake-radar-context" role="status">
+                <span aria-hidden="true">✦</span>
+                <p>
+                  <strong>来自文献雷达：{radarIntakeItem.title}</strong>
+                  <small>
+                    只有最终确认成功后，这篇候选论文才会从待审核列表移出。
+                  </small>
+                </p>
+              </div>
+            )}
 
             {!paperIntakeDraft ? (
               <form className="paper-intake-start" onSubmit={analyzePaperReference}>
@@ -6785,7 +6846,10 @@ export default function Home() {
                   <button
                     type="button"
                     className="secondary-button"
-                    onClick={() => setAddPaperOpen(false)}
+                    onClick={() => {
+                      setAddPaperOpen(false);
+                      setRadarIntakeItem(null);
+                    }}
                     disabled={paperIntakeBusy}
                   >
                     取消

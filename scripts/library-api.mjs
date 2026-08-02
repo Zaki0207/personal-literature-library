@@ -437,19 +437,9 @@ function createRequestHandler(
           error.code = "CONFLICT";
           throw error;
         }
-        const created = await repository.createPaper({
-          title: item.title,
-          zhTitle: item.zhTitle,
-          authors: item.authors,
-          institution: item.institution,
-          source: item.source,
-          date: item.date,
-          aiSummary: item.aiSummary,
-          originalUrl: item.originalUrl,
-          pdfUrl: item.pdfUrl,
-          hasPdf: Boolean(item.pdfUrl),
-          identifiers: item.identifiers,
-        });
+        const created = await repository.createPaper(
+          await readJsonBody(request),
+        );
         await repository.markRadarItemAdded(addRadarItemId, created.paper.id);
         sendJson(response, request, 201, {
           paper: created.paper,

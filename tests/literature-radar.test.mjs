@@ -212,13 +212,36 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.doesNotMatch(webSearchBodies[2].input, /\{\{research_scope\}\}/u);
 
   const paperB = secondRun.body.pending.find((item) => item.title === "New Paper B");
-  const added = await jsonRequest(
+  const unreviewedAdd = await jsonRequest(
     baseUrl,
     `/api/radar/items/${paperB.id}/add`,
     { method: "POST", body: "{}" },
   );
+  assert.equal(unreviewedAdd.response.status, 400);
+  assert.match(unreviewedAdd.body.error.message, /(title|标题)/u);
+
+  const added = await jsonRequest(
+    baseUrl,
+    `/api/radar/items/${paperB.id}/add`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        title: "New Paper B — Manually Reviewed",
+        zhTitle: "人工修改后的中文标题",
+        authors: paperB.authors,
+        institution: "Reviewed Lab",
+        source: paperB.source,
+        date: paperB.date,
+        aiSummary: "人工修改后的摘要",
+        originalUrl: paperB.originalUrl,
+        identifiers: paperB.identifiers,
+      }),
+    },
+  );
   assert.equal(added.response.status, 201);
-  assert.equal(added.body.paper.title, "New Paper B");
+  assert.equal(added.body.paper.title, "New Paper B — Manually Reviewed");
+  assert.equal(added.body.paper.zhTitle, "人工修改后的中文标题");
+  assert.equal(added.body.paper.institution, "Reviewed Lab");
   assert.equal(added.body.library.papers.length, 2);
   assert.equal(added.body.radar.counts.added, 1);
   assert.equal(added.body.radar.counts.discarded, 1);
