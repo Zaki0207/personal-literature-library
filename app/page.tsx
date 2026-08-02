@@ -2812,6 +2812,32 @@ export default function Home() {
                 <span>侧栏显示</span>
               </label>
             )}
+            <div className="category-quick-order-controls" aria-label={`调整“${category.name}”顺序`}>
+              <button
+                type="button"
+                onClick={() => void moveManagedCategoryInOrder(category, "up")}
+                disabled={siblingIndex <= 0 || Boolean(categoryActionBusy)}
+                aria-label={`上移“${category.name}”`}
+                title="上移"
+              >
+                <span aria-hidden="true">↑</span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void moveManagedCategoryInOrder(category, "down")
+                }
+                disabled={
+                  siblingIndex < 0 ||
+                  siblingIndex >= siblings.length - 1 ||
+                  Boolean(categoryActionBusy)
+                }
+                aria-label={`下移“${category.name}”`}
+                title="下移"
+              >
+                <span aria-hidden="true">↓</span>
+              </button>
+            </div>
             <div className="category-action-anchor">
             <button
               type="button"
@@ -2835,28 +2861,6 @@ export default function Home() {
                   onClick={() => beginRenameCategory(category)}
                 >
                   重命名
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    void moveManagedCategoryInOrder(category, "up")
-                  }
-                  disabled={siblingIndex <= 0 || Boolean(categoryActionBusy)}
-                >
-                  上移
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    void moveManagedCategoryInOrder(category, "down")
-                  }
-                  disabled={
-                    siblingIndex < 0 ||
-                    siblingIndex >= siblings.length - 1 ||
-                    Boolean(categoryActionBusy)
-                  }
-                >
-                  下移
                 </button>
                 <button
                   type="button"
