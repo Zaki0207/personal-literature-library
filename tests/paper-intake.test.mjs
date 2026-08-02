@@ -73,6 +73,9 @@ function crossrefResponse({
   doi = "10.1145/1234.5678",
   title = "A Test Paper",
   institution = "Example University",
+  source = "CVPR",
+  abstract = "<jats:p>We reconstruct volumetric smoke.</jats:p>",
+  published = [2025, 6, 12],
 } = {}) {
   return new Response(
     JSON.stringify({
@@ -87,9 +90,9 @@ function crossrefResponse({
             affiliation: [{ name: institution }],
           },
         ],
-        "container-title": ["CVPR"],
-        published: { "date-parts": [[2025, 6, 12]] },
-        abstract: "<jats:p>We reconstruct volumetric smoke.</jats:p>",
+        "container-title": [source],
+        published: { "date-parts": [published] },
+        abstract,
         URL: `https://doi.org/${doi}`,
         link: [
           {
@@ -414,6 +417,114 @@ test("网页元数据解析后会再次按规范化标题查重", async (t) => {
   assert.equal(result.status, "duplicate");
   assert.equal(result.duplicates[0].reasons[0].type, "title");
   assert.equal(aiCalls, 0);
+});
+
+test("PDF 直链不会按网页大小拒绝，并会从对应论文页补全元数据", async (t) => {
+  const pdfUrl = "https://pranav-jain.github.io/projects/nmcfs/nmcfs.pdf";
+  const projectUrl = "https://pranav-jain.github.io/projects/nmcfs/";
+  const prompts = [];
+  const fixture = await makeFixture(t, "direct-pdf", {
+    aiService: {
+      async generateText({ input }) {
+        prompts.push(input);
+        return {
+          resolvedModel: "test-model",
+          text: JSON.stringify({
+            zhTitle: "神经蒙特卡罗流体模拟",
+            institution: "University of Southern California",
+            source: "SIGGRAPH 2024",
+            aiSummary: "本文提出结合神经场与蒙特卡罗压力求解的无网格流体模拟方法。",
+            categoryIds: ["SMOKE001"],
+          }),
+        };
+      },
+    },
+    fetchImpl: async (url) => {
+      const href = String(url);
+      if (href === pdfUrl) {
+        return new Response("%PDF", {
+          status: 200,
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Length": "38123376",
+          },
+        });
+      }
+      if (href === projectUrl || href === projectUrl.slice(0, -1)) {
+        return new Response(
+          `<html><head><title>Neural Monte Carlo Fluid Simulation</title></head>
+           <body><p class="venue">SIGGRAPH 2024</p>
+           <section class="abstract"><h2>Abstract</h2><p>A mesh-free neural fluid method with a Monte Carlo pressure solver.</p></section>
+           <a href="https://dl.acm.org/doi/10.1145/3641519.3657438">ACM Library</a>
+           <a href="./nmcfs.pdf">Paper</a>
+           <a href="https://github.com/Pranav-Jain/Neural-Monte-Carlo-Fluid-Simulation">Code</a></body></html>`,
+          { status: 200, headers: { "Content-Type": "text/html" } },
+        );
+      }
+      if (
+        /api\.crossref\.org\/works\/10\.1145%2F3641519\.3657438/u.test(
+          href,
+        )
+      ) {
+        return crossrefResponse({
+          doi: "10.1145/3641519.3657438",
+          title: "Neural Monte Carlo Fluid Simulation",
+          institution: "University of Southern California",
+          source:
+            "Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers",
+          abstract: "",
+          published: [2024, 7, 13],
+        });
+      }
+      if (href === "https://doi.org/10.1145/3641519.3657438") {
+        return new Response("<html></html>", {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        });
+      }
+      throw new Error(`未预期的请求：${href}`);
+    },
+  });
+
+  const result = await fixture.service.analyze({ reference: pdfUrl });
+
+  assert.equal(result.status, "ready");
+  assert.equal(result.draft.title, "Neural Monte Carlo Fluid Simulation");
+  assert.equal(result.draft.source, "SIGGRAPH 2024");
+  assert.equal(result.draft.pdfUrl, pdfUrl);
+  assert.equal(result.draft.hasPdf, true);
+  assert.equal(result.draft.originalUrl, "https://doi.org/10.1145/3641519.3657438");
+  assert.equal(
+    result.draft.codeUrl,
+    "https://github.com/Pranav-Jain/Neural-Monte-Carlo-Fluid-Simulation",
+  );
+  assert.equal(result.draft.projectUrl, projectUrl.slice(0, -1));
+  assert.ok(
+    result.draft.identifiers.some(
+      (identifier) =>
+        identifier.kind === "doi" &&
+        identifier.value === "10.1145/3641519.3657438",
+    ),
+  );
+  assert.match(prompts[0], /mesh-free neural fluid method/u);
+});
+
+test("超过安全上限的普通网页仍会被拒绝", async (t) => {
+  const fixture = await makeFixture(t, "oversized-html", {
+    fetchImpl: async () =>
+      new Response("<html></html>", {
+        status: 200,
+        headers: {
+          "Content-Type": "text/html",
+          "Content-Length": String(3 * 1_024 * 1_024),
+        },
+      }),
+  });
+
+  await assert.rejects(
+    fixture.service.analyze({ reference: "https://papers.example/large" }),
+    (error) => error?.code === "METADATA_TOO_LARGE",
+  );
 });
 
 test("AI 失败时保留元数据草稿，允许人工审核后继续添加", async (t) => {

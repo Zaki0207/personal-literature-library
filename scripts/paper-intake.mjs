@@ -76,7 +76,12 @@ function assertSafeRemoteUrl(value) {
   return url;
 }
 
-async function fetchRemote(fetchImpl, value, accept, { headers = {} } = {}) {
+async function fetchRemote(
+  fetchImpl,
+  value,
+  accept,
+  { headers = {}, detectPdf = false } = {},
+) {
   let url = assertSafeRemoteUrl(value);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -108,6 +113,29 @@ async function fetchRemote(fetchImpl, value, accept, { headers = {} } = {}) {
           code: "METADATA_UNAVAILABLE",
         });
       }
+      const resolvedUrl = response.url || url.href;
+      const contentType = String(
+        response.headers.get("content-type") ?? "",
+      )
+        .split(";", 1)[0]
+        .trim()
+        .toLocaleLowerCase("en");
+      const isPdf =
+        contentType === "application/pdf" ||
+        /\.pdf$/iu.test(new URL(resolvedUrl).pathname);
+      if (detectPdf && isPdf) {
+        try {
+          await response.body?.cancel();
+        } catch {
+          // The response body may already be closed by a test or fetch adapter.
+        }
+        return {
+          text: "",
+          url: resolvedUrl,
+          contentType,
+          isPdf: true,
+        };
+      }
       const length = Number(response.headers.get("content-length") ?? 0);
       if (length > MAX_REMOTE_BYTES) {
         throw new PaperIntakeError("论文页面过大，无法安全读取元数据。", {
@@ -122,7 +150,12 @@ async function fetchRemote(fetchImpl, value, accept, { headers = {} } = {}) {
           code: "METADATA_TOO_LARGE",
         });
       }
-      return { text: new TextDecoder().decode(bytes), url: response.url || url.href };
+      return {
+        text: new TextDecoder().decode(bytes),
+        url: resolvedUrl,
+        contentType,
+        isPdf: false,
+      };
     }
   } catch (error) {
     if (error instanceof PaperIntakeError) throw error;
@@ -431,6 +464,14 @@ function metaValues(html, key) {
   return values;
 }
 
+function classText(html, className) {
+  const pattern = new RegExp(
+    `<([a-z][\\w:-]*)\\b[^>]*\\bclass\\s*=\\s*(["'])[^"']*\\b${className}\\b[^"']*\\2[^>]*>([\\s\\S]*?)<\\/\\1>`,
+    "iu",
+  );
+  return stripMarkup(html.match(pattern)?.[3] ?? "");
+}
+
 function htmlLinks(html, baseUrl) {
   const links = [];
   for (const match of html.matchAll(
@@ -594,10 +635,21 @@ async function searchGithubRepository(fetchImpl, metadata) {
 }
 
 async function discoverPaperResources(fetchImpl, metadata) {
-  const pages = [metadata.preprint?.url, metadata.originalUrl]
+  const pages = [
+    metadata.preprint?.url,
+    metadata.pdfLandingPageUrl,
+    metadata.resourcePageUrl,
+    metadata.originalUrl,
+  ]
     .map(normalizePaperUrl)
     .filter(Boolean);
-  let resources = {};
+  let resources = metadata.pdfLandingPageUrl
+    ? {
+        projectUrl: metadata.pdfLandingPageUrl,
+        projectProvider: "项目主页",
+        projectEvidence: "由 PDF 直链定位到对应论文页面",
+      }
+    : {};
   for (const pageUrl of [...new Set(pages)]) {
     try {
       const { text, url } = await fetchRemote(
@@ -646,23 +698,37 @@ function mergeMetadata(base, overlay, { preferOverlay = false, metadataSource } 
         method: "none",
         confidence: "none",
       },
+    resourcePageUrl: base.resourcePageUrl || overlay.resourcePageUrl || "",
+    pdfLandingPageUrl:
+      base.pdfLandingPageUrl || overlay.pdfLandingPageUrl || "",
     ...(base.preprint ? { preprint: base.preprint } : {}),
   };
 }
 
-async function fetchWebPage(fetchImpl, inputUrl) {
-  const { text, url: resolvedUrl } = await fetchRemote(
-    fetchImpl,
-    inputUrl,
-    "text/html, application/xhtml+xml;q=0.9",
+async function metadataFromWebPage(
+  fetchImpl,
+  { text, resolvedUrl, pdfUrl = "", pdfLandingPageUrl = "" },
+) {
+  const linkedDoi = htmlLinks(text, resolvedUrl)
+    .map((link) => normalizeDoi(link.url))
+    .find(Boolean);
+  const bibtexDoi = text.match(
+    /\bdoi\s*=\s*[{"']\s*(10\.\d{4,9}\/[^\s}"']+)/iu,
+  )?.[1];
+  const doi = normalizeDoi(
+    metaValues(text, "citation_doi")[0] ??
+      metaValues(text, "dc.identifier")[0] ??
+      linkedDoi ??
+      bibtexDoi ??
+      "",
   );
-  const doi = normalizeDoi(metaValues(text, "citation_doi")[0] ?? "");
   const authors = metaValues(text, "citation_author");
   const institutions = metaValues(text, "citation_author_institution");
   const source =
     metaValues(text, "citation_conference_title")[0] ||
     metaValues(text, "citation_journal_title")[0] ||
     metaValues(text, "citation_publisher")[0] ||
+    classText(text, "venue") ||
     "";
   const pageMetadata = {
     title:
@@ -680,11 +746,15 @@ async function fetchWebPage(fetchImpl, inputUrl) {
       metaValues(text, "citation_abstract")[0] ||
       metaValues(text, "description")[0] ||
       metaValues(text, "og:description")[0] ||
+      classText(text, "abstract").replace(/^abstract\s+/iu, "") ||
       "",
-    originalUrl: normalizePaperUrl(resolvedUrl) ?? normalizePaperUrl(inputUrl) ?? inputUrl,
-    pdfUrl: normalizePaperUrl(metaValues(text, "citation_pdf_url")[0] ?? "") ?? "",
+    originalUrl: normalizePaperUrl(resolvedUrl) ?? resolvedUrl,
+    pdfUrl:
+      normalizePaperUrl(pdfUrl) ??
+      normalizePaperUrl(metaValues(text, "citation_pdf_url")[0] ?? "") ??
+      "",
     identifiers: dedupePaperIdentifiers([
-      ...identifiersFromReference(inputUrl),
+      ...identifiersFromReference(pdfUrl || resolvedUrl),
       { kind: "url", value: resolvedUrl },
       ...(doi ? [{ kind: "doi", value: doi }] : []),
     ]),
@@ -694,6 +764,10 @@ async function fetchWebPage(fetchImpl, inputUrl) {
       method: doi ? "page-doi" : "none",
       confidence: doi ? "high" : "none",
     },
+    resourcePageUrl: normalizePaperUrl(resolvedUrl) ?? "",
+    ...(pdfLandingPageUrl
+      ? { pdfLandingPageUrl: normalizePaperUrl(pdfLandingPageUrl) ?? "" }
+      : {}),
   };
   if (!pageMetadata.title) {
     throw new PaperIntakeError("该页面没有可识别的论文标题，请改用 DOI 或 arXiv 链接。", {
@@ -711,6 +785,83 @@ async function fetchWebPage(fetchImpl, inputUrl) {
   } catch {
     return pageMetadata;
   }
+}
+
+function pdfLandingPageCandidates(pdfUrl) {
+  const url = new URL(pdfUrl);
+  const pathname = url.pathname;
+  const filename = pathname.split("/").filter(Boolean).at(-1) ?? "";
+  const stem = filename.replace(/\.pdf$/iu, "");
+  const directory = new URL(".", url);
+  const candidates = [directory.href];
+
+  if (stem) {
+    candidates.push(new URL(stem, directory).href);
+    candidates.push(new URL(`${stem}.html`, directory).href);
+  }
+  if (/\/(?:pdf|papers?|downloads?)\/$/iu.test(directory.pathname)) {
+    candidates.push(new URL("..", directory).href);
+  }
+  const unique = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = normalizePaperUrl(candidate);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(candidate);
+  }
+  return unique;
+}
+
+async function fetchPdfLandingPage(fetchImpl, pdfUrl) {
+  for (const candidate of pdfLandingPageCandidates(pdfUrl)) {
+    try {
+      const page = await fetchRemote(
+        fetchImpl,
+        candidate,
+        "text/html, application/xhtml+xml;q=0.9",
+        { detectPdf: true },
+      );
+      if (page.isPdf) continue;
+      return await metadataFromWebPage(fetchImpl, {
+        text: page.text,
+        resolvedUrl: page.url,
+        pdfUrl,
+        pdfLandingPageUrl: page.url,
+      });
+    } catch (error) {
+      if (
+        error instanceof PaperIntakeError &&
+        !["METADATA_INCOMPLETE", "METADATA_UNAVAILABLE"].includes(error.code)
+      ) {
+        throw error;
+      }
+    }
+  }
+  throw new PaperIntakeError(
+    "该链接是 PDF，但没有找到可识别的论文页面。请改用 DOI、arXiv 或论文项目页链接。",
+    {
+      statusCode: 422,
+      code: "PDF_METADATA_INCOMPLETE",
+      details: {
+        action: "也可以返回上一步，改为粘贴论文标题页或 DOI。",
+      },
+    },
+  );
+}
+
+async function fetchWebPage(fetchImpl, inputUrl) {
+  const page = await fetchRemote(
+    fetchImpl,
+    inputUrl,
+    "text/html, application/xhtml+xml;q=0.9, application/pdf;q=0.5",
+    { detectPdf: true },
+  );
+  if (page.isPdf) return fetchPdfLandingPage(fetchImpl, page.url);
+  return metadataFromWebPage(fetchImpl, {
+    text: page.text,
+    resolvedUrl: page.url,
+  });
 }
 
 function referenceKind(reference) {
