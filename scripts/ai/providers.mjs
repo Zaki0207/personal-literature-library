@@ -238,7 +238,7 @@ export class OpenAiProvider extends BaseProvider {
                 }
               : {}),
           },
-          ...(webSearch ? { timeoutMs: 60_000 } : {}),
+          ...(webSearch ? { timeoutMs: 120_000 } : {}),
         },
       );
     } catch (error) {

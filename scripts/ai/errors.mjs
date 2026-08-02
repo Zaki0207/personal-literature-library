@@ -77,7 +77,7 @@ const PUBLIC_ERRORS = {
   },
   WEB_SEARCH_UNSUPPORTED: {
     message: "当前 AI 服务或模型不支持联网检索。",
-    action: "请切换到支持 Responses API Web Search 的模型后重试。",
+    action: "请在 AI 设置中切换到支持 Responses API Web Search 的模型后重试。",
     statusCode: 400,
     retryable: false,
   },

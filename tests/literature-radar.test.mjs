@@ -166,3 +166,68 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.equal(state.body.counts.library, 2);
   assert.equal(state.body.pending.some((item) => item.title === "New Paper B"), false);
 });
+
+test("DeepSeek 激活时立即提示不支持联网检索，不再等待超时", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "literature-radar-deepseek-"));
+  const seedPath = join(directory, "seed.json");
+  await writeFile(
+    seedPath,
+    JSON.stringify({ categoryRecords: [], papers: [] }),
+    "utf8",
+  );
+  const calls = [];
+  const aiFetch = async (url, init) => {
+    calls.push({ url: String(url), body: JSON.parse(init.body) });
+    if (String(url).endsWith("/responses")) {
+      return new Response(
+        JSON.stringify({ error: { code: "unsupported_endpoint" } }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        model: "deepseek-v4-flash",
+        choices: [{ message: { role: "assistant", content: "OK" } }],
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  };
+  const api = await createLibraryApi({
+    port: 0,
+    dbPath: join(directory, "library.sqlite3"),
+    backupDir: join(directory, "backups"),
+    seedPath,
+    credentialStore: new MemoryCredentialStore(),
+    aiFetch,
+  });
+  const { url: baseUrl } = await api.listen();
+  t.after(async () => {
+    await api.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const configured = await jsonRequest(baseUrl, "/api/ai/connections", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "DeepSeek",
+      baseUrl: "https://api.deepseek.com",
+      model: "deepseek-v4-flash",
+      apiKey: "ds-test-only",
+    }),
+  });
+  assert.equal(configured.response.status, 200);
+  assert.equal(calls.length, 2, "验证阶段先尝试 Responses，再回退 Chat Completions");
+
+  const startedAt = performance.now();
+  const radar = await jsonRequest(baseUrl, "/api/radar/run", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "检索测试方向论文", count: 1 }),
+  });
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(radar.response.status, 400);
+  assert.equal(radar.body.error.code, "WEB_SEARCH_UNSUPPORTED");
+  assert.match(radar.body.error.message, /deepseek-v4-flash/u);
+  assert.match(radar.body.error.details.action, /AI 设置/u);
+  assert.equal(calls.length, 2, "能力检查应在发送外部请求前停止");
+  assert.ok(elapsedMs < 2_000, `错误应立即返回，实际耗时 ${elapsedMs}ms`);
+});
