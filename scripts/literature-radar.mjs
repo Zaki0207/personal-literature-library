@@ -235,9 +235,23 @@ export function createLiteratureRadarService({ repository, aiService }) {
       return repository.getRadarState();
     },
 
+    getAiTrace() {
+      return repository.getRadarAiTrace();
+    },
+
     async run(input) {
       const { prompt, count } = validateRunInput(input);
       await repository.saveRadarSettings({ prompt, count });
+
+      const trace = {
+        status: "running",
+        requestedCount: count,
+        userPrompt: prompt,
+        exchanges: [],
+        startedAt: new Date().toISOString(),
+        completedAt: "",
+        errorMessage: "",
+      };
 
       const persistentExclusions = repository.getRadarExclusions();
       const compact = compactExclusions(persistentExclusions);
@@ -257,95 +271,143 @@ export function createLiteratureRadarService({ repository, aiService }) {
       let validResponseCount = 0;
       let lastInvalidResponseError = null;
 
-      for (let round = 1; round <= MAX_ROUNDS && accepted.length < count; round += 1) {
-        const remaining = count - accepted.length;
-        const requested = Math.min(30, remaining + Math.min(5, remaining));
-        const result = await aiService.generateText({
-          input: searchPrompt({
+      try {
+        await repository.saveRadarAiTrace(trace);
+        for (
+          let round = 1;
+          round <= MAX_ROUNDS && accepted.length < count;
+          round += 1
+        ) {
+          const remaining = count - accepted.length;
+          const requested = Math.min(30, remaining + Math.min(5, remaining));
+          const aiPrompt = searchPrompt({
             userPrompt: prompt,
             requested,
             exclusions: [...compact.provided, ...transientExclusions],
             round,
-          }),
-          webSearch: true,
-        });
-        stats.rounds = round;
-        let rawPapers;
-        try {
-          rawPapers = parsePaperResponse(result.text);
-          validResponseCount += 1;
-        } catch (error) {
-          if (error?.code !== "RADAR_INVALID_AI_RESPONSE") throw error;
-          stats.invalidResponses += 1;
-          lastInvalidResponseError = error;
-          continue;
-        }
-        stats.examined += rawPapers.length;
-
-        for (const rawPaper of rawPapers) {
-          const candidate = candidateFromAi(rawPaper);
-          if (!candidate) {
-            stats.invalid += 1;
-            continue;
-          }
-          const titleKey = normalizePaperTitle(candidate.title);
-          const identifierKeys = candidate.identifiers.map(identifierKey);
-          const withinRun =
-            seenTitles.has(titleKey) ||
-            identifierKeys.some((key) => seenIdentifiers.has(key));
-          if (withinRun) {
-            stats.excludedWithinRun += 1;
-            continue;
-          }
-
-          const libraryMatches = repository.findPaperDuplicates(candidate);
-          const radarMatches = repository.findRadarDuplicates(candidate);
-          transientExclusions.push({
-            n: `round-${round}-${transientExclusions.length + 1}`,
-            origin: libraryMatches.length
-              ? "library"
-              : radarMatches.length
-                ? "radar"
-                : "current-run",
-            title: candidate.title,
-            ids: identifierKeys,
           });
-          if (libraryMatches.length) {
-            stats.excludedLibrary += 1;
+          const exchange = {
+            round,
+            prompt: aiPrompt,
+            response: "",
+            startedAt: new Date().toISOString(),
+            completedAt: "",
+            provider: "",
+            model: "",
+            latencyMs: null,
+            errorMessage: "",
+          };
+          trace.exchanges.push(exchange);
+          await repository.saveRadarAiTrace(trace);
+          const result = await aiService.generateText({
+            input: aiPrompt,
+            webSearch: true,
+          });
+          exchange.response = result.text;
+          exchange.completedAt = new Date().toISOString();
+          exchange.provider = result.provider ?? "";
+          exchange.model = result.resolvedModel ?? result.requestedModel ?? "";
+          exchange.latencyMs = result.latencyMs ?? null;
+          await repository.saveRadarAiTrace(trace);
+          stats.rounds = round;
+          let rawPapers;
+          try {
+            rawPapers = parsePaperResponse(result.text);
+            validResponseCount += 1;
+          } catch (error) {
+            if (error?.code !== "RADAR_INVALID_AI_RESPONSE") throw error;
+            stats.invalidResponses += 1;
+            lastInvalidResponseError = error;
+            exchange.errorMessage = error.message;
+            await repository.saveRadarAiTrace(trace);
             continue;
           }
-          if (radarMatches.length) {
-            stats.excludedHistory += 1;
-            continue;
-          }
+          stats.examined += rawPapers.length;
 
-          seenTitles.add(titleKey);
-          identifierKeys.forEach((key) => seenIdentifiers.add(key));
-          accepted.push(candidate);
-          if (accepted.length >= count) break;
+          for (const rawPaper of rawPapers) {
+            const candidate = candidateFromAi(rawPaper);
+            if (!candidate) {
+              stats.invalid += 1;
+              continue;
+            }
+            const titleKey = normalizePaperTitle(candidate.title);
+            const identifierKeys = candidate.identifiers.map(identifierKey);
+            const withinRun =
+              seenTitles.has(titleKey) ||
+              identifierKeys.some((key) => seenIdentifiers.has(key));
+            if (withinRun) {
+              stats.excludedWithinRun += 1;
+              continue;
+            }
+
+            const libraryMatches = repository.findPaperDuplicates(candidate);
+            const radarMatches = repository.findRadarDuplicates(candidate);
+            transientExclusions.push({
+              n: `round-${round}-${transientExclusions.length + 1}`,
+              origin: libraryMatches.length
+                ? "library"
+                : radarMatches.length
+                  ? "radar"
+                  : "current-run",
+              title: candidate.title,
+              ids: identifierKeys,
+            });
+            if (libraryMatches.length) {
+              stats.excludedLibrary += 1;
+              continue;
+            }
+            if (radarMatches.length) {
+              stats.excludedHistory += 1;
+              continue;
+            }
+
+            seenTitles.add(titleKey);
+            identifierKeys.forEach((key) => seenIdentifiers.add(key));
+            accepted.push(candidate);
+            if (accepted.length >= count) break;
+          }
         }
-      }
 
-      if (!validResponseCount && lastInvalidResponseError) {
-        throw lastInvalidResponseError;
-      }
+        if (!validResponseCount && lastInvalidResponseError) {
+          throw lastInvalidResponseError;
+        }
 
-      const saved = await repository.saveRadarCandidates(accepted);
-      const state = repository.getRadarState();
-      return {
-        ...state,
-        lastRun: {
-          requested: count,
-          added: saved.inserted.length,
-          insufficient: saved.inserted.length < count,
-          ...stats,
-        },
-        context: {
-          providedToAi: compact.providedCount,
-          totalExclusions: compact.totalCount,
-          locallyChecked: compact.totalCount,
-        },
-      };
+        const saved = await repository.saveRadarCandidates(accepted);
+        trace.status = "completed";
+        trace.completedAt = new Date().toISOString();
+        await repository.saveRadarAiTrace(trace);
+        const state = repository.getRadarState();
+        return {
+          ...state,
+          lastRun: {
+            requested: count,
+            added: saved.inserted.length,
+            insufficient: saved.inserted.length < count,
+            ...stats,
+          },
+          context: {
+            providedToAi: compact.providedCount,
+            totalExclusions: compact.totalCount,
+            locallyChecked: compact.totalCount,
+          },
+        };
+      } catch (error) {
+        trace.status = "failed";
+        trace.completedAt = new Date().toISOString();
+        trace.errorMessage =
+          error instanceof Error ? error.message : "文献雷达运行失败。";
+        const lastExchange = trace.exchanges.at(-1);
+        if (lastExchange && !lastExchange.completedAt) {
+          lastExchange.completedAt = trace.completedAt;
+          lastExchange.errorMessage = trace.errorMessage;
+        }
+        try {
+          await repository.saveRadarAiTrace(trace);
+        } catch {
+          // Preserve the original radar error if recording the trace also fails.
+        }
+        throw error;
+      }
     },
   };
 }

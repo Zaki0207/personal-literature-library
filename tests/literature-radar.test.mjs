@@ -59,6 +59,7 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   );
 
   const webSearchBodies = [];
+  const webSearchReplies = [];
   let radarCall = 0;
   const radarResponses = [
     [
@@ -74,7 +75,9 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
     if (!body.tools) return aiResponse(`${body.model}-resolved`, "OK");
     webSearchBodies.push(body);
     const papers = radarResponses[radarCall++] ?? [];
-    return aiResponse(body.model, JSON.stringify({ papers }));
+    const reply = JSON.stringify({ papers });
+    webSearchReplies.push(reply);
+    return aiResponse(body.model, reply);
   };
 
   const api = await createLibraryApi({
@@ -129,6 +132,21 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.deepEqual(webSearchBodies[0].tools, [{ type: "web_search" }]);
   assert.equal(webSearchBodies[0].tool_choice, "required");
   assert.match(webSearchBodies[0].input, /Existing Paper/u);
+
+  const firstTrace = await jsonRequest(baseUrl, "/api/radar/ai-trace");
+  assert.equal(firstTrace.response.status, 200);
+  assert.equal(firstTrace.body.trace.status, "completed");
+  assert.equal(firstTrace.body.trace.requestedCount, 2);
+  assert.equal(firstTrace.body.trace.exchanges.length, 2);
+  assert.equal(
+    firstTrace.body.trace.exchanges[0].prompt,
+    webSearchBodies[0].input,
+  );
+  assert.equal(
+    firstTrace.body.trace.exchanges[0].response,
+    webSearchReplies[0],
+  );
+  assert.match(firstTrace.body.trace.exchanges[0].prompt, /Existing Paper/u);
 
   const paperA = firstRun.body.pending.find((item) => item.title === "New Paper A");
   const discarded = await jsonRequest(
@@ -241,4 +259,15 @@ test("DeepSeek V4 Flash 通过 Responses API 执行联网检索", async (t) => {
   assert.deepEqual(calls[1].body.tools, [{ type: "web_search" }]);
   assert.equal(calls[1].body.tool_choice, "required");
   assert.deepEqual(calls[2].body.tools, [{ type: "web_search" }]);
+
+  const trace = await jsonRequest(baseUrl, "/api/radar/ai-trace");
+  assert.equal(trace.response.status, 200);
+  assert.equal(trace.body.trace.status, "completed");
+  assert.equal(trace.body.trace.exchanges.length, 2);
+  assert.equal(
+    trace.body.trace.exchanges[0].response,
+    "检索已完成，但本次响应不是合法 JSON：{'papers': []}",
+  );
+  assert.match(trace.body.trace.exchanges[0].errorMessage, /格式无效/u);
+  assert.match(trace.body.trace.exchanges[1].response, /DeepSeek Radar Paper/u);
 });

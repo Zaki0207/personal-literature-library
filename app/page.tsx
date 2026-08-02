@@ -330,6 +330,33 @@ type RadarAddResponse = {
   radar: RadarStateResponse;
 };
 
+type RadarAiExchange = {
+  round: number;
+  prompt: string;
+  response: string;
+  startedAt: string;
+  completedAt: string;
+  provider: string;
+  model: string;
+  latencyMs: number | null;
+  errorMessage: string;
+};
+
+type RadarAiTrace = {
+  status: "running" | "completed" | "failed";
+  requestedCount: number;
+  userPrompt: string;
+  exchanges: RadarAiExchange[];
+  errorMessage: string;
+  startedAt: string;
+  completedAt: string;
+  updatedAt: string;
+};
+
+type RadarAiTraceResponse = {
+  trace: RadarAiTrace | null;
+};
+
 type FlatCategory = Category & {
   depth: number;
   path: string[];
@@ -607,6 +634,20 @@ function formatAiVerifiedTime(value?: string | null) {
   }).format(date);
 }
 
+function formatRadarAiTraceTime(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
+
 function formatAiBaseUrlHost(value: string) {
   try {
     return new URL(value).host || "待确认地址";
@@ -678,6 +719,10 @@ export default function Home() {
   const [radarItemBusy, setRadarItemBusy] = useState<string | null>(null);
   const [radarError, setRadarError] = useState("");
   const [radarContextOpen, setRadarContextOpen] = useState(false);
+  const [radarAiTraceOpen, setRadarAiTraceOpen] = useState(false);
+  const [radarAiTrace, setRadarAiTrace] = useState<RadarAiTrace | null>(null);
+  const [radarAiTraceLoading, setRadarAiTraceLoading] = useState(false);
+  const [radarAiTraceError, setRadarAiTraceError] = useState("");
   const [activeScope, setActiveScope] = useState("all");
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("recent");
@@ -807,6 +852,7 @@ export default function Home() {
     addPaperOpen ||
     aiSettingsOpen ||
     categoryManagerOpen ||
+    radarAiTraceOpen ||
     editingPaperId !== null ||
     titlePreviewPaperId !== null;
   const sidebarExpanded = isMobile ? mobileNavOpen : !sidebarCollapsed;
@@ -1829,6 +1875,52 @@ export default function Home() {
     setOpenMenu(null);
     setFiltersOpen(false);
     setTextSizeOpen(false);
+  };
+
+  const closeRadarAiTrace = () => {
+    setRadarAiTraceOpen(false);
+    setRadarAiTraceError("");
+  };
+
+  const openRadarAiTrace = async () => {
+    modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarAiTraceOpen(true);
+    setRadarAiTraceLoading(true);
+    setRadarAiTraceError("");
+    try {
+      const response = await libraryRequest<RadarAiTraceResponse>(
+        "/radar/ai-trace",
+      );
+      setRadarAiTrace(response.trace);
+    } catch (error) {
+      setRadarAiTrace(null);
+      setRadarAiTraceError(
+        error instanceof Error ? error.message : "AI 记录读取失败。",
+      );
+    } finally {
+      setRadarAiTraceLoading(false);
+    }
+  };
+
+  const copyRadarAiText = async (value: string, label: string) => {
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(value);
+      setToast(`${label}已复制`);
+    } catch {
+      setToast("复制失败，请手动选择文本复制");
+    }
+  };
+
+  const copyCompleteRadarAiTrace = () => {
+    if (!radarAiTrace) return;
+    const text = radarAiTrace.exchanges
+      .map(
+        (exchange) =>
+          `===== 第 ${exchange.round} 轮：发送给 AI 的完整提示词 =====\n${exchange.prompt}\n\n===== 第 ${exchange.round} 轮：AI 的完整回复 =====\n${exchange.response || "（AI 未返回文本）"}`,
+      )
+      .join("\n\n");
+    void copyRadarAiText(text, "全部 AI 记录");
   };
 
   const runLiteratureRadar = async (event: FormEvent<HTMLFormElement>) => {
@@ -4323,16 +4415,26 @@ export default function Home() {
         {radarError && <p className="radar-error" role="alert">{radarError}</p>}
         <div className="radar-composer-actions">
           <p><span aria-hidden="true">✓</span> 数量不足时不会用重复论文补齐</p>
-          <button
-            type="submit"
-            className="primary-button radar-run-button"
-            disabled={radarBusy || !radarPrompt.trim()}
-          >
-            <span aria-hidden="true">✦</span>
-            {radarBusy
-              ? "正在联网检索并排重，最长约 20 分钟…"
-              : "开始本次检索"}
-          </button>
+          <div className="radar-composer-buttons">
+            <button
+              type="button"
+              className="secondary-button radar-trace-button"
+              onClick={openRadarAiTrace}
+            >
+              <span aria-hidden="true">⌘</span>
+              查看本次 AI 记录
+            </button>
+            <button
+              type="submit"
+              className="primary-button radar-run-button"
+              disabled={radarBusy || !radarPrompt.trim()}
+            >
+              <span aria-hidden="true">✦</span>
+              {radarBusy
+                ? "正在联网检索并排重，最长约 20 分钟…"
+                : "开始本次检索"}
+            </button>
+          </div>
         </div>
       </form>
 
@@ -5777,6 +5879,177 @@ export default function Home() {
                 </section>
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {radarAiTraceOpen && (
+        <div
+          className="modal-layer"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) closeRadarAiTrace();
+          }}
+        >
+          <section
+            ref={modalRef}
+            className="modal radar-ai-trace-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="radar-ai-trace-title"
+            aria-describedby="radar-ai-trace-description"
+            aria-busy={radarAiTraceLoading}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                closeRadarAiTrace();
+                return;
+              }
+              handleModalKeyDown(event);
+            }}
+          >
+            <div className="modal-heading radar-ai-trace-heading">
+              <div>
+                <h2 id="radar-ai-trace-title">本次 AI 完整记录</h2>
+                <p id="radar-ai-trace-description">
+                  按实际调用轮次展示；只保存在本机，不包含 API Key。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={closeRadarAiTrace}
+                aria-label="关闭 AI 完整记录"
+                autoFocus
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="radar-ai-trace-content">
+              {radarAiTraceLoading ? (
+                <div className="radar-ai-trace-empty">正在读取本机记录…</div>
+              ) : radarAiTraceError ? (
+                <p className="radar-error" role="alert">
+                  {radarAiTraceError}
+                </p>
+              ) : !radarAiTrace ? (
+                <div className="radar-ai-trace-empty">
+                  <span aria-hidden="true">⌘</span>
+                  <strong>尚无 AI 调用记录</strong>
+                  <p>完成下一次文献雷达检索后，可在这里查看完整内容。</p>
+                </div>
+              ) : (
+                <>
+                  <div className="radar-ai-trace-summary">
+                    <span className={`is-${radarAiTrace.status}`}>
+                      {radarAiTrace.status === "completed"
+                        ? "已完成"
+                        : radarAiTrace.status === "failed"
+                          ? "运行失败"
+                          : "运行中"}
+                    </span>
+                    <p>
+                      {formatRadarAiTraceTime(radarAiTrace.startedAt)} · 请求推送{" "}
+                      {radarAiTrace.requestedCount} 篇 · 实际调用{" "}
+                      {radarAiTrace.exchanges.length} 轮
+                    </p>
+                  </div>
+
+                  {radarAiTrace.errorMessage && (
+                    <p className="radar-error" role="status">
+                      {radarAiTrace.errorMessage}
+                    </p>
+                  )}
+
+                  <div className="radar-ai-trace-exchanges">
+                    {radarAiTrace.exchanges.map((exchange, index) => (
+                      <section
+                        className="radar-ai-trace-exchange"
+                        key={`${exchange.round}-${index}`}
+                      >
+                        <header>
+                          <div>
+                            <strong>第 {exchange.round} 轮调用</strong>
+                            <span>
+                              {[exchange.provider, exchange.model]
+                                .filter(Boolean)
+                                .join(" / ") || "等待 AI 返回"}
+                              {exchange.latencyMs !== null
+                                ? ` · ${(exchange.latencyMs / 1_000).toFixed(2)} 秒`
+                                : ""}
+                            </span>
+                          </div>
+                          {exchange.errorMessage && (
+                            <small>{exchange.errorMessage}</small>
+                          )}
+                        </header>
+
+                        <div className="radar-ai-trace-block">
+                          <div>
+                            <strong>发送给 AI 的完整提示词</strong>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void copyRadarAiText(
+                                  exchange.prompt,
+                                  `第 ${exchange.round} 轮提示词`,
+                                )
+                              }
+                            >
+                              复制提示词
+                            </button>
+                          </div>
+                          <pre>{exchange.prompt}</pre>
+                        </div>
+
+                        <div className="radar-ai-trace-block">
+                          <div>
+                            <strong>AI 的完整回复</strong>
+                            <button
+                              type="button"
+                              disabled={!exchange.response}
+                              onClick={() =>
+                                void copyRadarAiText(
+                                  exchange.response,
+                                  `第 ${exchange.round} 轮回复`,
+                                )
+                              }
+                            >
+                              复制回复
+                            </button>
+                          </div>
+                          <pre>
+                            {exchange.response || "（AI 尚未返回文本）"}
+                          </pre>
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <footer className="radar-ai-trace-footer">
+              <p>记录包含排重清单中的论文标题与标识，仅在点击时读取。</p>
+              <div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={copyCompleteRadarAiTrace}
+                  disabled={!radarAiTrace?.exchanges.length}
+                >
+                  复制全部
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={closeRadarAiTrace}
+                >
+                  完成
+                </button>
+              </div>
+            </footer>
           </section>
         </div>
       )}

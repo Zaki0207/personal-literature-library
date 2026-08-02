@@ -369,6 +369,14 @@ function createRequestHandler(
         return;
       }
 
+      if (request.method === "GET" && pathname === "/api/radar/ai-trace") {
+        assertAiRequestOrigin(request);
+        sendJson(response, request, 200, {
+          trace: literatureRadarService.getAiTrace(),
+        });
+        return;
+      }
+
       if (request.method === "POST" && pathname === "/api/radar/run") {
         assertAiRequestOrigin(request);
         const result = await literatureRadarService.run(

@@ -4364,6 +4364,230 @@ a:focus-visible {
   min-width: 190px;
 }
 
+.radar-composer-buttons {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.radar-trace-button {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.radar-ai-trace-modal {
+  display: grid;
+  width: min(1080px, 100%);
+  height: min(820px, calc(100vh - 48px));
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  padding: 0;
+  overflow: hidden;
+}
+
+.radar-ai-trace-heading {
+  margin: 0;
+  padding: 23px 25px 19px;
+  border-bottom: 1px solid var(--line);
+}
+
+.radar-ai-trace-heading p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.radar-ai-trace-content {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-height: 0;
+  padding: 20px 24px 24px;
+  overflow-y: auto;
+  background: #f7f8f6;
+}
+
+.radar-ai-trace-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+.radar-ai-trace-summary > span {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--ink-soft);
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.radar-ai-trace-summary > span.is-completed {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.radar-ai-trace-summary > span.is-failed {
+  background: #fff0eb;
+  color: #94452f;
+}
+
+.radar-ai-trace-summary p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.radar-ai-trace-exchanges {
+  display: grid;
+  gap: 16px;
+}
+
+.radar-ai-trace-exchange {
+  display: grid;
+  gap: 13px;
+  padding: 17px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: var(--card);
+  box-shadow: 0 5px 18px rgba(20, 40, 36, 0.04);
+}
+
+.radar-ai-trace-exchange > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.radar-ai-trace-exchange > header > div {
+  display: grid;
+  gap: 4px;
+}
+
+.radar-ai-trace-exchange > header strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.radar-ai-trace-exchange > header span,
+.radar-ai-trace-exchange > header small {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.radar-ai-trace-exchange > header small {
+  max-width: 360px;
+  color: #94452f;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.radar-ai-trace-block {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #dfe6e2;
+  border-radius: 10px;
+  background: #fbfcfb;
+}
+
+.radar-ai-trace-block > div {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px;
+  border-bottom: 1px solid #e4e9e6;
+  background: #f1f5f3;
+}
+
+.radar-ai-trace-block strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.radar-ai-trace-block button {
+  padding: 4px 7px;
+  border: 1px solid #cbd8d3;
+  border-radius: 6px;
+  background: white;
+  color: var(--ink);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.radar-ai-trace-block button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.radar-ai-trace-block pre {
+  max-height: 340px;
+  margin: 0;
+  padding: 14px;
+  overflow: auto;
+  color: #263632;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  tab-size: 2;
+  white-space: pre-wrap;
+}
+
+.radar-ai-trace-empty {
+  display: grid;
+  min-height: 300px;
+  place-items: center;
+  align-content: center;
+  gap: 7px;
+  color: var(--faint);
+  text-align: center;
+}
+
+.radar-ai-trace-empty > span {
+  color: var(--accent);
+  font-size: 25px;
+}
+
+.radar-ai-trace-empty strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.radar-ai-trace-empty p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.radar-ai-trace-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--line);
+  background: var(--card);
+}
+
+.radar-ai-trace-footer p {
+  margin: 0;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.radar-ai-trace-footer > div {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
 .radar-review-section {
   margin-top: 28px;
 }
@@ -4660,6 +4884,48 @@ a:focus-visible {
 
   .radar-run-button {
     width: 100%;
+  }
+
+  .radar-composer-buttons,
+  .radar-ai-trace-footer,
+  .radar-ai-trace-exchange > header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .radar-composer-buttons,
+  .radar-ai-trace-footer > div {
+    width: 100%;
+  }
+
+  .radar-composer-buttons > button,
+  .radar-ai-trace-footer button {
+    flex: 1;
+  }
+
+  .radar-ai-trace-modal {
+    height: calc(100vh - 24px);
+  }
+
+  .radar-ai-trace-heading {
+    padding: 20px 18px 16px;
+  }
+
+  .radar-ai-trace-content {
+    padding: 15px 13px 18px;
+  }
+
+  .radar-ai-trace-exchange {
+    padding: 13px;
+  }
+
+  .radar-ai-trace-exchange > header small {
+    max-width: none;
+    text-align: left;
+  }
+
+  .radar-ai-trace-footer {
+    padding: 13px;
   }
 }
 

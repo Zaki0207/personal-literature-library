@@ -56,6 +56,7 @@ const PAPER_SOURCES_NORMALIZATION_MIGRATION_ID =
 export const DEFAULT_RADAR_PROMPT =
   "请检索与我的研究方向高度相关、近期值得阅读的论文。优先推荐有明确学术来源、可核验原文链接，并说明每篇论文为什么值得我关注。";
 const RADAR_ITEM_STATUSES = new Set(["pending", "added", "discarded"]);
+const RADAR_AI_TRACE_STATUSES = new Set(["running", "completed", "failed"]);
 const MAX_CATEGORY_DEPTH = 3;
 const PDF_ARCHIVE_STATUSES = new Set(["ready", "failed", "stale"]);
 const LEGACY_AI_BASE_URLS = {
@@ -352,6 +353,61 @@ function validateRadarItemStatus(value) {
     });
   }
   return value;
+}
+
+function validateRadarAiTrace(value) {
+  if (!isPlainObject(value)) {
+    throw new ValidationError("文献雷达 AI 记录必须是对象。");
+  }
+  if (!RADAR_AI_TRACE_STATUSES.has(value.status)) {
+    throw new ValidationError("文献雷达 AI 记录状态无效。", {
+      field: "status",
+    });
+  }
+  const requestedCount = validateRadarCount(value.requestedCount);
+  const userPrompt = validateRadarPrompt(value.userPrompt);
+  if (!Array.isArray(value.exchanges) || value.exchanges.length > 3) {
+    throw new ValidationError("文献雷达 AI 往返记录无效。", {
+      field: "exchanges",
+    });
+  }
+  const exchanges = value.exchanges.map((exchange, index) => {
+    if (
+      !isPlainObject(exchange) ||
+      !Number.isSafeInteger(exchange.round) ||
+      exchange.round < 1 ||
+      exchange.round > 3 ||
+      typeof exchange.prompt !== "string" ||
+      !exchange.prompt ||
+      typeof exchange.response !== "string"
+    ) {
+      throw new ValidationError("文献雷达 AI 往返记录内容无效。", {
+        field: `exchanges[${index}]`,
+      });
+    }
+    return {
+      round: exchange.round,
+      prompt: exchange.prompt,
+      response: exchange.response,
+      startedAt: String(exchange.startedAt ?? ""),
+      completedAt: String(exchange.completedAt ?? ""),
+      provider: String(exchange.provider ?? ""),
+      model: String(exchange.model ?? ""),
+      latencyMs: Number.isFinite(exchange.latencyMs)
+        ? Math.max(0, Math.round(exchange.latencyMs))
+        : null,
+      errorMessage: String(exchange.errorMessage ?? "").slice(0, 1_000),
+    };
+  });
+  return {
+    status: value.status,
+    requestedCount,
+    userPrompt,
+    exchanges,
+    startedAt: String(value.startedAt ?? ""),
+    completedAt: String(value.completedAt ?? ""),
+    errorMessage: String(value.errorMessage ?? "").slice(0, 1_000),
+  };
 }
 
 function validateRadarCandidate(value) {
@@ -899,6 +955,15 @@ export class LibraryRepository {
         )
         .get(),
     );
+    const hadRadarAiTraceTable = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'radar_ai_trace'`,
+        )
+        .get(),
+    );
     const legacyAiConnectionColumns = hadAiConnectionsTable
       ? this.db
           .prepare("PRAGMA table_info(ai_connections)")
@@ -1051,6 +1116,19 @@ export class LibraryRepository {
         prompt TEXT NOT NULL,
         requested_count INTEGER NOT NULL
           CHECK (requested_count BETWEEN 1 AND 30),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS radar_ai_trace (
+        id TEXT PRIMARY KEY CHECK (id = 'latest'),
+        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+        requested_count INTEGER NOT NULL
+          CHECK (requested_count BETWEEN 1 AND 30),
+        user_prompt TEXT NOT NULL,
+        exchanges_json TEXT NOT NULL DEFAULT '[]',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
       ) STRICT;
 
@@ -1275,6 +1353,7 @@ export class LibraryRepository {
       if (!hadRadarSettingsTable || !hadRadarItemsTable) {
         this.schemaMigrated = true;
       }
+      if (!hadRadarAiTraceTable) this.schemaMigrated = true;
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS categories_active_parent_order_idx
           ON categories(deleted_at, parent_id, sort_order, id)
@@ -1965,6 +2044,37 @@ export class LibraryRepository {
       prompt: row?.prompt ?? DEFAULT_RADAR_PROMPT,
       requestedCount: Number(row?.requestedCount ?? 5),
       ...(row?.updatedAt ? { updatedAt: row.updatedAt } : {}),
+    };
+  }
+
+  getRadarAiTrace() {
+    this.#assertOpen();
+    const row = this.db
+      .prepare(
+        `SELECT status, requested_count AS requestedCount,
+                user_prompt AS userPrompt, exchanges_json AS exchangesJson,
+                error_message AS errorMessage, started_at AS startedAt,
+                completed_at AS completedAt, updated_at AS updatedAt
+         FROM radar_ai_trace WHERE id = 'latest'`,
+      )
+      .get();
+    if (!row) return null;
+    let exchanges = [];
+    try {
+      const parsed = JSON.parse(row.exchangesJson);
+      if (Array.isArray(parsed)) exchanges = parsed;
+    } catch {
+      // Preserve the run metadata even if a manually edited database has bad JSON.
+    }
+    return {
+      status: row.status,
+      requestedCount: Number(row.requestedCount),
+      userPrompt: row.userPrompt,
+      exchanges,
+      errorMessage: row.errorMessage,
+      startedAt: row.startedAt,
+      completedAt: row.completedAt,
+      updatedAt: row.updatedAt,
     };
   }
 
@@ -2814,6 +2924,40 @@ export class LibraryRepository {
         .run(normalizedPrompt, requestedCount, now);
       const backup = await this.#createBackup();
       return { settings: this.getRadarSettings(), backup };
+    });
+  }
+
+  async saveRadarAiTrace(value) {
+    return this.#queueMutation(async () => {
+      const trace = validateRadarAiTrace(value);
+      const updatedAt = this.now().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO radar_ai_trace (
+             id, status, requested_count, user_prompt, exchanges_json,
+             error_message, started_at, completed_at, updated_at
+           ) VALUES ('latest', ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             status = excluded.status,
+             requested_count = excluded.requested_count,
+             user_prompt = excluded.user_prompt,
+             exchanges_json = excluded.exchanges_json,
+             error_message = excluded.error_message,
+             started_at = excluded.started_at,
+             completed_at = excluded.completed_at,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          trace.status,
+          trace.requestedCount,
+          trace.userPrompt,
+          JSON.stringify(trace.exchanges),
+          trace.errorMessage,
+          trace.startedAt,
+          trace.completedAt,
+          updatedAt,
+        );
+      return this.getRadarAiTrace();
     });
   }
 
