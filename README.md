@@ -13,7 +13,8 @@ The project is designed for individual research workflows. It is currently Chine
 - Track paper resources consistently, including PDF availability, code repositories, project pages, and source links.
 - Open locally archived PDFs first; on the first open, keep the source link responsive while archiving a verified local copy in the background.
 - Detect duplicate papers using normalized titles and identifiers such as DOI and arXiv IDs.
-- Add papers from a reference or URL, resolve metadata, and optionally enrich the draft with an AI model you configure.
+- Discover recent papers with the AI Literature Radar, choose the number of candidates for each run, and review them before they enter the library.
+- Add papers from a DOI, arXiv identifier, web page, direct PDF URL, or publisher ePDF link; resolve metadata and optionally enrich the draft with an AI model you configure.
 - Store library data locally in SQLite and create integrity-checked backups after successful changes.
 
 ## Main Interface
@@ -51,16 +52,35 @@ An empty library starts safely. A private local seed file, if present at `local-
 ## Everyday Workflow
 
 1. Create categories that match your research areas and choose which top-level categories appear in the sidebar.
-2. Add a paper manually or provide a DOI, arXiv identifier, or paper URL for metadata lookup.
+2. Run the Literature Radar when you want a batch of new candidates, or add a paper manually with a DOI, arXiv identifier, paper URL, or PDF URL.
 3. Review the proposed metadata, resource links, category assignment, and optional AI-generated summary before saving.
 4. Use search, filters, favorites, and the reading-later list to retrieve papers quickly.
 5. Add personal notes directly to a paper and use its PDF, code, project, or source links from the same card.
+
+## Literature Radar
+
+The Literature Radar is a review queue for AI-assisted paper discovery. Each run is local-first and user-controlled:
+
+1. Edit the research request and choose how many candidates to ask for (from 1 to 30).
+2. The everyday request is editable inline. A separate advanced editor exposes the complete prompt template and its variables only when you open it, so the full system instructions do not clutter the normal workflow.
+3. The configured AI model performs web search and returns only candidates with a DOI, arXiv identifier, or verifiable paper URL. The default template searches beyond arXiv and prioritizes formal venues such as ACM SIGGRAPH, SIGGRAPH Asia, ACM TOG, CVPR, ICCV, ECCV, Eurographics, Computer Graphics Forum, SCA, NeurIPS, ICLR, ICML, AAAI, TPAMI, IJCV, TVCG, and TIP when they match the research scope.
+4. Before the request is sent, the AI receives a compact exclusion context containing paper titles, DOI/arXiv identifiers, and URLs from the current library and radar history. The local database then performs a second strict check against the library, pending candidates, added candidates, discarded history, and other results from the same run.
+5. Candidates appear in **Personal Review**. **Discard and never recommend again** keeps a candidate in the permanent exclusion history; it can be restored to the review queue if you change your mind. If there are not enough high-confidence, non-duplicate results, the radar returns fewer papers instead of filling the quota with repeats.
+6. **Review and add** opens the normal paper-intake flow with the candidate link prefilled. Metadata and duplicate checks run again, every field remains editable, and the radar item is marked as added only after you confirm a successful library save.
+
+The **View this AI record** action shows and lets you copy the exact rendered prompts and complete AI responses for the latest run. This makes the search auditable without exposing the advanced template during everyday use.
 
 ## AI-Assisted Enrichment
 
 AI integration is optional. From **AI Settings**, add a service connection with a display name, base URL, API key, and one or more model IDs. A model is verified with a minimal request before it is saved, and a single service connection can share its credential across multiple models.
 
 The application prefers the Responses API and falls back to Chat Completions only when a compatible provider explicitly returns a `404` for the first endpoint. AI requests respect the HTTP/HTTPS proxy available when the application starts.
+
+The Literature Radar requires a model and provider that support Responses API Web Search. Paper intake and radar use separate request limits so a slow web search does not look like a short metadata failure:
+
+- Paper metadata requests wait up to 20 seconds and cap HTML metadata at 2 MiB.
+- AI enrichment during paper intake waits up to 3 minutes. If it times out, the metadata draft is kept and can be completed manually.
+- A radar web-search run can wait up to 20 minutes while it searches and checks multiple rounds of candidates.
 
 ### Credential Handling
 
@@ -108,6 +128,13 @@ copy when available; otherwise it opens the source URL immediately and starts a
 background archive. HTML login pages, error pages, and files larger than 200 MiB
 are rejected rather than saved as PDFs. The editor also supports retrying,
 manual PDF import, and removal of the local copy.
+
+The paper-intake editor treats direct PDF links as paper references: it detects the
+PDF response without loading the entire file just to read metadata, then tries the
+nearby project or landing page and Crossref to identify the paper. DOI-bearing
+publisher ePDF links, including ACM links that challenge automated clients, use the
+DOI/Crossref metadata path while preserving the original ePDF as the paper's PDF
+resource.
 
 PDF files are not embedded in SQLite or copied into each versioned SQLite backup.
 Use Time Machine or a separate sync/backup strategy for the archive directory if

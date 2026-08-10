@@ -54,6 +54,7 @@ export function createProxyAwareFetch(environment = process.env) {
 }
 
 const defaultProviderFetch = createProxyAwareFetch();
+const WEB_SEARCH_TIMEOUT_MS = 20 * 60_000;
 
 export const AI_PROVIDER_DEFINITIONS = Object.freeze({
   openai: Object.freeze({
@@ -126,10 +127,10 @@ class BaseProvider {
     this.timeoutMs = timeoutMs;
   }
 
-  async request(url, { provider, apiKey, body }) {
+  async request(url, { provider, apiKey, body, timeoutMs = this.timeoutMs }) {
     const startedAt = performance.now();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await this.fetchImpl(url, {
         method: "POST",
@@ -177,7 +178,20 @@ export class OpenAiProvider extends BaseProvider {
   id = "openai";
   chatCompatibleBaseUrls = new Set();
 
-  async generateChatCompletion({ apiKey, model, input, baseUrl }) {
+  async generateChatCompletion({
+    apiKey,
+    model,
+    input,
+    baseUrl,
+    webSearch,
+    timeoutMs,
+  }) {
+    if (webSearch) {
+      throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
+        provider: this.id,
+        diagnostics: { endpoint: "chat/completions" },
+      });
+    }
     const result = await this.request(
       providerEndpoint(baseUrl, "chat/completions"),
       {
@@ -188,6 +202,7 @@ export class OpenAiProvider extends BaseProvider {
           messages: [{ role: "user", content: input }],
           stream: false,
         },
+        ...(timeoutMs ? { timeoutMs } : {}),
       },
     );
     return {
@@ -202,7 +217,14 @@ export class OpenAiProvider extends BaseProvider {
     };
   }
 
-  async generateText({ apiKey, model, input, baseUrl }) {
+  async generateText({
+    apiKey,
+    model,
+    input,
+    baseUrl,
+    webSearch = false,
+    timeoutMs,
+  }) {
     const resolvedBaseUrl = baseUrl ?? AI_PROVIDER_DEFINITIONS.openai.baseUrl;
     if (this.chatCompatibleBaseUrls.has(resolvedBaseUrl)) {
       return this.generateChatCompletion({
@@ -210,6 +232,8 @@ export class OpenAiProvider extends BaseProvider {
         model,
         input,
         baseUrl: resolvedBaseUrl,
+        webSearch,
+        timeoutMs,
       });
     }
 
@@ -224,16 +248,37 @@ export class OpenAiProvider extends BaseProvider {
             model,
             input,
             store: false,
+            ...(webSearch
+              ? {
+                  tools: [{ type: "web_search" }],
+                  tool_choice: "required",
+                }
+              : {}),
           },
+          ...(webSearch
+            ? { timeoutMs: WEB_SEARCH_TIMEOUT_MS }
+            : timeoutMs
+              ? { timeoutMs }
+              : {}),
         },
       );
     } catch (error) {
       if (!shouldTryChatCompletions(error)) throw error;
+      if (webSearch) {
+        throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
+          provider: this.id,
+          diagnostics: {
+            httpStatus: error.diagnostics?.httpStatus,
+            upstreamCode: error.diagnostics?.upstreamCode,
+          },
+        });
+      }
       const fallback = await this.generateChatCompletion({
         apiKey,
         model,
         input,
         baseUrl: resolvedBaseUrl,
+        timeoutMs,
       });
       this.chatCompatibleBaseUrls.add(resolvedBaseUrl);
       return fallback;
@@ -253,6 +298,7 @@ export class OpenAiProvider extends BaseProvider {
       usage: result.payload.usage ?? null,
       latencyMs: result.latencyMs,
       requestId: result.requestId,
+      webSearchUsed: webSearch,
     };
   }
 }
@@ -260,7 +306,7 @@ export class OpenAiProvider extends BaseProvider {
 export class DeepSeekProvider extends BaseProvider {
   id = "deepseek";
 
-  async generateText({ apiKey, model, input, baseUrl }) {
+  async generateText({ apiKey, model, input, baseUrl, timeoutMs }) {
     const result = await this.request(
       providerEndpoint(
         baseUrl ?? AI_PROVIDER_DEFINITIONS.deepseek.baseUrl,
@@ -274,6 +320,7 @@ export class DeepSeekProvider extends BaseProvider {
           messages: [{ role: "user", content: input }],
           stream: false,
         },
+        ...(timeoutMs ? { timeoutMs } : {}),
       },
     );
     return {

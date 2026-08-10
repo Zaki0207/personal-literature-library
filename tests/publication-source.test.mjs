@@ -44,6 +44,16 @@ test("期刊和 SIGGRAPH 联合出处保留必要信息但统一位置", () => {
   );
 });
 
+test("Crossref 的 SIGGRAPH 展开名称会归一化为会议简称", () => {
+  assert.equal(
+    normalizePublicationSource(
+      "Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers",
+      "2024-07-13",
+    ),
+    "SIGGRAPH 2024",
+  );
+});
+
 test("仅有出版社时可从明确的论文集标题恢复出处，未知来源不臆造简称", () => {
   assert.equal(
     normalizePublicationSource("Association for Computing Machinery", "2024", {

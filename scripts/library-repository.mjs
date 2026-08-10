@@ -53,6 +53,47 @@ const PAPER_IDENTIFIERS_MIGRATION_ID = "paper-identifiers-normalization-v2";
 const PAPER_KEYWORDS_REMOVAL_MIGRATION_ID = "remove-paper-keywords-v1";
 const PAPER_SOURCES_NORMALIZATION_MIGRATION_ID =
   "normalize-paper-publication-sources-v1";
+export const DEFAULT_RADAR_PROMPT =
+  "请检索与我的研究方向高度相关、近期值得阅读的论文。优先推荐有明确学术来源、可核验原文链接，并说明每篇论文为什么值得我关注。";
+export const DEFAULT_RADAR_PROMPT_TEMPLATE = `你是网站内置的文献雷达。必须使用联网检索查找真实论文，并核验标题、作者、出处和原文链接。
+
+用户可编辑的研究范围：
+{{research_scope}}
+
+本轮任务：
+- 这是第 {{round}} 轮检索。
+- 请返回 {{requested_count}} 篇候选论文，尽量覆盖不同工作。
+- 不得推荐下面排除清单中的任何论文，也不得推荐同一论文的不同链接、标题或发表版本。
+- 只返回有 DOI、arXiv 编号或可核验原文 URL 的论文。
+- recommendationReason 必须具体说明论文与用户研究范围的关系，以及相对现有知识库带来的新增价值。
+- aiSummary 使用中文概括论文解决的问题、核心方法和主要贡献。
+- 不要编造论文、作者、出处、录用状态或链接。
+
+检索来源要求：
+- 不得只检索 arXiv，必须同时搜索正式会议论文集、期刊官网和权威论文数据库。
+- 计算机图形学与视觉方向优先覆盖 ACM SIGGRAPH、SIGGRAPH Asia、ACM Transactions on Graphics（TOG）、CVPR、ICCV、ECCV、Eurographics、Computer Graphics Forum 和 SCA。
+- 人工智能与机器学习方向可覆盖 NeurIPS、ICLR、ICML 和 AAAI，但仅推荐与用户研究范围直接相关的论文。
+- 相关顶级期刊优先覆盖 IEEE TPAMI、IJCV、IEEE TVCG、IEEE TIP，以及该研究方向公认的高质量同行评审期刊。
+- 优先核查 ACM Digital Library、CVF Open Access、IEEE Xplore、SpringerLink、OpenReview、PMLR、期刊官网或会议官网。
+- 优先推荐近 3 年正式发表或已被会议接收的论文；特别重要的经典工作可以不受时间限制。
+- 在数量允许时，正式会议或期刊论文应占多数；arXiv 仅用于补充尚未正式发表的最新工作。
+- 如果 arXiv 论文已有正式会议或期刊版本，必须优先推荐正式版本，并使用正式出处和 DOI。
+- 同一论文的 arXiv、会议、期刊、作者主页和项目页版本只能推荐一次。
+- 如果没有足够数量的高可信度、不重复论文，应少返回，不得用低质量、重复或无法核验的论文补足。
+
+排除清单（来自当前知识库、历史待审/已加入/已丢弃记录及本次检索结果）：
+{{exclusions_json}}
+
+只输出一个合法 JSON 对象，不要输出 Markdown 或额外文字。格式必须是：
+{"papers":[{"title":"英文原题","zhTitle":"中文译题","authors":"作者，多个作者用逗号分隔","institution":"主要机构","source":"期刊/会议/arXiv","date":"YYYY-MM-DD 或 YYYY","aiSummary":"中文摘要","recommendationReason":"中文推荐理由","originalUrl":"论文正式页面、原文或 DOI/arXiv 页面","pdfUrl":"可选 PDF URL","identifiers":[{"kind":"doi|arxiv|url","value":"规范标识"}]}]}`;
+export const RADAR_PROMPT_TEMPLATE_VARIABLES = Object.freeze([
+  "{{research_scope}}",
+  "{{round}}",
+  "{{requested_count}}",
+  "{{exclusions_json}}",
+]);
+const RADAR_ITEM_STATUSES = new Set(["pending", "added", "discarded"]);
+const RADAR_AI_TRACE_STATUSES = new Set(["running", "completed", "failed"]);
 const MAX_CATEGORY_DEPTH = 3;
 const PDF_ARCHIVE_STATUSES = new Set(["ready", "failed", "stale"]);
 const LEGACY_AI_BASE_URLS = {
@@ -316,6 +357,153 @@ function validatePaperIdentifiers(value) {
   }
   const normalized = dedupePaperIdentifiers(value);
   return normalized;
+}
+
+function validateRadarPrompt(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ValidationError("文献雷达提示词不能为空。", {
+      field: "prompt",
+    });
+  }
+  const prompt = value.trim();
+  if (prompt.length > 10_000) {
+    throw new ValidationError("文献雷达提示词不能超过 10000 个字符。", {
+      field: "prompt",
+    });
+  }
+  return prompt;
+}
+
+function validateRadarPromptTemplate(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ValidationError("完整提示词模板不能为空。", {
+      field: "promptTemplate",
+    });
+  }
+  if (value.length > 50_000) {
+    throw new ValidationError("完整提示词模板不能超过 50000 个字符。", {
+      field: "promptTemplate",
+    });
+  }
+  const missingVariables = RADAR_PROMPT_TEMPLATE_VARIABLES.filter(
+    (variable) => !value.includes(variable),
+  );
+  if (missingVariables.length) {
+    throw new ValidationError(
+      `完整提示词模板缺少必要变量：${missingVariables.join("、")}`,
+      { field: "promptTemplate", missingVariables },
+    );
+  }
+  return value.trim();
+}
+
+function validateRadarCount(value) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 30) {
+    throw new ValidationError("每次推送数量必须是 1 到 30 之间的整数。", {
+      field: "count",
+    });
+  }
+  return value;
+}
+
+function validateRadarItemStatus(value) {
+  if (!RADAR_ITEM_STATUSES.has(value)) {
+    throw new ValidationError("文献雷达条目状态无效。", {
+      field: "status",
+    });
+  }
+  return value;
+}
+
+function validateRadarAiTrace(value) {
+  if (!isPlainObject(value)) {
+    throw new ValidationError("文献雷达 AI 记录必须是对象。");
+  }
+  if (!RADAR_AI_TRACE_STATUSES.has(value.status)) {
+    throw new ValidationError("文献雷达 AI 记录状态无效。", {
+      field: "status",
+    });
+  }
+  const requestedCount = validateRadarCount(value.requestedCount);
+  const userPrompt = validateRadarPrompt(value.userPrompt);
+  if (!Array.isArray(value.exchanges) || value.exchanges.length > 3) {
+    throw new ValidationError("文献雷达 AI 往返记录无效。", {
+      field: "exchanges",
+    });
+  }
+  const exchanges = value.exchanges.map((exchange, index) => {
+    if (
+      !isPlainObject(exchange) ||
+      !Number.isSafeInteger(exchange.round) ||
+      exchange.round < 1 ||
+      exchange.round > 3 ||
+      typeof exchange.prompt !== "string" ||
+      !exchange.prompt ||
+      typeof exchange.response !== "string"
+    ) {
+      throw new ValidationError("文献雷达 AI 往返记录内容无效。", {
+        field: `exchanges[${index}]`,
+      });
+    }
+    return {
+      round: exchange.round,
+      prompt: exchange.prompt,
+      response: exchange.response,
+      startedAt: String(exchange.startedAt ?? ""),
+      completedAt: String(exchange.completedAt ?? ""),
+      provider: String(exchange.provider ?? ""),
+      model: String(exchange.model ?? ""),
+      latencyMs: Number.isFinite(exchange.latencyMs)
+        ? Math.max(0, Math.round(exchange.latencyMs))
+        : null,
+      errorMessage: String(exchange.errorMessage ?? "").slice(0, 1_000),
+    };
+  });
+  return {
+    status: value.status,
+    requestedCount,
+    userPrompt,
+    exchanges,
+    startedAt: String(value.startedAt ?? ""),
+    completedAt: String(value.completedAt ?? ""),
+    errorMessage: String(value.errorMessage ?? "").slice(0, 1_000),
+  };
+}
+
+function validateRadarCandidate(value) {
+  if (!isPlainObject(value)) {
+    throw new ValidationError("文献雷达候选条目必须是对象。");
+  }
+  const title = requiredTitle(value.title);
+  const originalUrl = validateHttpUrl(value.originalUrl, "originalUrl") ?? null;
+  const pdfUrl = validateHttpUrl(value.pdfUrl, "pdfUrl") ?? null;
+  const identifiers = validatePaperIdentifiers(value.identifiers ?? []);
+  if (!identifiers.length) {
+    throw new ValidationError("文献雷达候选条目必须包含 DOI、arXiv 或原文 URL。", {
+      field: "identifiers",
+    });
+  }
+  return {
+    title,
+    normalizedTitle: normalizePaperTitle(title),
+    zhTitle: validateString(value.zhTitle ?? "", "zhTitle"),
+    authors: validateString(value.authors ?? "", "authors"),
+    institution: validateString(value.institution ?? "", "institution"),
+    source: normalizePublicationSource(
+      validateString(value.source ?? "", "source"),
+      validateString(value.date ?? "", "date"),
+      { title },
+    ),
+    date: validateString(value.date ?? "", "date"),
+    aiSummary: validateString(value.aiSummary ?? "", "aiSummary"),
+    recommendationReason: validateString(
+      value.recommendationReason ?? "",
+      "recommendationReason",
+    ),
+    originalUrl,
+    pdfUrl,
+    identifiers,
+  };
 }
 
 function validateCategoryIds(value) {
@@ -809,6 +997,33 @@ export class LibraryRepository {
         )
         .get(),
     );
+    const hadRadarSettingsTable = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'radar_settings'`,
+        )
+        .get(),
+    );
+    const hadRadarItemsTable = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'radar_items'`,
+        )
+        .get(),
+    );
+    const hadRadarAiTraceTable = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'radar_ai_trace'`,
+        )
+        .get(),
+    );
     const legacyAiConnectionColumns = hadAiConnectionsTable
       ? this.db
           .prepare("PRAGMA table_info(ai_connections)")
@@ -955,7 +1170,75 @@ export class LibraryRepository {
       CREATE UNIQUE INDEX IF NOT EXISTS ai_models_one_active_idx
         ON ai_models(active)
         WHERE active = 1;
+
+      CREATE TABLE IF NOT EXISTS radar_settings (
+        id TEXT PRIMARY KEY CHECK (id = 'default'),
+        prompt TEXT NOT NULL,
+        prompt_template TEXT NOT NULL DEFAULT '',
+        requested_count INTEGER NOT NULL
+          CHECK (requested_count BETWEEN 1 AND 30),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS radar_ai_trace (
+        id TEXT PRIMARY KEY CHECK (id = 'latest'),
+        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+        requested_count INTEGER NOT NULL
+          CHECK (requested_count BETWEEN 1 AND 30),
+        user_prompt TEXT NOT NULL,
+        exchanges_json TEXT NOT NULL DEFAULT '[]',
+        error_message TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS radar_items (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        normalized_title TEXT NOT NULL,
+        zh_title TEXT NOT NULL DEFAULT '',
+        authors TEXT NOT NULL DEFAULT '',
+        institution TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT '',
+        publication_date TEXT NOT NULL DEFAULT '',
+        ai_summary TEXT NOT NULL DEFAULT '',
+        recommendation_reason TEXT NOT NULL DEFAULT '',
+        original_url TEXT,
+        pdf_url TEXT,
+        status TEXT NOT NULL
+          CHECK (status IN ('pending', 'added', 'discarded')),
+        added_paper_id TEXT REFERENCES papers(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS radar_items_title_idx
+        ON radar_items(normalized_title);
+
+      CREATE INDEX IF NOT EXISTS radar_items_status_updated_idx
+        ON radar_items(status, updated_at DESC, id);
+
+      CREATE TABLE IF NOT EXISTS radar_item_identifiers (
+        item_id TEXT NOT NULL REFERENCES radar_items(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('doi', 'arxiv', 'url')),
+        normalized_value TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (item_id, kind, normalized_value),
+        UNIQUE (kind, normalized_value)
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS radar_item_identifiers_lookup_idx
+        ON radar_item_identifiers(kind, normalized_value, item_id);
       `);
+
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO radar_settings (
+             id, prompt, requested_count, updated_at
+           ) VALUES ('default', ?, 5, ?)`,
+        )
+        .run(DEFAULT_RADAR_PROMPT, this.now().toISOString());
 
       const categoryColumns = this.db
         .prepare("PRAGMA table_info(categories)")
@@ -963,6 +1246,10 @@ export class LibraryRepository {
         .map((column) => column.name);
       const paperColumns = this.db
         .prepare("PRAGMA table_info(papers)")
+        .all()
+        .map((column) => column.name);
+      const radarSettingColumns = this.db
+        .prepare("PRAGMA table_info(radar_settings)")
         .all()
         .map((column) => column.name);
       const alterations = [];
@@ -985,11 +1272,23 @@ export class LibraryRepository {
              CHECK (watch_later IN (0, 1))`,
         );
       }
+      if (!radarSettingColumns.includes("prompt_template")) {
+        alterations.push(
+          "ALTER TABLE radar_settings ADD COLUMN prompt_template TEXT NOT NULL DEFAULT ''",
+        );
+      }
       const removedKeywords = paperColumns.includes("keywords_json");
       if (removedKeywords) {
         alterations.push("ALTER TABLE papers DROP COLUMN keywords_json");
       }
       for (const statement of alterations) this.db.exec(statement);
+      this.db
+        .prepare(
+          `UPDATE radar_settings
+           SET prompt_template = ?
+           WHERE id = 'default' AND prompt_template = ''`,
+        )
+        .run(DEFAULT_RADAR_PROMPT_TEMPLATE);
       if (alterations.length) this.schemaMigrated = true;
       if (removedKeywords) {
         this.db
@@ -1128,6 +1427,10 @@ export class LibraryRepository {
       }
       if (!hadPaperIdentifiersTable) this.schemaMigrated = true;
       if (!hadPaperPdfArchivesTable) this.schemaMigrated = true;
+      if (!hadRadarSettingsTable || !hadRadarItemsTable) {
+        this.schemaMigrated = true;
+      }
+      if (!hadRadarAiTraceTable) this.schemaMigrated = true;
       this.db.exec(`
         CREATE INDEX IF NOT EXISTS categories_active_parent_order_idx
           ON categories(deleted_at, parent_id, sort_order, id)
@@ -1726,6 +2029,75 @@ export class LibraryRepository {
     return (childrenByParent.get(null) ?? []).map(project);
   }
 
+  #radarIdentifiersByItem() {
+    const byItem = new Map();
+    const rows = this.db
+      .prepare(
+        `SELECT item_id AS itemId, kind, normalized_value AS value
+         FROM radar_item_identifiers
+         ORDER BY item_id, kind, normalized_value`,
+      )
+      .all();
+    for (const row of rows) {
+      const identifiers = byItem.get(row.itemId) ?? [];
+      identifiers.push({ kind: row.kind, value: row.value });
+      byItem.set(row.itemId, identifiers);
+    }
+    return byItem;
+  }
+
+  #radarItemFromRow(row, identifiers = []) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      title: row.title,
+      zhTitle: row.zhTitle,
+      authors: row.authors,
+      institution: row.institution,
+      source: row.source,
+      date: row.date,
+      aiSummary: row.aiSummary,
+      recommendationReason: row.recommendationReason,
+      ...(row.originalUrl ? { originalUrl: row.originalUrl } : {}),
+      ...(row.pdfUrl ? { pdfUrl: row.pdfUrl } : {}),
+      identifiers,
+      status: validateRadarItemStatus(row.status),
+      ...(row.addedPaperId ? { addedPaperId: row.addedPaperId } : {}),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  #radarItems({ status, id } = {}) {
+    const clauses = [];
+    const parameters = [];
+    if (status) {
+      clauses.push("status = ?");
+      parameters.push(validateRadarItemStatus(status));
+    }
+    if (id) {
+      clauses.push("id = ?");
+      parameters.push(validateAiEntityId(id, "id"));
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT id, title, zh_title AS zhTitle, authors, institution, source,
+                publication_date AS date, ai_summary AS aiSummary,
+                recommendation_reason AS recommendationReason,
+                original_url AS originalUrl, pdf_url AS pdfUrl, status,
+                added_paper_id AS addedPaperId, created_at AS createdAt,
+                updated_at AS updatedAt
+         FROM radar_items
+         ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+         ORDER BY updated_at DESC, id`,
+      )
+      .all(...parameters);
+    const identifiersByItem = this.#radarIdentifiersByItem();
+    return rows.map((row) =>
+      this.#radarItemFromRow(row, identifiersByItem.get(row.id) ?? []),
+    );
+  }
+
   getLibrary() {
     this.#assertOpen();
     const papers = this.#papers();
@@ -1734,6 +2106,149 @@ export class LibraryRepository {
       categories: this.#categories(papers),
       backup: { ...this.backupStatus },
     };
+  }
+
+  getRadarSettings() {
+    this.#assertOpen();
+    const row = this.db
+      .prepare(
+        `SELECT prompt, prompt_template AS promptTemplate,
+                requested_count AS requestedCount,
+                updated_at AS updatedAt
+         FROM radar_settings WHERE id = 'default'`,
+      )
+      .get();
+    return {
+      prompt: row?.prompt ?? DEFAULT_RADAR_PROMPT,
+      promptTemplate:
+        row?.promptTemplate || DEFAULT_RADAR_PROMPT_TEMPLATE,
+      requestedCount: Number(row?.requestedCount ?? 5),
+      ...(row?.updatedAt ? { updatedAt: row.updatedAt } : {}),
+    };
+  }
+
+  getRadarAiTrace() {
+    this.#assertOpen();
+    const row = this.db
+      .prepare(
+        `SELECT status, requested_count AS requestedCount,
+                user_prompt AS userPrompt, exchanges_json AS exchangesJson,
+                error_message AS errorMessage, started_at AS startedAt,
+                completed_at AS completedAt, updated_at AS updatedAt
+         FROM radar_ai_trace WHERE id = 'latest'`,
+      )
+      .get();
+    if (!row) return null;
+    let exchanges = [];
+    try {
+      const parsed = JSON.parse(row.exchangesJson);
+      if (Array.isArray(parsed)) exchanges = parsed;
+    } catch {
+      // Preserve the run metadata even if a manually edited database has bad JSON.
+    }
+    return {
+      status: row.status,
+      requestedCount: Number(row.requestedCount),
+      userPrompt: row.userPrompt,
+      exchanges,
+      errorMessage: row.errorMessage,
+      startedAt: row.startedAt,
+      completedAt: row.completedAt,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  getRadarItem(id) {
+    this.#assertOpen();
+    return this.#radarItems({ id })[0] ?? null;
+  }
+
+  getRadarState() {
+    this.#assertOpen();
+    const counts = Object.fromEntries(
+      this.db
+        .prepare(
+          `SELECT status, COUNT(*) AS count
+           FROM radar_items GROUP BY status`,
+        )
+        .all()
+        .map((row) => [row.status, Number(row.count)]),
+    );
+    const libraryCount = Number(
+      this.db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM papers WHERE deleted_at IS NULL",
+        )
+        .get().count,
+    );
+    return {
+      settings: this.getRadarSettings(),
+      pending: this.#radarItems({ status: "pending" }),
+      discarded: this.#radarItems({ status: "discarded" }),
+      counts: {
+        library: libraryCount,
+        pending: counts.pending ?? 0,
+        discarded: counts.discarded ?? 0,
+        added: counts.added ?? 0,
+      },
+      backup: { ...this.backupStatus },
+    };
+  }
+
+  getRadarExclusions() {
+    this.#assertOpen();
+    const library = this.#papers().map((paper) => ({
+      origin: "library",
+      title: paper.title,
+      identifiers: paper.identifiers,
+    }));
+    const radar = this.#radarItems().map((item) => ({
+      origin: "radar",
+      status: item.status,
+      title: item.title,
+      identifiers: item.identifiers,
+    }));
+    return [...library, ...radar];
+  }
+
+  findRadarDuplicates({ identifiers = [], title = "" } = {}) {
+    this.#assertOpen();
+    const normalizedIdentifiers = validatePaperIdentifiers(identifiers) ?? [];
+    const matches = new Map();
+    const addReason = (itemId, reason) => {
+      const reasons = matches.get(itemId) ?? [];
+      if (!reasons.some((item) => JSON.stringify(item) === JSON.stringify(reason))) {
+        reasons.push(reason);
+      }
+      matches.set(itemId, reasons);
+    };
+    const lookup = this.db.prepare(
+      `SELECT item_id AS itemId
+       FROM radar_item_identifiers
+       WHERE kind = ? AND normalized_value = ?`,
+    );
+    for (const identifier of normalizedIdentifiers) {
+      for (const row of lookup.all(identifier.kind, identifier.value)) {
+        addReason(row.itemId, {
+          type: "identifier",
+          kind: identifier.kind,
+          value: identifier.value,
+        });
+      }
+    }
+    const normalizedTitle = normalizePaperTitle(title);
+    if (normalizedTitle) {
+      const row = this.db
+        .prepare(
+          "SELECT id FROM radar_items WHERE normalized_title = ?",
+        )
+        .get(normalizedTitle);
+      if (row) addReason(row.id, { type: "title" });
+    }
+    return [...matches.entries()].map(([itemId, reasons]) => ({
+      item: this.getRadarItem(itemId),
+      reasons,
+    }));
   }
 
   getCategories() {
@@ -2469,6 +2984,220 @@ export class LibraryRepository {
     });
     this.mutationQueue = result.catch(() => undefined);
     return result;
+  }
+
+  async saveRadarSettings({ prompt, count } = {}) {
+    return this.#queueMutation(async () => {
+      const normalizedPrompt = validateRadarPrompt(prompt);
+      const requestedCount = validateRadarCount(count);
+      const now = this.now().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO radar_settings (
+             id, prompt, requested_count, updated_at
+           ) VALUES ('default', ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             prompt = excluded.prompt,
+             requested_count = excluded.requested_count,
+             updated_at = excluded.updated_at`,
+        )
+        .run(normalizedPrompt, requestedCount, now);
+      const backup = await this.#createBackup();
+      return { settings: this.getRadarSettings(), backup };
+    });
+  }
+
+  async saveRadarPromptTemplate(value) {
+    return this.#queueMutation(async () => {
+      const promptTemplate = validateRadarPromptTemplate(value);
+      const updatedAt = this.now().toISOString();
+      this.db
+        .prepare(
+          `UPDATE radar_settings
+           SET prompt_template = ?, updated_at = ?
+           WHERE id = 'default'`,
+        )
+        .run(promptTemplate, updatedAt);
+      const backup = await this.#createBackup();
+      return { settings: this.getRadarSettings(), backup };
+    });
+  }
+
+  async resetRadarPromptTemplate() {
+    return this.saveRadarPromptTemplate(DEFAULT_RADAR_PROMPT_TEMPLATE);
+  }
+
+  async saveRadarAiTrace(value) {
+    return this.#queueMutation(async () => {
+      const trace = validateRadarAiTrace(value);
+      const updatedAt = this.now().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO radar_ai_trace (
+             id, status, requested_count, user_prompt, exchanges_json,
+             error_message, started_at, completed_at, updated_at
+           ) VALUES ('latest', ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             status = excluded.status,
+             requested_count = excluded.requested_count,
+             user_prompt = excluded.user_prompt,
+             exchanges_json = excluded.exchanges_json,
+             error_message = excluded.error_message,
+             started_at = excluded.started_at,
+             completed_at = excluded.completed_at,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          trace.status,
+          trace.requestedCount,
+          trace.userPrompt,
+          JSON.stringify(trace.exchanges),
+          trace.errorMessage,
+          trace.startedAt,
+          trace.completedAt,
+          updatedAt,
+        );
+      return this.getRadarAiTrace();
+    });
+  }
+
+  async saveRadarCandidates(candidates) {
+    return this.#queueMutation(async () => {
+      if (!Array.isArray(candidates) || candidates.length > 90) {
+        throw new ValidationError("文献雷达候选条目必须是数组，且不能超过 90 条。", {
+          field: "candidates",
+        });
+      }
+      const normalizedCandidates = candidates.map(validateRadarCandidate);
+      const inserted = [];
+      const skipped = [];
+      const now = this.now().toISOString();
+      const insertItem = this.db.prepare(
+        `INSERT INTO radar_items (
+           id, title, normalized_title, zh_title, authors, institution,
+           source, publication_date, ai_summary, recommendation_reason,
+           original_url, pdf_url, status, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      );
+      const insertIdentifier = this.db.prepare(
+        `INSERT INTO radar_item_identifiers (
+           item_id, kind, normalized_value, created_at
+         ) VALUES (?, ?, ?, ?)`,
+      );
+
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const candidate of normalizedCandidates) {
+          const libraryMatches = this.findPaperDuplicates(candidate);
+          const radarMatches = this.findRadarDuplicates(candidate);
+          if (libraryMatches.length || radarMatches.length) {
+            skipped.push({
+              title: candidate.title,
+              reason: libraryMatches.length ? "library" : "radar",
+            });
+            continue;
+          }
+          const id = `radar-${randomUUID()}`;
+          insertItem.run(
+            id,
+            candidate.title,
+            candidate.normalizedTitle,
+            candidate.zhTitle,
+            candidate.authors,
+            candidate.institution,
+            candidate.source,
+            candidate.date,
+            candidate.aiSummary,
+            candidate.recommendationReason,
+            candidate.originalUrl,
+            candidate.pdfUrl,
+            now,
+            now,
+          );
+          for (const identifier of candidate.identifiers) {
+            insertIdentifier.run(id, identifier.kind, identifier.value, now);
+          }
+          inserted.push(id);
+        }
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+      const backup = inserted.length
+        ? await this.#createBackup()
+        : { ...this.backupStatus };
+      return {
+        inserted: inserted.map((id) => this.getRadarItem(id)),
+        skipped,
+        backup,
+      };
+    });
+  }
+
+  async discardRadarItem(id) {
+    return this.#queueMutation(async () => {
+      validateAiEntityId(id, "id");
+      const item = this.getRadarItem(id);
+      if (!item) throw new NotFoundError("未找到文献雷达条目。");
+      if (item.status === "added") {
+        throw new ConflictError("已加入知识库的论文不能丢弃。");
+      }
+      if (item.status !== "discarded") {
+        this.db
+          .prepare(
+            `UPDATE radar_items
+             SET status = 'discarded', updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(this.now().toISOString(), id);
+      }
+      const backup = await this.#createBackup();
+      return { item: this.getRadarItem(id), backup };
+    });
+  }
+
+  async restoreRadarItem(id) {
+    return this.#queueMutation(async () => {
+      validateAiEntityId(id, "id");
+      const item = this.getRadarItem(id);
+      if (!item) throw new NotFoundError("未找到文献雷达条目。");
+      if (item.status !== "discarded") {
+        throw new ConflictError("只有已丢弃论文可以恢复到待审核列表。");
+      }
+      this.db
+        .prepare(
+          `UPDATE radar_items
+           SET status = 'pending', updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(this.now().toISOString(), id);
+      const backup = await this.#createBackup();
+      return { item: this.getRadarItem(id), backup };
+    });
+  }
+
+  async markRadarItemAdded(id, paperId) {
+    return this.#queueMutation(async () => {
+      validateAiEntityId(id, "id");
+      validatePaperId(paperId);
+      const item = this.getRadarItem(id);
+      if (!item) throw new NotFoundError("未找到文献雷达条目。");
+      const paper = this.getPaper(paperId);
+      if (!paper) throw new NotFoundError("未找到刚加入知识库的论文。");
+      if (item.status !== "pending") {
+        throw new ConflictError("只有待审核论文可以加入知识库。");
+      }
+      this.db
+        .prepare(
+          `UPDATE radar_items
+           SET status = 'added', added_paper_id = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(paperId, this.now().toISOString(), id);
+      const backup = await this.#createBackup();
+      return { item: this.getRadarItem(id), paper, backup };
+    });
   }
 
   async updatePaper(id, input) {

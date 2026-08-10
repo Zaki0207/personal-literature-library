@@ -3,6 +3,7 @@
 import {
   ChangeEvent,
   DragEvent as ReactDragEvent,
+  Fragment,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
@@ -270,6 +271,97 @@ type AiVerificationResponse = AiSettingsMutationResponse & {
   };
 };
 
+type RadarItem = {
+  id: string;
+  title: string;
+  zhTitle: string;
+  authors: string;
+  institution: string;
+  source: string;
+  date: string;
+  aiSummary: string;
+  recommendationReason: string;
+  originalUrl?: string;
+  pdfUrl?: string;
+  identifiers: PaperIdentifier[];
+  status: "pending" | "added" | "discarded";
+  addedPaperId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type RadarStateResponse = {
+  settings: {
+    prompt: string;
+    promptTemplate: string;
+    requestedCount: number;
+    updatedAt?: string;
+  };
+  pending: RadarItem[];
+  discarded: RadarItem[];
+  counts: {
+    library: number;
+    pending: number;
+    discarded: number;
+    added: number;
+  };
+  backup?: BackupStatus;
+  context?: {
+    providedToAi: number;
+    totalExclusions: number;
+    locallyChecked: number;
+  };
+  lastRun?: {
+    requested: number;
+    added: number;
+    insufficient: boolean;
+    rounds: number;
+    examined: number;
+    excludedLibrary: number;
+    excludedHistory: number;
+    excludedWithinRun: number;
+    invalid: number;
+    invalidResponses?: number;
+  };
+};
+
+type RadarAddResponse = {
+  paper: Paper;
+  library: LibraryResponse;
+  radar: RadarStateResponse;
+};
+
+type RadarAiExchange = {
+  round: number;
+  prompt: string;
+  response: string;
+  startedAt: string;
+  completedAt: string;
+  provider: string;
+  model: string;
+  latencyMs: number | null;
+  errorMessage: string;
+};
+
+type RadarAiTrace = {
+  status: "running" | "completed" | "failed";
+  requestedCount: number;
+  userPrompt: string;
+  exchanges: RadarAiExchange[];
+  errorMessage: string;
+  startedAt: string;
+  completedAt: string;
+  updatedAt: string;
+};
+
+type RadarAiTraceResponse = {
+  trace: RadarAiTrace | null;
+};
+
+type RadarPromptTemplateResponse = {
+  promptTemplate: string;
+};
+
 type FlatCategory = Category & {
   depth: number;
   path: string[];
@@ -294,6 +386,12 @@ const paperSearchFieldLabels: Record<string, string> = {
 };
 
 const legacyWatchCategoryIds = new Set(["BGPSP4JY"]);
+const radarPromptTemplateVariables = [
+  "{{research_scope}}",
+  "{{round}}",
+  "{{requested_count}}",
+  "{{exclusions_json}}",
+] as const;
 const initialPapers: Paper[] = [];
 const initialCategories: Category[] = [];
 const initialCategoryRecords: CategoryRecord[] = [];
@@ -440,6 +538,22 @@ function providerForUrl(url: string) {
   return "项目站";
 }
 
+function referenceForRadarItem(item: RadarItem) {
+  const originalUrl = safeExternalUrl(item.originalUrl);
+  if (originalUrl) return originalUrl;
+
+  const doi = item.identifiers.find((identifier) => identifier.kind === "doi");
+  if (doi) return `https://doi.org/${doi.value}`;
+
+  const arxiv = item.identifiers.find(
+    (identifier) => identifier.kind === "arxiv",
+  );
+  if (arxiv) return `https://arxiv.org/abs/${arxiv.value}`;
+
+  const url = item.identifiers.find((identifier) => identifier.kind === "url");
+  return safeExternalUrl(url?.value) ?? "";
+}
+
 function draftFromPaper(paper: Paper): PaperEditDraft {
   return {
     title: paper.title,
@@ -547,6 +661,20 @@ function formatAiVerifiedTime(value?: string | null) {
   }).format(date);
 }
 
+function formatRadarAiTraceTime(value?: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(date);
+}
+
 function formatAiBaseUrlHost(value: string) {
   try {
     return new URL(value).host || "待确认地址";
@@ -605,6 +733,27 @@ function normalizeCategoryRecords(
 export default function Home() {
   const [papers, setPapers] = useState(initialPapers);
   const [categories, setCategories] = useState(initialCategories);
+  const [activeSurface, setActiveSurface] = useState<"library" | "radar">(
+    "library",
+  );
+  const [radarState, setRadarState] = useState<RadarStateResponse | null>(null);
+  const [radarPrompt, setRadarPrompt] = useState("");
+  const [radarCount, setRadarCount] = useState(5);
+  const [radarView, setRadarView] = useState<"pending" | "discarded">(
+    "pending",
+  );
+  const [radarBusy, setRadarBusy] = useState(false);
+  const [radarItemBusy, setRadarItemBusy] = useState<string | null>(null);
+  const [radarError, setRadarError] = useState("");
+  const [radarContextOpen, setRadarContextOpen] = useState(false);
+  const [radarAiTraceOpen, setRadarAiTraceOpen] = useState(false);
+  const [radarAiTrace, setRadarAiTrace] = useState<RadarAiTrace | null>(null);
+  const [radarAiTraceLoading, setRadarAiTraceLoading] = useState(false);
+  const [radarAiTraceError, setRadarAiTraceError] = useState("");
+  const [radarPromptEditorOpen, setRadarPromptEditorOpen] = useState(false);
+  const [radarPromptTemplateDraft, setRadarPromptTemplateDraft] = useState("");
+  const [radarPromptTemplateBusy, setRadarPromptTemplateBusy] = useState(false);
+  const [radarPromptTemplateError, setRadarPromptTemplateError] = useState("");
   const [activeScope, setActiveScope] = useState("all");
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("recent");
@@ -629,6 +778,7 @@ export default function Home() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [addPaperOpen, setAddPaperOpen] = useState(false);
+  const [radarIntakeItem, setRadarIntakeItem] = useState<RadarItem | null>(null);
   const [addingPaper, setAddingPaper] = useState(false);
   const [paperReference, setPaperReference] = useState("");
   const [paperIntakeResult, setPaperIntakeResult] =
@@ -734,8 +884,18 @@ export default function Home() {
     addPaperOpen ||
     aiSettingsOpen ||
     categoryManagerOpen ||
+    radarAiTraceOpen ||
+    radarPromptEditorOpen ||
     editingPaperId !== null ||
     titlePreviewPaperId !== null;
+  const radarPromptTemplateDirty = Boolean(
+    radarState &&
+      radarPromptTemplateDraft !== radarState.settings.promptTemplate,
+  );
+  const missingRadarPromptTemplateVariables =
+    radarPromptTemplateVariables.filter(
+      (variable) => !radarPromptTemplateDraft.includes(variable),
+    );
   const sidebarExpanded = isMobile ? mobileNavOpen : !sidebarCollapsed;
   const editingPaper = editingPaperId
     ? papers.find((paper) => paper.id === editingPaperId) ?? null
@@ -783,6 +943,7 @@ export default function Home() {
         setOpenMenu(null);
         setTitlePreviewPaperId(null);
         setAddPaperOpen(false);
+        setRadarIntakeItem(null);
         if (!aiBusyAction) setAiSettingsOpen(false);
         setMobileNavOpen(false);
       }
@@ -832,6 +993,29 @@ export default function Home() {
     return () => {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadRadar = async () => {
+      try {
+        const response = await libraryRequest<RadarStateResponse>("/radar");
+        if (cancelled) return;
+        setRadarState(response);
+        setRadarPrompt(response.settings.prompt);
+        setRadarCount(response.settings.requestedCount);
+        if (response.backup) setBackupStatus(response.backup);
+      } catch (error) {
+        if (cancelled) return;
+        setRadarError(
+          error instanceof Error ? error.message : "文献雷达暂时不可用。",
+        );
+      }
+    };
+    loadRadar();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -1314,6 +1498,7 @@ export default function Home() {
   const activeFilterCount = [codeOnly, projectOnly].filter(Boolean).length;
 
   const selectScope = (scope: string) => {
+    setActiveSurface("library");
     setActiveScope(scope);
     const selectedCategory = flattenedCategories.find(
       (category) => category.id === scope,
@@ -1330,6 +1515,7 @@ export default function Home() {
   };
 
   const resetLibraryView = () => {
+    setActiveSurface("library");
     setActiveScope("all");
     setFavoriteOnly(false);
     setWatchLaterOnly(false);
@@ -1632,6 +1818,7 @@ export default function Home() {
     setProjectOnly(false);
     setQuery(duplicate.title);
     setAddPaperOpen(false);
+    setRadarIntakeItem(null);
   };
 
   const addPaper = async (event: FormEvent<HTMLFormElement>) => {
@@ -1679,19 +1866,36 @@ export default function Home() {
     addingPaperRef.current = true;
     setAddingPaper(true);
     try {
-      const response = await libraryRequest<PaperMutationResponse>("/papers", {
-        method: "POST",
-        body: JSON.stringify(paper),
-      });
-      setPapers((current) => [response.paper, ...current]);
-      applyBackupStatus(response.backup);
+      if (radarIntakeItem) {
+        const response = await libraryRequest<RadarAddResponse>(
+          `/radar/items/${encodeURIComponent(radarIntakeItem.id)}/add`,
+          {
+            method: "POST",
+            body: JSON.stringify(paper),
+          },
+        );
+        applyLibrarySnapshot(response.library);
+        applyRadarSnapshot(response.radar);
+        setToast("论文已确认加入知识库，后续检索将自动排除");
+      } else {
+        const response = await libraryRequest<PaperMutationResponse>(
+          "/papers",
+          {
+            method: "POST",
+            body: JSON.stringify(paper),
+          },
+        );
+        setPapers((current) => [response.paper, ...current]);
+        applyBackupStatus(response.backup);
+        setToast(savedMessage("论文已添加", response.backup));
+      }
       setAddPaperOpen(false);
+      setRadarIntakeItem(null);
       setPaperReference("");
       setPaperIntakeResult(null);
       setPaperIntakeDraft(null);
       setPaperIntakeError("");
       setActiveScope("all");
-      setToast(savedMessage("论文已添加", response.backup));
     } catch (error) {
       setPaperIntakeError(
         error instanceof Error ? error.message : "添加失败，请重试。",
@@ -1711,6 +1915,221 @@ export default function Home() {
       scopeIsInsideHiddenRoot(nextCategories, current) ? "all" : current,
     );
     applyBackupStatus(library.backup);
+  };
+
+  const applyRadarSnapshot = (
+    response: RadarStateResponse,
+    { syncSettings = false } = {},
+  ) => {
+    setRadarState(response);
+    if (syncSettings) {
+      setRadarPrompt(response.settings.prompt);
+      setRadarCount(response.settings.requestedCount);
+    }
+    applyBackupStatus(response.backup);
+  };
+
+  const openLiteratureRadar = () => {
+    setActiveSurface("radar");
+    setMobileNavOpen(false);
+    setOpenMenu(null);
+    setFiltersOpen(false);
+    setTextSizeOpen(false);
+  };
+
+  const openRadarPromptEditor = () => {
+    modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarPromptTemplateDraft(radarState?.settings.promptTemplate ?? "");
+    setRadarPromptTemplateError("");
+    setRadarPromptEditorOpen(true);
+  };
+
+  const closeRadarPromptEditor = () => {
+    setRadarPromptEditorOpen(false);
+    setRadarPromptTemplateError("");
+  };
+
+  const requestCloseRadarPromptEditor = () => {
+    if (radarPromptTemplateBusy) return;
+    if (
+      radarPromptTemplateDirty &&
+      !window.confirm("完整提示词模板尚未保存，确定放弃修改？")
+    ) {
+      return;
+    }
+    closeRadarPromptEditor();
+  };
+
+  const restoreDefaultRadarPromptTemplate = async () => {
+    if (radarPromptTemplateBusy) return;
+    setRadarPromptTemplateBusy(true);
+    setRadarPromptTemplateError("");
+    try {
+      const response = await libraryRequest<RadarPromptTemplateResponse>(
+        "/radar/prompt-template/default",
+      );
+      setRadarPromptTemplateDraft(response.promptTemplate);
+      setToast("默认模板已载入，保存后生效");
+    } catch (error) {
+      setRadarPromptTemplateError(
+        error instanceof Error ? error.message : "默认模板读取失败。",
+      );
+    } finally {
+      setRadarPromptTemplateBusy(false);
+    }
+  };
+
+  const saveRadarPromptTemplate = async () => {
+    if (
+      radarPromptTemplateBusy ||
+      !radarPromptTemplateDirty ||
+      missingRadarPromptTemplateVariables.length
+    ) {
+      return;
+    }
+    setRadarPromptTemplateBusy(true);
+    setRadarPromptTemplateError("");
+    try {
+      const response = await libraryRequest<RadarStateResponse>(
+        "/radar/prompt-template",
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            promptTemplate: radarPromptTemplateDraft,
+          }),
+        },
+      );
+      applyRadarSnapshot(response);
+      setRadarPromptTemplateDraft(response.settings.promptTemplate);
+      setRadarPromptEditorOpen(false);
+      setToast("完整提示词模板已保存");
+    } catch (error) {
+      setRadarPromptTemplateError(
+        error instanceof Error ? error.message : "完整提示词模板保存失败。",
+      );
+    } finally {
+      setRadarPromptTemplateBusy(false);
+    }
+  };
+
+  const closeRadarAiTrace = () => {
+    setRadarAiTraceOpen(false);
+    setRadarAiTraceError("");
+  };
+
+  const openRadarAiTrace = async () => {
+    modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarAiTraceOpen(true);
+    setRadarAiTraceLoading(true);
+    setRadarAiTraceError("");
+    try {
+      const response = await libraryRequest<RadarAiTraceResponse>(
+        "/radar/ai-trace",
+      );
+      setRadarAiTrace(response.trace);
+    } catch (error) {
+      setRadarAiTrace(null);
+      setRadarAiTraceError(
+        error instanceof Error ? error.message : "AI 记录读取失败。",
+      );
+    } finally {
+      setRadarAiTraceLoading(false);
+    }
+  };
+
+  const copyRadarAiText = async (value: string, label: string) => {
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(value);
+      setToast(`${label}已复制`);
+    } catch {
+      setToast("复制失败，请手动选择文本复制");
+    }
+  };
+
+  const copyCompleteRadarAiTrace = () => {
+    if (!radarAiTrace) return;
+    const text = radarAiTrace.exchanges
+      .map(
+        (exchange) =>
+          `===== 第 ${exchange.round} 轮：发送给 AI 的完整提示词 =====\n${exchange.prompt}\n\n===== 第 ${exchange.round} 轮：AI 的完整回复 =====\n${exchange.response || "（AI 未返回文本）"}`,
+      )
+      .join("\n\n");
+    void copyRadarAiText(text, "全部 AI 记录");
+  };
+
+  const runLiteratureRadar = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!radarPrompt.trim() || radarBusy) return;
+    setRadarBusy(true);
+    setRadarError("");
+    try {
+      const response = await libraryRequest<RadarStateResponse>("/radar/run", {
+        method: "POST",
+        body: JSON.stringify({ prompt: radarPrompt, count: radarCount }),
+      });
+      applyRadarSnapshot(response, { syncSettings: true });
+      setRadarView("pending");
+      const added = response.lastRun?.added ?? 0;
+      const requested = response.lastRun?.requested ?? radarCount;
+      setToast(
+        response.lastRun?.insufficient
+          ? `已找到 ${added} 篇不重复论文；没有用重复结果补足 ${requested} 篇`
+          : `已推送 ${added} 篇不重复论文，等待审核`,
+      );
+    } catch (error) {
+      setRadarError(
+        error instanceof Error ? error.message : "文献检索失败，请重试。",
+      );
+    } finally {
+      setRadarBusy(false);
+    }
+  };
+
+  const changeRadarItem = async (
+    item: RadarItem,
+    action: "discard" | "restore",
+  ) => {
+    if (radarItemBusy) return;
+    setRadarItemBusy(item.id);
+    setRadarError("");
+    try {
+      const response = await libraryRequest<RadarStateResponse>(
+        `/radar/items/${encodeURIComponent(item.id)}/${action}`,
+        { method: "POST", body: "{}" },
+      );
+      applyRadarSnapshot(response);
+      setToast(
+        action === "discard"
+          ? "已丢弃，并加入永久排除记录"
+          : "已恢复到待审核列表",
+      );
+    } catch (error) {
+      setRadarError(
+        error instanceof Error ? error.message : "操作失败，请重试。",
+      );
+    } finally {
+      setRadarItemBusy(null);
+    }
+  };
+
+  const reviewRadarItemForAddition = (item: RadarItem) => {
+    if (radarItemBusy) return;
+    const reference = referenceForRadarItem(item);
+    if (!reference) {
+      setRadarError("这篇论文缺少可再次核验的链接或标识，暂时无法进入添加流程。");
+      return;
+    }
+
+    modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarError("");
+    setRadarIntakeItem(item);
+    setPaperReference(reference);
+    setPaperIntakeResult(null);
+    setPaperIntakeDraft(null);
+    setPaperDuplicateBusyId(null);
+    setPaperIntakeError("");
+    setAddPaperOpen(true);
   };
 
   const applyCategoryListResponse = (
@@ -2909,6 +3328,7 @@ export default function Home() {
 
   const openAddPaperModal = () => {
     modalTriggerRef.current = document.activeElement as HTMLElement;
+    setRadarIntakeItem(null);
     setPaperReference("");
     setPaperIntakeResult(null);
     setPaperIntakeDraft(null);
@@ -3297,10 +3717,14 @@ export default function Home() {
           <button
             type="button"
             className={`nav-item category-link ${
-              activeScope === category.id ? "is-active" : ""
+              activeSurface === "library" && activeScope === category.id
+                ? "is-active"
+                : ""
             }`}
             onClick={() => selectScope(category.id)}
-            aria-pressed={activeScope === category.id}
+            aria-pressed={
+              activeSurface === "library" && activeScope === category.id
+            }
             title={category.name}
           >
             <span className="category-link-name">{category.name}</span>
@@ -3585,22 +4009,37 @@ export default function Home() {
 
   const renderPaperCard = (paper: Paper) => {
     const paperSearchMatch = paperSearchMatches.get(paper.id);
-    const scopedCategoryIds = new Set(paper.scopes);
-    const visibleTags = flattenedCategories
-      .filter((category) => scopedCategoryIds.has(category.id))
-      .map((category) => ({
-        tag: {
-          label: category.name,
-          scope: category.id,
-        },
-        category,
-      }));
-    const visibleTagScopes = new Set(
-      visibleTags.map(({ tag }) => tag.scope),
+    const directCategoryIds = new Set(
+      paper.categoryIds ??
+        paper.tags
+          .map((tag) => tag.scope)
+          .filter((scope) => scope !== "uncategorized"),
     );
+    const selectedCategories = flattenedCategories.filter((category) =>
+      directCategoryIds.has(category.id),
+    );
+    const terminalCategories = selectedCategories.filter(
+      (category) =>
+        !selectedCategories.some(
+          (candidate) =>
+            candidate.id !== category.id &&
+            candidate.ancestorIds?.includes(category.id),
+        ),
+    );
+    const representedCategoryIds = new Set<string>();
+    const visiblePaths = terminalCategories.map((category) => {
+      representedCategoryIds.add(category.id);
+      category.ancestorIds?.forEach((ancestorId) =>
+        representedCategoryIds.add(ancestorId),
+      );
+      return { category, path: category.path };
+    });
     paper.tags.forEach((tag) => {
-      if (!visibleTagScopes.has(tag.scope)) {
-        visibleTags.push({ tag, category: undefined });
+      if (!representedCategoryIds.has(tag.scope)) {
+        visiblePaths.push({
+          category: undefined,
+          path: [tag.label],
+        });
       }
     });
     const pdfUrl = safeExternalUrl(paper.pdfUrl);
@@ -3643,16 +4082,24 @@ export default function Home() {
       <article className="paper-card" key={paper.id}>
         <div className="paper-card-top">
           <div className="paper-badges">
-            {visibleTags.map(({ tag, category }) => (
+            {visiblePaths.map(({ category, path }, pathIndex) => (
               <span
-                className={`category-badge category-badge-depth-${Math.min(
-                  category?.depth ?? 0,
-                  2,
-                )}`}
-                key={`${tag.scope}:${tag.label}`}
-                title={category?.path.join(" › ")}
+                className={`category-path ${
+                  category ? "category-path-root" : ""
+                }`}
+                key={`${category?.id ?? "tag"}:${path.join("/")}:${pathIndex}`}
+                title={path.join(" > ")}
               >
-                {tag.label}
+                {path.map((segment, index) => (
+                  <Fragment key={`${segment}:${index}`}>
+                    {index > 0 && (
+                      <span className="category-path-separator" aria-hidden="true">
+                        →
+                      </span>
+                    )}
+                    <span className="category-path-segment">{segment}</span>
+                  </Fragment>
+                ))}
               </span>
             ))}
           </div>
@@ -3913,6 +4360,279 @@ export default function Home() {
     );
   };
 
+  const visibleRadarItems =
+    radarView === "pending"
+      ? radarState?.pending ?? []
+      : radarState?.discarded ?? [];
+  const radarTotalExclusions = radarState
+    ? radarState.counts.library +
+      radarState.counts.pending +
+      radarState.counts.discarded +
+      radarState.counts.added
+    : papers.length;
+
+  const renderRadarItem = (item: RadarItem) => {
+    const originalUrl = safeExternalUrl(item.originalUrl);
+    const busy = radarItemBusy === item.id;
+    const metadata = [
+      item.authors,
+      item.institution,
+      item.source,
+      item.date,
+    ].filter(Boolean);
+    return (
+      <article className="radar-paper-card" key={item.id}>
+        <header className="radar-paper-header">
+          <div>
+            <span className="radar-unique-badge">
+              <span aria-hidden="true">✓</span>
+              已通过知识库与历史记录排重
+            </span>
+            <h2>{item.title}</h2>
+            {item.zhTitle && <p className="radar-paper-zh-title">{item.zhTitle}</p>}
+          </div>
+          {originalUrl && (
+            <a
+              className="radar-source-link"
+              href={originalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              查看原文 ↗
+            </a>
+          )}
+        </header>
+
+        {metadata.length > 0 && (
+          <p className="radar-paper-meta">{metadata.join(" · ")}</p>
+        )}
+
+        {item.recommendationReason && (
+          <div className="radar-reason">
+            <span>推荐理由</span>
+            <p>{item.recommendationReason}</p>
+          </div>
+        )}
+        {item.aiSummary && (
+          <div className="radar-summary">
+            <span>AI 摘要</span>
+            <p>{item.aiSummary}</p>
+          </div>
+        )}
+
+        <footer className="radar-paper-footer">
+          <div className="radar-identifiers" aria-label="排重标识">
+            {item.identifiers
+              .filter((identifier) => identifier.kind !== "url")
+              .slice(0, 3)
+              .map((identifier) => (
+                <span key={`${identifier.kind}:${identifier.value}`}>
+                  {identifier.kind.toUpperCase()} · {identifier.value}
+                </span>
+              ))}
+          </div>
+          <div className="radar-review-actions">
+            {item.status === "discarded" ? (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => changeRadarItem(item, "restore")}
+                disabled={Boolean(radarItemBusy)}
+              >
+                {busy ? "正在恢复…" : "恢复到待审核"}
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="radar-discard-button"
+                  onClick={() => changeRadarItem(item, "discard")}
+                  disabled={Boolean(radarItemBusy)}
+                >
+                  {busy ? "处理中…" : "丢弃并不再推荐"}
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => reviewRadarItemForAddition(item)}
+                  disabled={Boolean(radarItemBusy)}
+                >
+                  核对并加入
+                </button>
+              </>
+            )}
+          </div>
+        </footer>
+      </article>
+    );
+  };
+
+  const renderRadarSurface = () => (
+    <div className="radar-page">
+      <section className="radar-hero" aria-labelledby="radar-title">
+        <div>
+          <span className="radar-eyebrow">AI 文献发现</span>
+          <h1 id="radar-title">文献雷达</h1>
+          <p>按你的研究范围联网检索；每篇论文先排重，再交给你决定加入或永久丢弃。</p>
+        </div>
+        <div className="radar-hero-stats" aria-label="排重范围">
+          <span><strong>{radarState?.counts.library ?? papers.length}</strong> 知识库论文</span>
+          <span><strong>{radarState?.counts.discarded ?? 0}</strong> 永久排除</span>
+        </div>
+      </section>
+
+      <form className="radar-composer" onSubmit={runLiteratureRadar}>
+        <div className="radar-composer-heading">
+          <div>
+            <h2>本次检索要求</h2>
+            <p>提示词每次都可编辑；保存后将作为下一次默认值。</p>
+          </div>
+          <label className="radar-count-field">
+            <span>推送数量</span>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={radarCount}
+              onChange={(event) =>
+                setRadarCount(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
+              }
+              disabled={radarBusy}
+            />
+            <small>篇</small>
+          </label>
+        </div>
+        <label className="radar-prompt-field">
+          <span className="sr-only">文献检索提示词</span>
+          <textarea
+            value={radarPrompt}
+            onChange={(event) => setRadarPrompt(event.target.value)}
+            rows={5}
+            maxLength={10_000}
+            placeholder="例如：检索与多模态情感识别、微表情分析和生理信号融合相关的近期论文……"
+            disabled={radarBusy}
+          />
+        </label>
+
+        <div className="radar-template-entry">
+          <div>
+            <strong>完整提示词模板</strong>
+            <span>高级设置；日常检索只需编辑上方要求</span>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={openRadarPromptEditor}
+            disabled={!radarState || radarBusy}
+          >
+            <span aria-hidden="true">⌘</span>
+            编辑完整提示词
+          </button>
+        </div>
+
+        <div className="radar-system-context">
+          <button
+            type="button"
+            onClick={() => setRadarContextOpen((current) => !current)}
+            aria-expanded={radarContextOpen}
+          >
+            <span aria-hidden="true">⌁</span>
+            系统排重上下文（只读）
+            <strong>{radarTotalExclusions} 条</strong>
+            <span aria-hidden="true">{radarContextOpen ? "⌃" : "⌄"}</span>
+          </button>
+          {radarContextOpen && (
+            <div className="radar-context-detail">
+              <p>
+                AI 检索前会收到知识库与历史审核记录的标题、DOI、arXiv 和 URL 摘要；
+                返回后，本机数据库还会对全部 {radarTotalExclusions} 条记录再次严格排重。
+              </p>
+              <dl>
+                <div><dt>当前知识库</dt><dd>{radarState?.counts.library ?? papers.length}</dd></div>
+                <div><dt>待审核</dt><dd>{radarState?.counts.pending ?? 0}</dd></div>
+                <div><dt>已加入历史</dt><dd>{radarState?.counts.added ?? 0}</dd></div>
+                <div><dt>已丢弃历史</dt><dd>{radarState?.counts.discarded ?? 0}</dd></div>
+              </dl>
+              {radarState?.context && (
+                <small>
+                  上次检索：AI 收到 {radarState.context.providedToAi} 条摘要，本机核查 {radarState.context.locallyChecked} 条。
+                </small>
+              )}
+            </div>
+          )}
+        </div>
+
+        {radarError && <p className="radar-error" role="alert">{radarError}</p>}
+        <div className="radar-composer-actions">
+          <p><span aria-hidden="true">✓</span> 数量不足时不会用重复论文补齐</p>
+          <div className="radar-composer-buttons">
+            <button
+              type="button"
+              className="secondary-button radar-trace-button"
+              onClick={openRadarAiTrace}
+            >
+              <span aria-hidden="true">⌘</span>
+              查看本次 AI 记录
+            </button>
+            <button
+              type="submit"
+              className="primary-button radar-run-button"
+              disabled={radarBusy || !radarPrompt.trim()}
+            >
+              <span aria-hidden="true">✦</span>
+              {radarBusy
+                ? "正在联网检索并排重，最长约 20 分钟…"
+                : "开始本次检索"}
+            </button>
+          </div>
+        </div>
+      </form>
+
+      <section className="radar-review-section" aria-labelledby="radar-review-title">
+        <div className="radar-review-heading">
+          <div>
+            <h2 id="radar-review-title">个人审核</h2>
+            <p>加入或丢弃之前，不会改动你的知识库。</p>
+          </div>
+          <div className="radar-tabs" role="tablist" aria-label="文献雷达审核状态">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={radarView === "pending"}
+              className={radarView === "pending" ? "is-active" : ""}
+              onClick={() => setRadarView("pending")}
+            >
+              待审核 <span>{radarState?.counts.pending ?? 0}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={radarView === "discarded"}
+              className={radarView === "discarded" ? "is-active" : ""}
+              onClick={() => setRadarView("discarded")}
+            >
+              已丢弃 <span>{radarState?.counts.discarded ?? 0}</span>
+            </button>
+          </div>
+        </div>
+
+        {visibleRadarItems.length ? (
+          <div className="radar-paper-list">{visibleRadarItems.map(renderRadarItem)}</div>
+        ) : (
+          <div className="radar-empty-state">
+            <span aria-hidden="true">✦</span>
+            <h3>{radarView === "pending" ? "暂无待审核论文" : "暂无已丢弃论文"}</h3>
+            <p>
+              {radarView === "pending"
+                ? "编辑上方提示词并开始检索，新的不重复论文会出现在这里。"
+                : "你丢弃的论文会永久保留在排除记录中，并可随时恢复。"}
+            </p>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+
   return (
     <div className="library-app">
       {isMobile && mobileNavOpen && (
@@ -3944,6 +4664,7 @@ export default function Home() {
           <div className="library-shortcuts" aria-label="文献范围与标记">
             <button
               className={`nav-item ${
+                activeSurface === "library" &&
                 activeScope === "all" &&
                 !favoriteOnly &&
                 !watchLaterOnly
@@ -3952,6 +4673,7 @@ export default function Home() {
               }`}
               onClick={resetLibraryView}
               aria-pressed={
+                activeSurface === "library" &&
                 activeScope === "all" &&
                 !favoriteOnly &&
                 !watchLaterOnly
@@ -3961,8 +4683,9 @@ export default function Home() {
               <span className="nav-count">{scopeCounts.all}</span>
             </button>
             <button
-              className={`nav-item ${favoriteOnly ? "is-active" : ""}`}
+              className={`nav-item ${activeSurface === "library" && favoriteOnly ? "is-active" : ""}`}
               onClick={() => {
+                setActiveSurface("library");
                 setFavoriteOnly((current) => !current);
                 setOpenMenu(null);
               }}
@@ -3973,8 +4696,9 @@ export default function Home() {
               <span className="nav-count">{scopeCounts.favorites}</span>
             </button>
             <button
-              className={`nav-item ${watchLaterOnly ? "is-active" : ""}`}
+              className={`nav-item ${activeSurface === "library" && watchLaterOnly ? "is-active" : ""}`}
               onClick={() => {
+                setActiveSurface("library");
                 setWatchLaterOnly((current) => !current);
                 setOpenMenu(null);
               }}
@@ -3985,15 +4709,32 @@ export default function Home() {
               <span className="nav-count">{scopeCounts.watchLater}</span>
             </button>
             <button
+              className={`nav-item radar-nav-item ${
+                activeSurface === "radar" ? "is-active" : ""
+              }`}
+              onClick={openLiteratureRadar}
+              aria-pressed={activeSurface === "radar"}
+            >
+              <span>
+                <span className="radar-nav-symbol" aria-hidden="true">✦</span>
+                文献雷达
+              </span>
+              <span className="nav-count">{radarState?.counts.pending ?? 0}</span>
+            </button>
+            <button
               className={`nav-item ${
-                activeScope === "uncategorized" ? "is-active" : ""
+                activeSurface === "library" && activeScope === "uncategorized"
+                  ? "is-active"
+                  : ""
               }`}
               onClick={() =>
                 selectScope(
                   activeScope === "uncategorized" ? "all" : "uncategorized",
                 )
               }
-              aria-pressed={activeScope === "uncategorized"}
+              aria-pressed={
+                activeSurface === "library" && activeScope === "uncategorized"
+              }
             >
               <span>未分类</span>
               <span className="nav-count">
@@ -4063,7 +4804,11 @@ export default function Home() {
               type="search"
               placeholder="搜索题目、作者、机构、年份、来源或主题"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onFocus={() => setActiveSurface("library")}
+              onChange={(event) => {
+                setActiveSurface("library");
+                setQuery(event.target.value);
+              }}
             />
             <kbd>⌘ K</kbd>
           </label>
@@ -4071,7 +4816,10 @@ export default function Home() {
           <div className="filter-anchor">
             <button
               className={`toolbar-button ${filtersOpen || activeFilterCount ? "is-engaged" : ""}`}
-              onClick={() => setFiltersOpen((current) => !current)}
+              onClick={() => {
+                setActiveSurface("library");
+                setFiltersOpen((current) => !current);
+              }}
               aria-expanded={filtersOpen}
               aria-controls="filter-popover"
             >
@@ -4118,7 +4866,10 @@ export default function Home() {
             <span className="sr-only">论文排序</span>
             <select
               value={normalizedQuery ? "relevance" : sortBy}
-              onChange={(event) => setSortBy(event.target.value)}
+              onChange={(event) => {
+                setActiveSurface("library");
+                setSortBy(event.target.value);
+              }}
               disabled={Boolean(normalizedQuery)}
             >
               {normalizedQuery && (
@@ -4151,6 +4902,10 @@ export default function Home() {
           </button>
         </header>
 
+        {activeSurface === "radar" ? (
+          renderRadarSurface()
+        ) : (
+          <>
         <section
           className="view-overview"
           aria-labelledby="view-overview-title"
@@ -4392,6 +5147,8 @@ export default function Home() {
             </div>
           )}
           </section>
+        )}
+          </>
         )}
       </main>
 
@@ -5276,6 +6033,298 @@ export default function Home() {
         </div>
       )}
 
+      {radarPromptEditorOpen && (
+        <div
+          className="modal-layer"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) {
+              requestCloseRadarPromptEditor();
+            }
+          }}
+        >
+          <section
+            ref={modalRef}
+            className="modal radar-prompt-template-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="radar-prompt-template-title"
+            aria-describedby="radar-prompt-template-description"
+            aria-busy={radarPromptTemplateBusy}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                requestCloseRadarPromptEditor();
+                return;
+              }
+              handleModalKeyDown(event);
+            }}
+          >
+            <div className="modal-heading radar-prompt-template-heading">
+              <div>
+                <h2 id="radar-prompt-template-title">编辑完整提示词</h2>
+                <p id="radar-prompt-template-description">
+                  除动态变量外，系统角色、来源要求、排重规则和输出格式均可编辑。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={requestCloseRadarPromptEditor}
+                aria-label="关闭完整提示词编辑器"
+                disabled={radarPromptTemplateBusy}
+                autoFocus
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="radar-prompt-template-content">
+              <div className="radar-template-variable-guide">
+                <strong>必须保留的动态变量</strong>
+                <p>运行时系统会把这些变量替换为本次实际内容。</p>
+                <div>
+                  <span><code>{"{{research_scope}}"}</code> 检索要求</span>
+                  <span><code>{"{{round}}"}</code> 当前轮次</span>
+                  <span><code>{"{{requested_count}}"}</code> 候选数量</span>
+                  <span><code>{"{{exclusions_json}}"}</code> 本机排除清单</span>
+                </div>
+              </div>
+
+              <label className="radar-prompt-template-field">
+                <span>完整提示词模板</span>
+                <textarea
+                  value={radarPromptTemplateDraft}
+                  onChange={(event) => {
+                    setRadarPromptTemplateDraft(event.target.value);
+                    setRadarPromptTemplateError("");
+                  }}
+                  maxLength={50_000}
+                  spellCheck={false}
+                  disabled={radarPromptTemplateBusy}
+                />
+              </label>
+
+              {missingRadarPromptTemplateVariables.length > 0 && (
+                <p className="radar-template-variable-error" role="alert">
+                  缺少必要变量：{missingRadarPromptTemplateVariables.join("、")}
+                </p>
+              )}
+              {radarPromptTemplateError && (
+                <p className="radar-error" role="alert">
+                  {radarPromptTemplateError}
+                </p>
+              )}
+            </div>
+
+            <footer className="radar-prompt-template-footer">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void restoreDefaultRadarPromptTemplate()}
+                disabled={radarPromptTemplateBusy}
+              >
+                恢复默认模板
+              </button>
+              <div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={requestCloseRadarPromptEditor}
+                  disabled={radarPromptTemplateBusy}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => void saveRadarPromptTemplate()}
+                  disabled={
+                    radarPromptTemplateBusy ||
+                    !radarPromptTemplateDirty ||
+                    missingRadarPromptTemplateVariables.length > 0 ||
+                    !radarPromptTemplateDraft.trim()
+                  }
+                >
+                  {radarPromptTemplateBusy ? "正在保存…" : "保存模板"}
+                </button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {radarAiTraceOpen && (
+        <div
+          className="modal-layer"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) closeRadarAiTrace();
+          }}
+        >
+          <section
+            ref={modalRef}
+            className="modal radar-ai-trace-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="radar-ai-trace-title"
+            aria-describedby="radar-ai-trace-description"
+            aria-busy={radarAiTraceLoading}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                closeRadarAiTrace();
+                return;
+              }
+              handleModalKeyDown(event);
+            }}
+          >
+            <div className="modal-heading radar-ai-trace-heading">
+              <div>
+                <h2 id="radar-ai-trace-title">本次 AI 完整记录</h2>
+                <p id="radar-ai-trace-description">
+                  按实际调用轮次展示；只保存在本机，不包含 API Key。
+                </p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={closeRadarAiTrace}
+                aria-label="关闭 AI 完整记录"
+                autoFocus
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="radar-ai-trace-content">
+              {radarAiTraceLoading ? (
+                <div className="radar-ai-trace-empty">正在读取本机记录…</div>
+              ) : radarAiTraceError ? (
+                <p className="radar-error" role="alert">
+                  {radarAiTraceError}
+                </p>
+              ) : !radarAiTrace ? (
+                <div className="radar-ai-trace-empty">
+                  <span aria-hidden="true">⌘</span>
+                  <strong>尚无 AI 调用记录</strong>
+                  <p>完成下一次文献雷达检索后，可在这里查看完整内容。</p>
+                </div>
+              ) : (
+                <>
+                  <div className="radar-ai-trace-summary">
+                    <span className={`is-${radarAiTrace.status}`}>
+                      {radarAiTrace.status === "completed"
+                        ? "已完成"
+                        : radarAiTrace.status === "failed"
+                          ? "运行失败"
+                          : "运行中"}
+                    </span>
+                    <p>
+                      {formatRadarAiTraceTime(radarAiTrace.startedAt)} · 请求推送{" "}
+                      {radarAiTrace.requestedCount} 篇 · 实际调用{" "}
+                      {radarAiTrace.exchanges.length} 轮
+                    </p>
+                  </div>
+
+                  {radarAiTrace.errorMessage && (
+                    <p className="radar-error" role="status">
+                      {radarAiTrace.errorMessage}
+                    </p>
+                  )}
+
+                  <div className="radar-ai-trace-exchanges">
+                    {radarAiTrace.exchanges.map((exchange, index) => (
+                      <section
+                        className="radar-ai-trace-exchange"
+                        key={`${exchange.round}-${index}`}
+                      >
+                        <header>
+                          <div>
+                            <strong>第 {exchange.round} 轮调用</strong>
+                            <span>
+                              {[exchange.provider, exchange.model]
+                                .filter(Boolean)
+                                .join(" / ") || "等待 AI 返回"}
+                              {exchange.latencyMs !== null
+                                ? ` · ${(exchange.latencyMs / 1_000).toFixed(2)} 秒`
+                                : ""}
+                            </span>
+                          </div>
+                          {exchange.errorMessage && (
+                            <small>{exchange.errorMessage}</small>
+                          )}
+                        </header>
+
+                        <div className="radar-ai-trace-block">
+                          <div>
+                            <strong>发送给 AI 的完整提示词</strong>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void copyRadarAiText(
+                                  exchange.prompt,
+                                  `第 ${exchange.round} 轮提示词`,
+                                )
+                              }
+                            >
+                              复制提示词
+                            </button>
+                          </div>
+                          <pre>{exchange.prompt}</pre>
+                        </div>
+
+                        <div className="radar-ai-trace-block">
+                          <div>
+                            <strong>AI 的完整回复</strong>
+                            <button
+                              type="button"
+                              disabled={!exchange.response}
+                              onClick={() =>
+                                void copyRadarAiText(
+                                  exchange.response,
+                                  `第 ${exchange.round} 轮回复`,
+                                )
+                              }
+                            >
+                              复制回复
+                            </button>
+                          </div>
+                          <pre>
+                            {exchange.response || "（AI 尚未返回文本）"}
+                          </pre>
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <footer className="radar-ai-trace-footer">
+              <p>记录包含排重清单中的论文标题与标识，仅在点击时读取。</p>
+              <div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={copyCompleteRadarAiTrace}
+                  disabled={!radarAiTrace?.exchanges.length}
+                >
+                  复制全部
+                </button>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={closeRadarAiTrace}
+                >
+                  完成
+                </button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
+
       {aiSettingsOpen && (
         <div
           className="modal-layer"
@@ -5636,12 +6685,17 @@ export default function Home() {
         <div
           className="modal-layer"
           onMouseDown={(event) => {
-            if (event.currentTarget === event.target) setAddPaperOpen(false);
+            if (event.currentTarget === event.target) {
+              setAddPaperOpen(false);
+              setRadarIntakeItem(null);
+            }
           }}
         >
           <section
             ref={modalRef}
-            className="modal paper-intake-modal"
+            className={`modal paper-intake-modal${
+              radarIntakeItem ? " has-radar-context" : ""
+            }`}
             role="dialog"
             aria-modal="true"
             aria-labelledby="add-paper-title"
@@ -5649,12 +6703,21 @@ export default function Home() {
           >
             <div className="modal-heading">
               <div>
-                <h2 id="add-paper-title">添加论文</h2>
-                <p>粘贴论文地址，核对 AI 整理后的信息再保存。</p>
+                <h2 id="add-paper-title">
+                  {radarIntakeItem ? "核对并加入论文" : "添加论文"}
+                </h2>
+                <p>
+                  {radarIntakeItem
+                    ? "再次识别和查重，手动核对全部信息后再加入知识库。"
+                    : "粘贴论文地址，核对 AI 整理后的信息再保存。"}
+                </p>
               </div>
               <button
                 className="modal-close"
-                onClick={() => setAddPaperOpen(false)}
+                onClick={() => {
+                  setAddPaperOpen(false);
+                  setRadarIntakeItem(null);
+                }}
                 aria-label="关闭"
                 disabled={paperIntakeBusy || addingPaper}
               >
@@ -5684,6 +6747,18 @@ export default function Home() {
                 人工确认
               </li>
             </ol>
+
+            {radarIntakeItem && (
+              <div className="paper-intake-radar-context" role="status">
+                <span aria-hidden="true">✦</span>
+                <p>
+                  <strong>来自文献雷达：{radarIntakeItem.title}</strong>
+                  <small>
+                    只有最终确认成功后，这篇候选论文才会从待审核列表移出。
+                  </small>
+                </p>
+              </div>
+            )}
 
             {!paperIntakeDraft ? (
               <form className="paper-intake-start" onSubmit={analyzePaperReference}>
@@ -5771,7 +6846,10 @@ export default function Home() {
                   <button
                     type="button"
                     className="secondary-button"
-                    onClick={() => setAddPaperOpen(false)}
+                    onClick={() => {
+                      setAddPaperOpen(false);
+                      setRadarIntakeItem(null);
+                    }}
                     disabled={paperIntakeBusy}
                   >
                     取消
