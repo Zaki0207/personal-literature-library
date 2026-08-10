@@ -184,6 +184,152 @@ test("DOI 先获取权威元数据，再让 AI 只补全知识库需要的字段
   assert.doesNotMatch(prompts[0], /zotero/iu);
 });
 
+test("IEEE DOI 优先使用 OpenAlex 发现的开放获取 PDF", async (t) => {
+  const doi = "10.1109/tvcg.2024.3358636";
+  const openAccessPdf =
+    "https://durham-repository.worktribe.com/file/2407995/1/Accepted%20Journal%20Article";
+  const fixture = await makeFixture(t, "ieee-open-access-pdf", {
+    fetchImpl: async (url) => {
+      const href = String(url);
+      if (/api\.crossref\.org\/works\/10\.1109%2Ftvcg\.2024\.3358636/iu.test(href)) {
+        return new Response(
+          JSON.stringify({
+            message: {
+              DOI: doi,
+              title: [
+                "Laplacian Projection Based Global Physical Prior Smoke Reconstruction",
+              ],
+              author: [{ given: "Shibang", family: "Xiao" }],
+              "container-title": [
+                "IEEE Transactions on Visualization and Computer Graphics",
+              ],
+              published: { "date-parts": [[2024, 12]] },
+              URL: `https://doi.org/${doi}`,
+              resource: {
+                primary: {
+                  URL: "https://ieeexplore.ieee.org/document/10414126/",
+                },
+              },
+              link: [
+                {
+                  URL: "http://xplorestaging.ieee.org/ielx7/2945/10737249/10414126.pdf?arnumber=10414126",
+                  "content-type": "unspecified",
+                  "intended-application": "similarity-checking",
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (/api\.openalex\.org\/works\/https%3A%2F%2Fdoi\.org%2F10\.1109%2Ftvcg\.2024\.3358636/iu.test(href)) {
+        return new Response(
+          JSON.stringify({
+            doi: `https://doi.org/${doi}`,
+            best_oa_location: {
+              is_oa: true,
+              pdf_url: openAccessPdf,
+            },
+            locations: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (href === `https://doi.org/${doi}`) {
+        return new Response("<html><body>IEEE paper</body></html>", {
+          status: 200,
+        });
+      }
+      if (/api\.github\.com\/search\/repositories/iu.test(href)) {
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`未预期的请求：${href}`);
+    },
+  });
+
+  const result = await fixture.service.analyze({ reference: doi });
+
+  assert.equal(result.status, "ready");
+  assert.equal(result.draft.pdfUrl, openAccessPdf);
+  assert.equal(result.draft.hasPdf, true);
+  assert.equal(
+    result.draft.originalUrl,
+    "https://doi.org/10.1109/tvcg.2024.3358636",
+  );
+});
+
+test("IEEE DOI 无开放副本时从 Crossref 文档号推导官方 PDF 页", async (t) => {
+  const doi = "10.1109/tvcg.2024.3358636";
+  const fixture = await makeFixture(t, "ieee-publisher-pdf", {
+    fetchImpl: async (url) => {
+      const href = String(url);
+      if (/api\.crossref\.org\/works\/10\.1109%2Ftvcg\.2024\.3358636/iu.test(href)) {
+        return new Response(
+          JSON.stringify({
+            message: {
+              DOI: doi,
+              title: [
+                "Laplacian Projection Based Global Physical Prior Smoke Reconstruction",
+              ],
+              author: [{ given: "Shibang", family: "Xiao" }],
+              "container-title": [
+                "IEEE Transactions on Visualization and Computer Graphics",
+              ],
+              published: { "date-parts": [[2024, 12]] },
+              resource: {
+                primary: {
+                  URL: "https://ieeexplore.ieee.org/document/10414126/",
+                },
+              },
+              link: [
+                {
+                  URL: "http://xplorestaging.ieee.org/ielx7/2945/10737249/10414126.pdf?arnumber=10414126",
+                  "content-type": "unspecified",
+                  "intended-application": "similarity-checking",
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (/api\.openalex\.org\/works\//iu.test(href)) {
+        return new Response(
+          JSON.stringify({
+            doi: `https://doi.org/${doi}`,
+            best_oa_location: null,
+            locations: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (href === `https://doi.org/${doi}`) {
+        return new Response("<html><body>IEEE paper</body></html>", {
+          status: 200,
+        });
+      }
+      if (/api\.github\.com\/search\/repositories/iu.test(href)) {
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`未预期的请求：${href}`);
+    },
+  });
+
+  const result = await fixture.service.analyze({ reference: doi });
+
+  assert.equal(
+    result.draft.pdfUrl,
+    "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10414126",
+  );
+  assert.equal(result.draft.hasPdf, true);
+});
+
 test("arXiv 链接会规范化版本号，并按标题与作者匹配正式发表版本", async (t) => {
   const fixture = await makeFixture(t, "arxiv", {
     fetchImpl: async (url) => {

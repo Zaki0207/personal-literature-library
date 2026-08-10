@@ -279,14 +279,67 @@ function publicationYear(value) {
   return match ? Number(match[0]) : null;
 }
 
-function crossrefMetadata(message, doi) {
+function crossrefDirectPdfUrl(message) {
   const links = Array.isArray(message.link) ? message.link : [];
-  const pdfUrl =
-    links.find(
-      (link) =>
-        /pdf/iu.test(link?.["content-type"] ?? "") ||
-        /\/(?:e?pdf)(?:\/|$)/iu.test(link?.URL ?? ""),
-    )?.URL ?? "";
+  for (const link of links) {
+    if (
+      String(link?.["intended-application"] ?? "").toLocaleLowerCase("en") ===
+      "similarity-checking"
+    ) {
+      continue;
+    }
+    const normalized = normalizePaperUrl(link?.URL ?? "");
+    if (!normalized) continue;
+    const url = new URL(normalized);
+    if (
+      /pdf/iu.test(link?.["content-type"] ?? "") ||
+      /\/(?:e?pdf)(?:\/|$)/iu.test(url.pathname) ||
+      /\.pdf$/iu.test(url.pathname)
+    ) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function ieeeDocumentNumber(message) {
+  const links = Array.isArray(message.link) ? message.link : [];
+  const candidates = [
+    message.resource?.primary?.URL,
+    ...links.map((link) => link?.URL),
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizePaperUrl(candidate ?? "");
+    if (!normalized) continue;
+    const url = new URL(normalized);
+    const host = url.hostname.replace(/^www\./u, "").toLocaleLowerCase("en");
+    if (
+      host !== "ieeexplore.ieee.org" &&
+      host !== "xplorestaging.ieee.org"
+    ) {
+      continue;
+    }
+    const documentMatch = url.pathname.match(/\/document\/(\d+)(?:\/|$)/u);
+    const pdfMatch = url.pathname.match(/\/(\d+)\.pdf$/iu);
+    const articleNumber =
+      documentMatch?.[1] ||
+      url.searchParams.get("arnumber")?.match(/^\d+$/u)?.[0] ||
+      pdfMatch?.[1] ||
+      "";
+    if (articleNumber) return articleNumber;
+  }
+  return "";
+}
+
+function ieeePublisherPdfUrl(message) {
+  const articleNumber = ieeeDocumentNumber(message);
+  return articleNumber
+    ? `https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=${articleNumber}`
+    : "";
+}
+
+function crossrefMetadata(message, doi) {
+  const pdfUrl = crossrefDirectPdfUrl(message);
   const source =
     message["container-title"]?.[0] ||
     message.event?.name ||
@@ -306,6 +359,7 @@ function crossrefMetadata(message, doi) {
     abstract: stripMarkup(message.abstract ?? ""),
     originalUrl: `https://doi.org/${doi}`,
     pdfUrl: normalizePaperUrl(pdfUrl) ?? "",
+    publisherPdfUrl: ieeePublisherPdfUrl(message),
     identifiers: dedupePaperIdentifiers([
       { kind: "doi", value: doi },
       { kind: "url", value: `https://doi.org/${doi}` },
@@ -336,6 +390,29 @@ async function fetchCrossref(fetchImpl, doi) {
     });
   }
   return crossrefMetadata(payload.message, doi);
+}
+
+async function fetchOpenAccessPdf(fetchImpl, doi) {
+  const workId = encodeURIComponent(`https://doi.org/${doi}`);
+  const endpoint = `https://api.openalex.org/works/${workId}`;
+  try {
+    const { text } = await fetchRemote(fetchImpl, endpoint, "application/json");
+    const payload = JSON.parse(text);
+    if (normalizeDoi(payload?.doi ?? "") !== doi) return "";
+    const locations = [
+      payload.best_oa_location,
+      ...(Array.isArray(payload.locations) ? payload.locations : []),
+      payload.primary_location,
+    ];
+    for (const location of locations) {
+      if (!location || location.is_oa === false) continue;
+      const pdfUrl = normalizePaperUrl(location.pdf_url ?? "");
+      if (pdfUrl) return pdfUrl;
+    }
+  } catch {
+    // Open-access discovery is best-effort; the publisher fallback remains usable.
+  }
+  return "";
 }
 
 async function searchCrossrefPublishedVersion(fetchImpl, metadata) {
@@ -707,6 +784,8 @@ function mergeMetadata(base, overlay, { preferOverlay = false, metadataSource } 
     resourcePageUrl: base.resourcePageUrl || overlay.resourcePageUrl || "",
     pdfLandingPageUrl:
       base.pdfLandingPageUrl || overlay.pdfLandingPageUrl || "",
+    publisherPdfUrl:
+      base.publisherPdfUrl || overlay.publisherPdfUrl || "",
     ...(base.preprint ? { preprint: base.preprint } : {}),
   };
 }
@@ -908,9 +987,18 @@ async function resolveMetadata(fetchImpl, reference) {
   const parsed = referenceKind(reference);
   if (parsed.kind === "doi") {
     const metadata = await fetchCrossref(fetchImpl, parsed.value);
+    const openAccessPdfUrl =
+      parsed.pdfUrl || metadata.pdfUrl
+        ? ""
+        : await fetchOpenAccessPdf(fetchImpl, parsed.value);
     return {
       ...metadata,
-      pdfUrl: parsed.pdfUrl || metadata.pdfUrl,
+      pdfUrl:
+        parsed.pdfUrl ||
+        metadata.pdfUrl ||
+        openAccessPdfUrl ||
+        metadata.publisherPdfUrl ||
+        "",
       identifiers: dedupePaperIdentifiers([
         ...(metadata.identifiers ?? []),
         ...(parsed.sourceUrl
