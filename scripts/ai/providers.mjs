@@ -318,6 +318,8 @@ export class DeepSeekProvider extends BaseProvider {
         body: {
           model,
           messages: [{ role: "user", content: input }],
+          thinking: { type: "enabled" },
+          reasoning_effort: "max",
           stream: false,
         },
         ...(timeoutMs ? { timeoutMs } : {}),
