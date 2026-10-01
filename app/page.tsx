@@ -16,6 +16,7 @@ import {
   comparePaperSearchMatches,
   matchPaperSearch,
   normalizeSearchText,
+  type PaperSearchMatch,
 } from "../lib/paper-search.mjs";
 import {
   formatAuthorsForDisplay,
@@ -23,712 +24,69 @@ import {
   formatPublicationForDisplay,
 } from "../lib/paper-display.mjs";
 import { createPortal } from "react-dom";
+import type {
+  AiConnectionSettings,
+  AiModelSettings,
+  AiReasoningEffort,
+  AiSettingsMutationResponse,
+  AiSettingsResponse,
+  AiVerificationResponse,
+  BackupStatus,
+  CardTextSize,
+  CategoriesResponse,
+  Category,
+  CategoryMutationResponse,
+  CategoryRecord,
+  DeletedCategoryRecord,
+  FlatCategory,
+  LibraryConnection,
+  LibraryResponse,
+  Paper,
+  PaperDuplicateMatch,
+  PaperEditDraft,
+  PaperIntakeDraft,
+  PaperIntakeResponse,
+  PaperMutationResponse,
+  PaperViewMode,
+  PdfArchiveMutationResponse,
+  RadarAddResponse,
+  RadarAiTrace,
+  RadarAiTraceResponse,
+  RadarItem,
+  RadarPromptTemplateResponse,
+  RadarStateResponse,
+} from "./library/contracts";
+import { libraryRequest, pdfOpenUrl } from "./library/api-client";
+import { RadarSurface } from "./library/components/radar-surface";
+import { PaperIntakeSources } from "./library/components/paper-intake-sources";
+import {
+  AI_REASONING_EFFORT_LABELS,
+  cardTextSizeLabels,
+  draftFromPaper,
+  flattenCategoryTree,
+  formatAiBaseUrlHost,
+  formatAiVerifiedTime,
+  formatBackupTime,
+  formatPdfArchiveTime,
+  formatPdfSize,
+  formatRadarAiTraceTime,
+  normalizeAiBaseUrlForComparison,
+  normalizeCategoryRecords,
+  normalizePapers,
+  paperMatchesNonScopeFilters,
+  paperSearchFieldLabels,
+  providerForUrl,
+  radarPromptTemplateVariables,
+  referenceForRadarItem,
+  safeExternalUrl,
+  sameCategorySelection,
+  sanitizeCategoryTree,
+  scopeIsInsideHiddenRoot,
+} from "./library/presentation";
 
-type CardTextSize = "small" | "standard" | "large";
-type PaperViewMode = "cards" | "titles";
-
-type Category = {
-  id: string;
-  name: string;
-  count: number;
-  sidebarVisible: boolean;
-  ancestorIds?: string[];
-  children?: Category[];
-};
-
-type CategoryRecord = {
-  id: string;
-  name: string;
-  parentId: string | null;
-  ancestorIds: string[];
-  directCount: number;
-  totalCount: number;
-  childCount: number;
-  sidebarVisible: boolean;
-  createdAt?: string;
-  updatedAt?: string;
-};
-
-type DeletedCategoryRecord = CategoryRecord & {
-  deletedAt?: string;
-};
-
-type PaperTag = {
-  label: string;
-  scope: string;
-};
-
-type PaperIdentifier = {
-  kind: "doi" | "arxiv" | "url";
-  value: string;
-};
-
-type PdfArchive = {
-  status: "ready" | "failed" | "stale";
-  downloadedAt?: string;
-  sizeBytes?: number;
-  errorCode?: string;
-  errorMessage?: string;
-};
-
-type Paper = {
-  id: string;
-  zoteroKey?: string;
-  title: string;
-  zhTitle: string;
-  authors: string;
-  institution: string;
-  source: string;
-  date: string;
-  dateAdded: string;
-  tags: PaperTag[];
-  aiSummary: string;
-  note?: string;
-  noteCount?: number;
-  categoryIds?: string[];
-  scopes: string[];
-  favorite: boolean;
-  watchLater: boolean;
-  hasPdf: boolean;
-  pdfAttachmentKey?: string;
-  pdfUrl?: string;
-  pdfArchive?: PdfArchive;
-  originalUrl?: string;
-  codeProvider?: string;
-  codeUrl?: string;
-  projectProvider?: string;
-  projectUrl?: string;
-  identifiers?: PaperIdentifier[];
-  updatedAt?: string;
-};
-
-type PaperIntakeDraft = {
-  title: string;
-  zhTitle: string;
-  authors: string;
-  institution: string;
-  source: string;
-  date: string;
-  aiSummary: string;
-  categoryIds: string[];
-  originalUrl: string;
-  pdfUrl: string;
-  hasPdf: boolean;
-  codeUrl: string;
-  codeProvider: string;
-  projectUrl: string;
-  projectProvider: string;
-  identifiers: PaperIdentifier[];
-};
-
-type PaperDuplicateMatch = {
-  paper: Pick<
-    Paper,
-    "id" | "title" | "zhTitle" | "authors" | "source" | "date"
-  > & { deletedAt?: string };
-  reasons: Array<
-    | { type: "title" }
-    | { type: "identifier"; kind: PaperIdentifier["kind"]; value: string }
-  >;
-};
-
-type PaperIntakeResponse =
-  | {
-      status: "duplicate";
-      reference: string;
-      duplicates: PaperDuplicateMatch[];
-    }
-  | {
-      status: "ready";
-      reference: string;
-      metadata: {
-        title: string;
-        authors: string;
-        institution: string;
-        source: string;
-        date: string;
-        originalUrl: string;
-        pdfUrl: string;
-        identifiers: PaperIdentifier[];
-        metadataSource: string;
-        publicationStatus: "published" | "preprint" | "unknown";
-        publicationMatch: { method: string; confidence: string };
-        preprint: null | { arxivId: string; url: string; date: string };
-        codeUrl: string;
-        codeProvider: string;
-        codeEvidence: string;
-        projectUrl: string;
-        projectProvider: string;
-        projectEvidence: string;
-      };
-      ai: null | {
-        zhTitle: string;
-        institution: string;
-        source: string;
-        aiSummary: string;
-        categoryIds: string[];
-        model: string;
-      };
-      aiError: null | { code: string; message: string; action?: string };
-      draft: PaperIntakeDraft;
-    };
-
-type PaperEditDraft = {
-  title: string;
-  zhTitle: string;
-  authors: string;
-  institution: string;
-  source: string;
-  date: string;
-  favorite: boolean;
-  watchLater: boolean;
-  selectedCategoryIds: string[];
-  aiSummary: string;
-  note: string;
-  pdfUrl: string;
-  originalUrl: string;
-  hasCode: boolean;
-  codeUrl: string;
-  hasProject: boolean;
-  projectUrl: string;
-};
-
-type BackupStatus = {
-  ok: boolean;
-  lastBackupAt?: string;
-  message?: string;
-};
-
-type LibraryResponse = {
-  papers: Paper[];
-  categories: Category[];
-  backup?: BackupStatus;
-};
-
-type PaperMutationResponse = {
-  paper: Paper;
-  backup?: BackupStatus;
-};
-
-type PdfArchiveMutationResponse = PaperMutationResponse & {
-  alreadyArchived?: boolean;
-  committed?: boolean;
-};
-
-type CategoryMutationResponse = {
-  category: CategoryRecord;
-  categories?: CategoryRecord[];
-  deletedCategories?: DeletedCategoryRecord[];
-  library?: LibraryResponse;
-  backup?: BackupStatus;
-};
-
-type CategoriesResponse = {
-  categories: CategoryRecord[];
-  deletedCategories?: DeletedCategoryRecord[];
-  library?: LibraryResponse;
-  backup?: BackupStatus;
-};
-
-type LibraryConnection = "connecting" | "ready" | "unavailable";
-
-type AiModelSettings = {
-  id: string;
-  model: string;
-  resolvedModel: string;
-  verifiedAt: string | null;
-  active: boolean;
-};
-
-type AiConnectionSettings = {
-  id: string;
-  name: string;
-  baseUrl: string;
-  configured: boolean;
-  status: "verified" | "credential-missing";
-  models: AiModelSettings[];
-};
-
-type AiSettingsResponse = {
-  connections: AiConnectionSettings[];
-  activeModelId: string | null;
-};
-
-type AiSettingsMutationResponse = {
-  settings: AiSettingsResponse;
-  backup?: BackupStatus;
-};
-
-type AiVerificationResponse = AiSettingsMutationResponse & {
-  verification: {
-    ok: true;
-    connectionId: string;
-    modelId: string;
-    requestedModel: string;
-    resolvedModel: string;
-    latencyMs: number;
-    verifiedAt: string;
-  };
-};
-
-type RadarItem = {
-  id: string;
-  title: string;
-  zhTitle: string;
-  authors: string;
-  institution: string;
-  source: string;
-  date: string;
-  aiSummary: string;
-  recommendationReason: string;
-  originalUrl?: string;
-  pdfUrl?: string;
-  identifiers: PaperIdentifier[];
-  status: "pending" | "added" | "discarded";
-  addedPaperId?: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type RadarStateResponse = {
-  settings: {
-    prompt: string;
-    promptTemplate: string;
-    requestedCount: number;
-    updatedAt?: string;
-  };
-  pending: RadarItem[];
-  discarded: RadarItem[];
-  counts: {
-    library: number;
-    pending: number;
-    discarded: number;
-    added: number;
-  };
-  backup?: BackupStatus;
-  context?: {
-    providedToAi: number;
-    totalExclusions: number;
-    locallyChecked: number;
-  };
-  lastRun?: {
-    requested: number;
-    added: number;
-    insufficient: boolean;
-    rounds: number;
-    examined: number;
-    excludedLibrary: number;
-    excludedHistory: number;
-    excludedWithinRun: number;
-    invalid: number;
-    invalidResponses?: number;
-  };
-};
-
-type RadarAddResponse = {
-  paper: Paper;
-  library: LibraryResponse;
-  radar: RadarStateResponse;
-};
-
-type RadarAiExchange = {
-  round: number;
-  prompt: string;
-  response: string;
-  startedAt: string;
-  completedAt: string;
-  provider: string;
-  model: string;
-  latencyMs: number | null;
-  errorMessage: string;
-};
-
-type RadarAiTrace = {
-  status: "running" | "completed" | "failed";
-  requestedCount: number;
-  userPrompt: string;
-  exchanges: RadarAiExchange[];
-  errorMessage: string;
-  startedAt: string;
-  completedAt: string;
-  updatedAt: string;
-};
-
-type RadarAiTraceResponse = {
-  trace: RadarAiTrace | null;
-};
-
-type RadarPromptTemplateResponse = {
-  promptTemplate: string;
-};
-
-type FlatCategory = Category & {
-  depth: number;
-  path: string[];
-  numberPath: number[];
-  outlineNumber: string;
-};
-
-type PaperSearchMatch = ReturnType<typeof matchPaperSearch>;
-
-const paperSearchFieldLabels: Record<string, string> = {
-  identifier: "论文标识",
-  source: "来源",
-  year: "发表年份",
-  title: "英文标题",
-  zhTitle: "中文标题",
-  authors: "作者",
-  institution: "机构",
-  categories: "分类",
-  aiSummary: "AI 总结",
-  note: "笔记",
-  resources: "资源",
-};
-
-const legacyWatchCategoryIds = new Set(["BGPSP4JY"]);
-const radarPromptTemplateVariables = [
-  "{{research_scope}}",
-  "{{round}}",
-  "{{requested_count}}",
-  "{{exclusions_json}}",
-] as const;
 const initialPapers: Paper[] = [];
 const initialCategories: Category[] = [];
 const initialCategoryRecords: CategoryRecord[] = [];
-
-function normalizePaper(paper: Paper): Paper {
-  const originalCategoryIds = paper.categoryIds ?? [];
-  const inheritedLegacyWatch =
-    originalCategoryIds.some((id) => legacyWatchCategoryIds.has(id)) ||
-    paper.tags.some((tag) => legacyWatchCategoryIds.has(tag.scope));
-  const categoryIds = originalCategoryIds.filter(
-    (id) => !legacyWatchCategoryIds.has(id),
-  );
-  const scopes = paper.scopes.filter(
-    (scope) => !legacyWatchCategoryIds.has(scope),
-  );
-
-  return {
-    ...paper,
-    categoryIds,
-    tags: paper.tags.filter(
-      (tag) => !legacyWatchCategoryIds.has(tag.scope),
-    ),
-    scopes:
-      scopes.length || categoryIds.length
-        ? scopes
-        : ["uncategorized"],
-    favorite: Boolean(paper.favorite),
-    watchLater: paper.watchLater ?? inheritedLegacyWatch,
-  };
-}
-
-function normalizePapers(papers: Paper[]) {
-  return papers.map(normalizePaper);
-}
-
-function paperMatchesNonScopeFilters(
-  paper: Paper,
-  options: {
-    searchMatch: PaperSearchMatch;
-    favoriteOnly: boolean;
-    watchLaterOnly: boolean;
-    codeOnly: boolean;
-    projectOnly: boolean;
-  },
-) {
-  if (options.favoriteOnly && !paper.favorite) return false;
-  if (options.watchLaterOnly && !paper.watchLater) return false;
-  if (options.codeOnly && !safeExternalUrl(paper.codeUrl)) return false;
-  if (options.projectOnly && !safeExternalUrl(paper.projectUrl)) return false;
-  return options.searchMatch.matched;
-}
-
-function sanitizeCategoryTree(categories: Category[]): Category[] {
-  return categories
-    .filter((category) => !legacyWatchCategoryIds.has(category.id))
-    .map((category) => ({
-      ...category,
-      sidebarVisible: category.sidebarVisible ?? true,
-      children: sanitizeCategoryTree(category.children ?? []),
-    }));
-}
-
-function scopeIsInsideHiddenRoot(
-  categories: Category[],
-  scope: string,
-) {
-  if (scope === "all" || scope === "uncategorized") return false;
-  const includesScope = (category: Category): boolean =>
-    category.id === scope ||
-    Boolean(category.children?.some(includesScope));
-  const root = categories.find(includesScope);
-  return Boolean(root && !root.sidebarVisible);
-}
-
-function flattenCategoryTree(
-  categories: Category[],
-  depth = 0,
-  parentPath: string[] = [],
-  parentIds: string[] = [],
-  parentNumberPath: number[] = [],
-): FlatCategory[] {
-  return categories.flatMap((category, index) => {
-    const path = [...parentPath, category.name];
-    const numberPath = [...parentNumberPath, index + 1];
-    const ancestorIds =
-      category.ancestorIds?.length ? category.ancestorIds : parentIds;
-    const outlineNumber =
-      numberPath.length === 1
-        ? `${numberPath[0]}.`
-        : numberPath.join(".");
-    return [
-      {
-        ...category,
-        ancestorIds,
-        depth,
-        path,
-        numberPath,
-        outlineNumber,
-      },
-      ...flattenCategoryTree(
-        category.children ?? [],
-        depth + 1,
-        path,
-        [...parentIds, category.id],
-        numberPath,
-      ),
-    ];
-  });
-}
-
-const configuredLibraryApiUrl =
-  (
-    import.meta as ImportMeta & {
-      env?: { VITE_LIBRARY_API_URL?: string };
-    }
-  ).env?.VITE_LIBRARY_API_URL ?? "http://127.0.0.1:4317";
-const LIBRARY_API_BASE = `${configuredLibraryApiUrl.replace(/\/+$/, "")}/api`;
-
-const cardTextSizeLabels: Record<CardTextSize, string> = {
-  small: "小",
-  standard: "标准",
-  large: "大",
-};
-
-function safeExternalUrl(url?: string) {
-  if (!url) return undefined;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "https:" || parsed.protocol === "http:"
-      ? parsed.href
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function providerForUrl(url: string) {
-  const safeUrl = safeExternalUrl(url);
-  if (!safeUrl) return "代码";
-  const host = new URL(safeUrl).hostname.replace(/^www\./, "");
-  if (host === "github.com") return "GitHub";
-  if (host === "gitlab.com") return "GitLab";
-  if (host === "bitbucket.org") return "Bitbucket";
-  return "项目站";
-}
-
-function referenceForRadarItem(item: RadarItem) {
-  const originalUrl = safeExternalUrl(item.originalUrl);
-  if (originalUrl) return originalUrl;
-
-  const doi = item.identifiers.find((identifier) => identifier.kind === "doi");
-  if (doi) return `https://doi.org/${doi.value}`;
-
-  const arxiv = item.identifiers.find(
-    (identifier) => identifier.kind === "arxiv",
-  );
-  if (arxiv) return `https://arxiv.org/abs/${arxiv.value}`;
-
-  const url = item.identifiers.find((identifier) => identifier.kind === "url");
-  return safeExternalUrl(url?.value) ?? "";
-}
-
-function draftFromPaper(paper: Paper): PaperEditDraft {
-  return {
-    title: paper.title,
-    zhTitle: paper.zhTitle,
-    authors: paper.authors,
-    institution: paper.institution,
-    source: paper.source,
-    date: paper.date === "日期未录入" ? "" : paper.date,
-    favorite: paper.favorite,
-    watchLater: paper.watchLater,
-    selectedCategoryIds:
-      paper.categoryIds ??
-      paper.tags.map((tag) => tag.scope).filter((scope) => scope !== "uncategorized"),
-    aiSummary: paper.aiSummary,
-    note: paper.note ?? "",
-    pdfUrl: paper.pdfUrl ?? "",
-    originalUrl: paper.originalUrl ?? "",
-    hasCode: Boolean(paper.codeProvider || paper.codeUrl),
-    codeUrl: paper.codeUrl ?? "",
-    hasProject: Boolean(paper.projectProvider || paper.projectUrl),
-    projectUrl: paper.projectUrl ?? "",
-  };
-}
-
-function sameCategorySelection(left: string[], right: string[]) {
-  if (left.length !== right.length) return false;
-  const rightIds = new Set(right);
-  return left.every((id) => rightIds.has(id));
-}
-
-async function libraryRequest<T>(path: string, init?: RequestInit) {
-  const response = await fetch(`${LIBRARY_API_BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-
-  const payload = (await response.json().catch(() => null)) as
-    | (T & {
-        error?:
-          | string
-          | { message?: string; details?: { action?: string } };
-      })
-    | null;
-  if (!response.ok) {
-    const errorValue = payload?.error;
-    const message =
-      typeof errorValue === "object"
-        ? errorValue.message || "本机文献数据库暂时不可用"
-        : errorValue || "本机文献数据库暂时不可用";
-    const action =
-      typeof errorValue === "object" ? errorValue.details?.action : "";
-    throw new Error(
-      action && action !== message ? `${message} ${action}` : message,
-    );
-  }
-  return payload as T;
-}
-
-function pdfOpenUrl(paperId: string) {
-  return `${LIBRARY_API_BASE}/papers/${encodeURIComponent(paperId)}/pdf/open`;
-}
-
-function formatPdfSize(sizeBytes?: number) {
-  if (!sizeBytes || sizeBytes < 1_024) return sizeBytes ? `${sizeBytes} B` : "";
-  if (sizeBytes < 1_024 * 1_024) {
-    return `${(sizeBytes / 1_024).toFixed(1)} KB`;
-  }
-  return `${(sizeBytes / (1_024 * 1_024)).toFixed(1)} MB`;
-}
-
-function formatPdfArchiveTime(value?: string) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return "";
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatBackupTime(value?: string) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return "";
-  return new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatAiVerifiedTime(value?: string | null) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return "";
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatRadarAiTraceTime(value?: string | null) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return "";
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).format(date);
-}
-
-function formatAiBaseUrlHost(value: string) {
-  try {
-    return new URL(value).host || "待确认地址";
-  } catch {
-    return "待确认地址";
-  }
-}
-
-function normalizeAiBaseUrlForComparison(value: string) {
-  try {
-    const url = new URL(value.trim());
-    url.pathname = url.pathname.replace(/\/+$/u, "");
-    return url.toString().replace(/\/$/u, "");
-  } catch {
-    return value.trim().replace(/\/+$/u, "");
-  }
-}
-
-function normalizeCategoryRecords(
-  records: Array<
-    Partial<CategoryRecord> & Pick<CategoryRecord, "id" | "name">
-  >,
-  papers: Paper[],
-) {
-  const visibleRecords = records.filter(
-    (record) => !legacyWatchCategoryIds.has(record.id),
-  );
-  return visibleRecords.map((record) => {
-    const parentId = record.parentId ?? null;
-    const directCount =
-      record.directCount ??
-      papers.filter((paper) => paper.categoryIds?.includes(record.id)).length;
-    const totalCount =
-      record.totalCount ??
-      papers.filter((paper) => paper.scopes.includes(record.id)).length;
-    const childCount =
-      record.childCount ??
-      visibleRecords.filter((candidate) => candidate.parentId === record.id)
-        .length;
-
-    return {
-      id: record.id,
-      name: record.name,
-      parentId,
-      ancestorIds: record.ancestorIds ?? [],
-      directCount,
-      totalCount,
-      childCount,
-      sidebarVisible: record.sidebarVisible ?? true,
-      createdAt: record.createdAt,
-      updatedAt: record.updatedAt,
-    };
-  });
-}
 
 export default function Home() {
   const [papers, setPapers] = useState(initialPapers);
@@ -942,8 +300,10 @@ export default function Home() {
         setTextSizeOpen(false);
         setOpenMenu(null);
         setTitlePreviewPaperId(null);
-        setAddPaperOpen(false);
-        setRadarIntakeItem(null);
+        if (!paperIntakeBusy && !addingPaper) {
+          setAddPaperOpen(false);
+          setRadarIntakeItem(null);
+        }
         if (!aiBusyAction) setAiSettingsOpen(false);
         setMobileNavOpen(false);
       }
@@ -951,7 +311,7 @@ export default function Home() {
 
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [aiBusyAction]);
+  }, [addingPaper, aiBusyAction, paperIntakeBusy]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1750,7 +1110,7 @@ export default function Home() {
         "/paper-intake/analyze",
         {
           method: "POST",
-          body: JSON.stringify({ reference: paperReference.trim() }),
+          body: JSON.stringify({ reference: paperReference }),
         },
       );
       setPaperIntakeResult(response);
@@ -3272,6 +2632,38 @@ export default function Home() {
     }
   };
 
+  const updateAiModelReasoningEffort = async (
+    model: AiModelSettings,
+    reasoningEffort: AiReasoningEffort,
+  ) => {
+    if (aiBusyAction || reasoningEffort === model.reasoningEffort) return;
+    setAiBusyAction(`reasoning:${model.id}`);
+    setAiInlineError(null);
+    try {
+      const response = await libraryRequest<AiSettingsMutationResponse>(
+        `/ai/models/${encodeURIComponent(model.id)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ reasoningEffort }),
+        },
+      );
+      applyAiSettings(response.settings, aiSelectedConnectionId);
+      applyBackupStatus(response.backup);
+      setToast(
+        `${model.model} 的思考强度已设为 ${AI_REASONING_EFFORT_LABELS[reasoningEffort]}`,
+      );
+    } catch (error) {
+      setAiInlineError({
+        ...(aiSelectedConnectionId
+          ? { connectionId: aiSelectedConnectionId }
+          : {}),
+        message: error instanceof Error ? error.message : "思考强度保存失败",
+      });
+    } finally {
+      setAiBusyAction(null);
+    }
+  };
+
   const removeAiModel = async (model: AiModelSettings) => {
     if (aiBusyAction) return;
     if (!window.confirm(`删除模型配置 ${model.model}？`)) return;
@@ -4027,7 +3419,10 @@ export default function Home() {
         ),
     );
     const representedCategoryIds = new Set<string>();
-    const visiblePaths = terminalCategories.map((category) => {
+    const visiblePaths: Array<{
+      category: FlatCategory | undefined;
+      path: string[];
+    }> = terminalCategories.map((category) => {
       representedCategoryIds.add(category.id);
       category.ancestorIds?.forEach((ancestorId) =>
         representedCategoryIds.add(ancestorId),
@@ -4360,279 +3755,6 @@ export default function Home() {
     );
   };
 
-  const visibleRadarItems =
-    radarView === "pending"
-      ? radarState?.pending ?? []
-      : radarState?.discarded ?? [];
-  const radarTotalExclusions = radarState
-    ? radarState.counts.library +
-      radarState.counts.pending +
-      radarState.counts.discarded +
-      radarState.counts.added
-    : papers.length;
-
-  const renderRadarItem = (item: RadarItem) => {
-    const originalUrl = safeExternalUrl(item.originalUrl);
-    const busy = radarItemBusy === item.id;
-    const metadata = [
-      item.authors,
-      item.institution,
-      item.source,
-      item.date,
-    ].filter(Boolean);
-    return (
-      <article className="radar-paper-card" key={item.id}>
-        <header className="radar-paper-header">
-          <div>
-            <span className="radar-unique-badge">
-              <span aria-hidden="true">✓</span>
-              已通过知识库与历史记录排重
-            </span>
-            <h2>{item.title}</h2>
-            {item.zhTitle && <p className="radar-paper-zh-title">{item.zhTitle}</p>}
-          </div>
-          {originalUrl && (
-            <a
-              className="radar-source-link"
-              href={originalUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              查看原文 ↗
-            </a>
-          )}
-        </header>
-
-        {metadata.length > 0 && (
-          <p className="radar-paper-meta">{metadata.join(" · ")}</p>
-        )}
-
-        {item.recommendationReason && (
-          <div className="radar-reason">
-            <span>推荐理由</span>
-            <p>{item.recommendationReason}</p>
-          </div>
-        )}
-        {item.aiSummary && (
-          <div className="radar-summary">
-            <span>AI 摘要</span>
-            <p>{item.aiSummary}</p>
-          </div>
-        )}
-
-        <footer className="radar-paper-footer">
-          <div className="radar-identifiers" aria-label="排重标识">
-            {item.identifiers
-              .filter((identifier) => identifier.kind !== "url")
-              .slice(0, 3)
-              .map((identifier) => (
-                <span key={`${identifier.kind}:${identifier.value}`}>
-                  {identifier.kind.toUpperCase()} · {identifier.value}
-                </span>
-              ))}
-          </div>
-          <div className="radar-review-actions">
-            {item.status === "discarded" ? (
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => changeRadarItem(item, "restore")}
-                disabled={Boolean(radarItemBusy)}
-              >
-                {busy ? "正在恢复…" : "恢复到待审核"}
-              </button>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  className="radar-discard-button"
-                  onClick={() => changeRadarItem(item, "discard")}
-                  disabled={Boolean(radarItemBusy)}
-                >
-                  {busy ? "处理中…" : "丢弃并不再推荐"}
-                </button>
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={() => reviewRadarItemForAddition(item)}
-                  disabled={Boolean(radarItemBusy)}
-                >
-                  核对并加入
-                </button>
-              </>
-            )}
-          </div>
-        </footer>
-      </article>
-    );
-  };
-
-  const renderRadarSurface = () => (
-    <div className="radar-page">
-      <section className="radar-hero" aria-labelledby="radar-title">
-        <div>
-          <span className="radar-eyebrow">AI 文献发现</span>
-          <h1 id="radar-title">文献雷达</h1>
-          <p>按你的研究范围联网检索；每篇论文先排重，再交给你决定加入或永久丢弃。</p>
-        </div>
-        <div className="radar-hero-stats" aria-label="排重范围">
-          <span><strong>{radarState?.counts.library ?? papers.length}</strong> 知识库论文</span>
-          <span><strong>{radarState?.counts.discarded ?? 0}</strong> 永久排除</span>
-        </div>
-      </section>
-
-      <form className="radar-composer" onSubmit={runLiteratureRadar}>
-        <div className="radar-composer-heading">
-          <div>
-            <h2>本次检索要求</h2>
-            <p>提示词每次都可编辑；保存后将作为下一次默认值。</p>
-          </div>
-          <label className="radar-count-field">
-            <span>推送数量</span>
-            <input
-              type="number"
-              min={1}
-              max={30}
-              value={radarCount}
-              onChange={(event) =>
-                setRadarCount(Math.max(1, Math.min(30, Number(event.target.value) || 1)))
-              }
-              disabled={radarBusy}
-            />
-            <small>篇</small>
-          </label>
-        </div>
-        <label className="radar-prompt-field">
-          <span className="sr-only">文献检索提示词</span>
-          <textarea
-            value={radarPrompt}
-            onChange={(event) => setRadarPrompt(event.target.value)}
-            rows={5}
-            maxLength={10_000}
-            placeholder="例如：检索与多模态情感识别、微表情分析和生理信号融合相关的近期论文……"
-            disabled={radarBusy}
-          />
-        </label>
-
-        <div className="radar-template-entry">
-          <div>
-            <strong>完整提示词模板</strong>
-            <span>高级设置；日常检索只需编辑上方要求</span>
-          </div>
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={openRadarPromptEditor}
-            disabled={!radarState || radarBusy}
-          >
-            <span aria-hidden="true">⌘</span>
-            编辑完整提示词
-          </button>
-        </div>
-
-        <div className="radar-system-context">
-          <button
-            type="button"
-            onClick={() => setRadarContextOpen((current) => !current)}
-            aria-expanded={radarContextOpen}
-          >
-            <span aria-hidden="true">⌁</span>
-            系统排重上下文（只读）
-            <strong>{radarTotalExclusions} 条</strong>
-            <span aria-hidden="true">{radarContextOpen ? "⌃" : "⌄"}</span>
-          </button>
-          {radarContextOpen && (
-            <div className="radar-context-detail">
-              <p>
-                AI 检索前会收到知识库与历史审核记录的标题、DOI、arXiv 和 URL 摘要；
-                返回后，本机数据库还会对全部 {radarTotalExclusions} 条记录再次严格排重。
-              </p>
-              <dl>
-                <div><dt>当前知识库</dt><dd>{radarState?.counts.library ?? papers.length}</dd></div>
-                <div><dt>待审核</dt><dd>{radarState?.counts.pending ?? 0}</dd></div>
-                <div><dt>已加入历史</dt><dd>{radarState?.counts.added ?? 0}</dd></div>
-                <div><dt>已丢弃历史</dt><dd>{radarState?.counts.discarded ?? 0}</dd></div>
-              </dl>
-              {radarState?.context && (
-                <small>
-                  上次检索：AI 收到 {radarState.context.providedToAi} 条摘要，本机核查 {radarState.context.locallyChecked} 条。
-                </small>
-              )}
-            </div>
-          )}
-        </div>
-
-        {radarError && <p className="radar-error" role="alert">{radarError}</p>}
-        <div className="radar-composer-actions">
-          <p><span aria-hidden="true">✓</span> 数量不足时不会用重复论文补齐</p>
-          <div className="radar-composer-buttons">
-            <button
-              type="button"
-              className="secondary-button radar-trace-button"
-              onClick={openRadarAiTrace}
-            >
-              <span aria-hidden="true">⌘</span>
-              查看本次 AI 记录
-            </button>
-            <button
-              type="submit"
-              className="primary-button radar-run-button"
-              disabled={radarBusy || !radarPrompt.trim()}
-            >
-              <span aria-hidden="true">✦</span>
-              {radarBusy
-                ? "正在联网检索并排重，最长约 20 分钟…"
-                : "开始本次检索"}
-            </button>
-          </div>
-        </div>
-      </form>
-
-      <section className="radar-review-section" aria-labelledby="radar-review-title">
-        <div className="radar-review-heading">
-          <div>
-            <h2 id="radar-review-title">个人审核</h2>
-            <p>加入或丢弃之前，不会改动你的知识库。</p>
-          </div>
-          <div className="radar-tabs" role="tablist" aria-label="文献雷达审核状态">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={radarView === "pending"}
-              className={radarView === "pending" ? "is-active" : ""}
-              onClick={() => setRadarView("pending")}
-            >
-              待审核 <span>{radarState?.counts.pending ?? 0}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={radarView === "discarded"}
-              className={radarView === "discarded" ? "is-active" : ""}
-              onClick={() => setRadarView("discarded")}
-            >
-              已丢弃 <span>{radarState?.counts.discarded ?? 0}</span>
-            </button>
-          </div>
-        </div>
-
-        {visibleRadarItems.length ? (
-          <div className="radar-paper-list">{visibleRadarItems.map(renderRadarItem)}</div>
-        ) : (
-          <div className="radar-empty-state">
-            <span aria-hidden="true">✦</span>
-            <h3>{radarView === "pending" ? "暂无待审核论文" : "暂无已丢弃论文"}</h3>
-            <p>
-              {radarView === "pending"
-                ? "编辑上方提示词并开始检索，新的不重复论文会出现在这里。"
-                : "你丢弃的论文会永久保留在排除记录中，并可随时恢复。"}
-            </p>
-          </div>
-        )}
-      </section>
-    </div>
-  );
-
   return (
     <div className="library-app">
       {isMobile && mobileNavOpen && (
@@ -4903,7 +4025,28 @@ export default function Home() {
         </header>
 
         {activeSurface === "radar" ? (
-          renderRadarSurface()
+          <RadarSurface
+            radarState={radarState}
+            libraryPaperCount={papers.length}
+            prompt={radarPrompt}
+            requestedCount={radarCount}
+            view={radarView}
+            busy={radarBusy}
+            itemBusyId={radarItemBusy}
+            error={radarError}
+            contextOpen={radarContextOpen}
+            onPromptChange={setRadarPrompt}
+            onRequestedCountChange={setRadarCount}
+            onViewChange={setRadarView}
+            onToggleContext={() =>
+              setRadarContextOpen((current) => !current)
+            }
+            onOpenPromptEditor={openRadarPromptEditor}
+            onOpenAiTrace={openRadarAiTrace}
+            onSubmit={runLiteratureRadar}
+            onChangeItem={changeRadarItem}
+            onReviewItem={reviewRadarItemForAddition}
+          />
         ) : (
           <>
         <section
@@ -6546,6 +5689,34 @@ export default function Home() {
                                       ? ` · ${formatAiVerifiedTime(model.verifiedAt)}`
                                       : ""}
                                   </small>
+                                  {model.reasoningEffort &&
+                                    model.reasoningEffortOptions.length > 0 && (
+                                      <label className="ai-reasoning-effort-control">
+                                        <span>思考强度</span>
+                                        <select
+                                          value={model.reasoningEffort}
+                                          onChange={(event) =>
+                                            void updateAiModelReasoningEffort(
+                                              model,
+                                              event.target
+                                                .value as AiReasoningEffort,
+                                            )
+                                          }
+                                          disabled={Boolean(aiBusyAction)}
+                                          aria-label={`${model.model} 的思考强度`}
+                                        >
+                                          {model.reasoningEffortOptions.map(
+                                            (effort) => (
+                                              <option key={effort} value={effort}>
+                                                {AI_REASONING_EFFORT_LABELS[
+                                                  effort
+                                                ]}
+                                              </option>
+                                            ),
+                                          )}
+                                        </select>
+                                      </label>
+                                    )}
                                 </div>
                                 <div className="ai-model-actions">
                                   <button
@@ -6685,7 +5856,11 @@ export default function Home() {
         <div
           className="modal-layer"
           onMouseDown={(event) => {
-            if (event.currentTarget === event.target) {
+            if (
+              event.currentTarget === event.target &&
+              !paperIntakeBusy &&
+              !addingPaper
+            ) {
               setAddPaperOpen(false);
               setRadarIntakeItem(null);
             }
@@ -6698,6 +5873,7 @@ export default function Home() {
             }`}
             role="dialog"
             aria-modal="true"
+            aria-busy={paperIntakeBusy || addingPaper}
             aria-labelledby="add-paper-title"
             onKeyDown={handleModalKeyDown}
           >
@@ -6708,8 +5884,8 @@ export default function Home() {
                 </h2>
                 <p>
                   {radarIntakeItem
-                    ? "再次识别和查重，手动核对全部信息后再加入知识库。"
-                    : "粘贴论文地址，核对 AI 整理后的信息再保存。"}
+                    ? "AI 联网核对这篇候选论文，确认信息后加入知识库。"
+                    : "给出任何论文线索，让 AI 联网查找并整理完整资料。"}
                 </p>
               </div>
               <button
@@ -6728,7 +5904,7 @@ export default function Home() {
             <ol className="paper-intake-steps" aria-label="添加进度">
               <li className={!paperIntakeDraft ? "is-active" : "is-complete"}>
                 <span>1</span>
-                识别与查重
+                提供线索
               </li>
               <li
                 className={
@@ -6740,7 +5916,7 @@ export default function Home() {
                 }
               >
                 <span>2</span>
-                元数据与 AI
+                AI 联网整理
               </li>
               <li className={paperIntakeDraft ? "is-active" : ""}>
                 <span>3</span>
@@ -6763,26 +5939,27 @@ export default function Home() {
             {!paperIntakeDraft ? (
               <form className="paper-intake-start" onSubmit={analyzePaperReference}>
                 <label className="paper-intake-reference">
-                  <span>论文链接或标识</span>
+                  <span>论文名称、链接或其他线索</span>
                   <textarea
                     value={paperReference}
                     onChange={(event) => setPaperReference(event.target.value)}
-                    placeholder="粘贴 DOI、arXiv 编号或论文网页 URL"
-                    rows={3}
+                    placeholder="论文名称、项目主页、DOI、arXiv、代码仓库，或作者与研究内容的描述，都可以直接粘贴在这里。"
+                    rows={4}
+                    maxLength={12000}
                     autoFocus
                     disabled={paperIntakeBusy}
                   />
                 </label>
                 <p className="paper-intake-hint">
-                  系统会先检查本地知识库；确认无重复后，再核对正式发表版本、查找项目与代码，并调用当前模型生成中文标题、摘要和分类建议。
+                  AI 会根据线索搜索论文、核对发表信息、寻找 PDF 与代码，并整理中文标题、摘要和分类。线索和现有分类会发送给当前模型；需要模型支持联网检索。
                 </p>
 
                 {paperIntakeBusy && (
                   <div className="paper-intake-progress" role="status">
                     <span className="paper-intake-spinner" aria-hidden="true" />
                     <div>
-                      <strong>正在整理这篇论文</strong>
-                      <small>查重、读取元数据并生成补全内容，通常需要几秒。</small>
+                      <strong>AI 正在联网查找并核对论文</strong>
+                      <small>可能需要几分钟。完成后会展示资料和来源，确认前不会加入知识库。</small>
                     </div>
                   </div>
                 )}
@@ -6793,7 +5970,7 @@ export default function Home() {
                       <span aria-hidden="true">!</span>
                       <div>
                         <strong>知识库中可能已经有这篇论文</strong>
-                        <small>为避免重复，当前不会继续调用 AI 或写入数据库。</small>
+                        <small>当前不会重复入库，可以直接查看已有论文。</small>
                       </div>
                     </div>
                     <div className="paper-duplicate-list">
@@ -6836,6 +6013,33 @@ export default function Home() {
                   </div>
                 )}
 
+                {paperIntakeResult?.status === "needs_clarification" && (
+                  <div className="paper-intake-clarification" role="status">
+                    <strong>还需要一点线索</strong>
+                    <p>{paperIntakeResult.message}</p>
+                    <small>在上方补充信息，再交给 AI 整理。</small>
+                    <PaperIntakeSources sources={paperIntakeResult.sources} />
+                  </div>
+                )}
+
+                {paperIntakeResult?.status === "research_incomplete" && (
+                  <div className="paper-intake-clarification" role="status">
+                    <strong>本次检索未完成</strong>
+                    <p>{paperIntakeResult.message}</p>
+                    <small>可以保留上方内容直接重试，或在 AI 设置中切换支持联网的模型。</small>
+                    <PaperIntakeSources sources={paperIntakeResult.sources} />
+                  </div>
+                )}
+
+                {paperIntakeResult?.status === "not_found" && (
+                  <div className="paper-intake-clarification" role="status">
+                    <strong>未找到匹配的论文</strong>
+                    <p>{paperIntakeResult.message}</p>
+                    <small>可以调整上方线索，再交给 AI 整理。</small>
+                    <PaperIntakeSources sources={paperIntakeResult.sources} />
+                  </div>
+                )}
+
                 {paperIntakeError && (
                   <p className="paper-intake-error" role="alert">
                     {paperIntakeError}
@@ -6859,7 +6063,7 @@ export default function Home() {
                     className="primary-button"
                     disabled={paperIntakeBusy || !paperReference.trim()}
                   >
-                    {paperIntakeBusy ? "正在识别…" : "识别并生成"}
+                    {paperIntakeBusy ? "AI 正在查找…" : "交给 AI 整理"}
                   </button>
                 </div>
               </form>
@@ -6867,7 +6071,7 @@ export default function Home() {
               <form className="paper-intake-review" onSubmit={addPaper}>
                 <div className="paper-intake-review-meta">
                   <div>
-                    <span>元数据来源</span>
+                    <span>整理方式</span>
                     <strong>
                       {paperIntakeResult?.status === "ready"
                         ? paperIntakeResult.metadata.metadataSource
@@ -6907,16 +6111,19 @@ export default function Home() {
                   </div>
                 </div>
 
-                {paperIntakeResult?.status === "ready" && paperIntakeResult.aiError && (
-                  <div className="paper-intake-ai-warning" role="alert">
-                    <strong>元数据已获取，但 AI 补全没有完成</strong>
-                    <p>
-                      {paperIntakeResult.aiError.message}
-                      {paperIntakeResult.aiError.action
-                        ? ` ${paperIntakeResult.aiError.action}`
-                        : " 你可以手动填写后继续添加。"}
-                    </p>
-                  </div>
+                {paperIntakeResult?.status === "ready" && (
+                  <>
+                    {paperIntakeResult.metadata.matchReason && (
+                      <p className="paper-intake-match-reason">{paperIntakeResult.metadata.matchReason}</p>
+                    )}
+                    {paperIntakeResult.metadata.warnings.length > 0 && (
+                      <div className="paper-intake-ai-warning" role="status">
+                        <strong>以下信息需要留意</strong>
+                        <ul>{paperIntakeResult.metadata.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+                      </div>
+                    )}
+                    <PaperIntakeSources sources={paperIntakeResult.metadata.sources} />
+                  </>
                 )}
 
                 <fieldset className="paper-intake-section">
@@ -6976,7 +6183,7 @@ export default function Home() {
 
                 <fieldset className="paper-intake-section is-ai-section">
                   <legend>
-                    AI 补全
+                    AI 整理
                     <small>可修改</small>
                   </legend>
                   <label className="paper-intake-field">
@@ -7075,7 +6282,7 @@ export default function Home() {
                     {paperIntakeResult?.status === "ready" &&
                       paperIntakeResult.metadata.codeEvidence && (
                         <small className="paper-intake-evidence">
-                          已验证：{paperIntakeResult.metadata.codeEvidence}
+                          来源说明：{paperIntakeResult.metadata.codeEvidence}
                         </small>
                       )}
                   </label>
@@ -7091,7 +6298,7 @@ export default function Home() {
                     {paperIntakeResult?.status === "ready" &&
                       paperIntakeResult.metadata.projectEvidence && (
                         <small className="paper-intake-evidence">
-                          已验证：{paperIntakeResult.metadata.projectEvidence}
+                          来源说明：{paperIntakeResult.metadata.projectEvidence}
                         </small>
                       )}
                   </label>

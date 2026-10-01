@@ -109,3 +109,56 @@ test("旧关键词列只迁移一次，并从数据库、接口模型和写入�
     1,
   );
 });
+
+test("旧 AI 模型表自动补充并初始化思考强度", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ai-reasoning-migration-"));
+  const dbPath = join(directory, "library.sqlite3");
+  const backupDir = join(directory, "backups");
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  let repository = await createLibraryRepository({
+    dbPath,
+    backupDir,
+    seedPath: null,
+  });
+  await repository.saveAiServiceModel({
+    connectionId: "openai-test",
+    name: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    model: "gpt-5.6-sol",
+    resolvedModel: "gpt-5.6-sol",
+  });
+  await repository.saveAiServiceModel({
+    connectionId: "deepseek-test",
+    name: "DeepSeek",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-v4-pro",
+    resolvedModel: "deepseek-v4-pro",
+  });
+  await repository.close();
+
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec("ALTER TABLE ai_models DROP COLUMN reasoning_effort");
+  legacy.close();
+
+  repository = await createLibraryRepository({
+    dbPath,
+    backupDir,
+    seedPath: null,
+  });
+  t.after(() => repository.close());
+
+  const columns = repository.db.prepare("PRAGMA table_info(ai_models)").all();
+  assert.equal(
+    columns.some((column) => column.name === "reasoning_effort"),
+    true,
+  );
+  const models = repository
+    .getAiServices()
+    .flatMap((service) => service.models)
+    .map((model) => [model.model, model.reasoningEffort]);
+  assert.deepEqual(new Map(models), new Map([
+    ["gpt-5.6-sol", "medium"],
+    ["deepseek-v4-pro", "max"],
+  ]));
+});

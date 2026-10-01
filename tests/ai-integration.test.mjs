@@ -91,9 +91,6 @@ test("服务连接共享钥匙串密钥，并可添加和切换多个模型", as
     const requestUrl = String(url);
     const body = JSON.parse(init.body);
     calls.push({ url: requestUrl, init, body });
-    if (requestUrl.startsWith("https://api.deepseek.com/") && requestUrl.endsWith("/responses")) {
-      return new Response("not found", { status: 404 });
-    }
     return requestUrl.endsWith("/chat/completions")
       ? chatSuccess(body.model)
       : responsesSuccess(`${body.model}-resolved`);
@@ -208,8 +205,10 @@ test("服务连接共享钥匙串密钥，并可添加和切换多个模型", as
   assert.equal(
     calls.some(
       (call) =>
-        call.url === "https://api.deepseek.com/chat/completions" &&
-        call.body.model === "deepseek-custom",
+        call.url === "https://api.deepseek.com/responses" &&
+        call.body.model === "deepseek-custom" &&
+        call.body.reasoning_effort === "max" &&
+        call.body.thinking?.type === "enabled",
     ),
     true,
   );
@@ -269,53 +268,104 @@ test("服务连接共享钥匙串密钥，并可添加和切换多个模型", as
   );
 });
 
-test("OpenAI 兼容地址不支持 Responses 时自动回退到 Chat Completions", async (t) => {
+test("OpenAI 模型可选择并持久化思考强度", async (t) => {
   const calls = [];
-  const fixture = await makeAiFixture(t, "openai-chat-fallback", {
+  const fixture = await makeAiFixture(t, "openai-reasoning-effort", {
     aiFetch: async (url, init) => {
-      const requestUrl = String(url);
-      calls.push(requestUrl);
-      if (requestUrl.endsWith("/responses")) {
-        return new Response("not found", { status: 404 });
-      }
-      return chatSuccess(JSON.parse(init.body).model);
+      const body = JSON.parse(init.body);
+      calls.push({ url: String(url), body });
+      return responsesSuccess(body.model);
     },
   });
 
-  const first = await jsonRequest(fixture.baseUrl, "/api/ai/connections", {
-    method: "POST",
-    body: JSON.stringify({
-      name: "兼容网关",
-      model: "relay-model",
-      baseUrl: "https://relay.example/v1",
-      apiKey: "sk-relay-test",
-    }),
-  });
-  assert.equal(first.response.status, 200);
-  const connectionId = first.body.verification.connectionId;
-  assert.deepEqual(calls, [
-    "https://relay.example/v1/responses",
-    "https://relay.example/v1/chat/completions",
-  ]);
-
-  const second = await jsonRequest(
+  const configured = await jsonRequest(
     fixture.baseUrl,
-    `/api/ai/connections/${connectionId}/models/verify`,
+    "/api/ai/connections",
     {
       method: "POST",
       body: JSON.stringify({
-        name: "兼容网关",
-        model: "relay-model-2",
-        baseUrl: "https://relay.example/v1",
+        name: "OpenAI",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5.6-sol",
+        apiKey: "sk-reasoning-test",
       }),
     },
   );
-  assert.equal(second.response.status, 200);
-  assert.equal(calls.at(-1), "https://relay.example/v1/chat/completions");
-  assert.equal(calls.length, 3);
+  assert.equal(configured.response.status, 200);
+  const model = configured.body.settings.connections[0].models[0];
+  assert.equal(model.reasoningEffort, "medium");
+  assert.deepEqual(model.reasoningEffortOptions, [
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
+  assert.deepEqual(calls[0].body.reasoning, { effort: "medium" });
+
+  const updated = await jsonRequest(
+    fixture.baseUrl,
+    `/api/ai/models/${model.id}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ reasoningEffort: "max" }),
+    },
+  );
+  assert.equal(updated.response.status, 200);
+  assert.equal(
+    updated.body.settings.connections[0].models[0].reasoningEffort,
+    "max",
+  );
+
+  await fixture.api.aiService.generateText({ input: "think carefully" });
+  assert.deepEqual(calls.at(-1).body.reasoning, { effort: "max" });
+
+  const database = new DatabaseSync(fixture.dbPath, { readOnly: true });
+  try {
+    assert.equal(
+      database
+        .prepare("SELECT reasoning_effort AS effort FROM ai_models WHERE id = ?")
+        .get(model.id).effort,
+      "max",
+    );
+  } finally {
+    database.close();
+  }
+
+  const unsupported = await jsonRequest(
+    fixture.baseUrl,
+    `/api/ai/models/${model.id}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ reasoningEffort: "minimal" }),
+    },
+  );
+  assert.equal(unsupported.response.status, 400);
+  assert.equal(unsupported.body.error.details.field, "reasoningEffort");
 });
 
-test("Responses 返回接口不支持时仍可用 Chat Completions 验证 DeepSeek V4", async (t) => {
+test("OpenAI 兼容地址的 Responses 失败不会回退到 Chat Completions 或保存配置", async (t) => {
+  const calls = [];
+  const fixture = await makeAiFixture(t, "responses-only", {
+    aiFetch: async (url) => {
+      calls.push(String(url));
+      return new Response("not found", { status: 404 });
+    },
+  });
+  const response = await jsonRequest(fixture.baseUrl, "/api/ai/connections", {
+    method: "POST",
+    body: JSON.stringify({ name: "兼容网关", model: "relay-model", baseUrl: "https://relay.example/v1", apiKey: "sk-relay-test" }),
+  });
+  assert.equal(response.response.status, 400);
+  assert.equal(response.body.error.code, "RESPONSES_UNSUPPORTED");
+  assert.equal(response.body.error.details.protocol, "Responses");
+  assert.deepEqual(calls, ["https://relay.example/v1/responses"]);
+  assert.equal(fixture.credentialStore.values.size, 0);
+  assert.equal(fixture.api.repository.getAiServices().length, 0);
+});
+
+test("DeepSeek 连接也遵守 Responses 设置，不因参数错误回退协议", async (t) => {
   const calls = [];
   const fixture = await makeAiFixture(t, "deepseek-invalid-responses", {
     aiFetch: async (url, init) => {
@@ -346,12 +396,12 @@ test("Responses 返回接口不支持时仍可用 Chat Completions 验证 DeepSe
     }),
   });
 
-  assert.equal(result.response.status, 200);
-  assert.equal(result.body.verification.requestedModel, "deepseek-v4-pro");
+  assert.equal(result.response.status, 400);
+  assert.equal(result.body.error.details.protocol, "Responses");
   assert.deepEqual(calls, [
     "https://api.deepseek.com/responses",
-    "https://api.deepseek.com/chat/completions",
   ]);
+  assert.equal(fixture.credentialStore.values.size, 0);
 });
 
 test("Base URL 仅允许安全地址，修改发送目标必须重新输入密钥", async (t) => {
@@ -724,7 +774,7 @@ test("连接名称可独立保存，地址和密钥仍必须通过模型验证",
   );
 });
 
-test("AI 配置接口只允许当前本地网站来源", async (t) => {
+test("AI 配置接口允许本机动态端口并拒绝外部网站来源", async (t) => {
   const fixture = await makeAiFixture(t, "origin-restriction");
 
   const allowed = await jsonRequest(fixture.baseUrl, "/api/ai/settings", {
@@ -736,8 +786,17 @@ test("AI 配置接口只允许当前本地网站来源", async (t) => {
     "http://localhost:3000",
   );
 
+  const alternatePort = await jsonRequest(fixture.baseUrl, "/api/ai/settings", {
+    headers: { Origin: "http://localhost:3001" },
+  });
+  assert.equal(alternatePort.response.status, 200);
+  assert.equal(
+    alternatePort.response.headers.get("access-control-allow-origin"),
+    "http://localhost:3001",
+  );
+
   const rejected = await jsonRequest(fixture.baseUrl, "/api/ai/settings", {
-    headers: { Origin: "http://localhost:6553" },
+    headers: { Origin: "https://malicious.example" },
   });
   assert.equal(rejected.response.status, 403);
   assert.equal(rejected.body.error.code, "ORIGIN_NOT_ALLOWED");

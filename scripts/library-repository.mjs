@@ -1,24 +1,23 @@
 import { randomUUID } from "node:crypto";
-import {
-  access,
-  copyFile,
-  mkdir,
-  readdir,
-  rename,
-  rm,
-  stat,
-} from "node:fs/promises";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { backup as sqliteBackup, DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import {
   dedupePaperIdentifiers,
   identifiersFromReference,
   normalizePaperTitle,
 } from "./paper-identifiers.mjs";
+import {
+  REASONING_EFFORTS,
+  defaultReasoningEffort,
+} from "./ai/reasoning-effort.mjs";
 import { normalizePublicationSource } from "../lib/publication-source.mjs";
+import {
+  createSqliteBackup,
+  readSqliteBackupStatus,
+} from "./sqlite-backup.mjs";
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 
@@ -583,6 +582,16 @@ function validateAiModel(value, fieldName = "model") {
   return value.trim();
 }
 
+function validateAiReasoningEffort(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !REASONING_EFFORTS.includes(value)) {
+    throw new ValidationError("reasoningEffort 不是受支持的思考强度。", {
+      field: "reasoningEffort",
+    });
+  }
+  return value;
+}
+
 function validateCategoryName(value) {
   const name = validateString(value, "name");
   if (!name) {
@@ -875,18 +884,6 @@ function sqliteBoolean(value) {
   return value ? 1 : 0;
 }
 
-function isoFileTimestamp(date) {
-  return date.toISOString().replaceAll(":", "-").replaceAll(".", "-");
-}
-
-function backupStatusMessage(error) {
-  const detail =
-    error instanceof Error && error.message
-      ? error.message
-      : "未知文件系统错误";
-  return `本地修改已保存，但 iCloud 备份失败：${detail}`;
-}
-
 export class LibraryRepository {
   constructor({
     dbPath = DEFAULT_DATABASE_PATH,
@@ -913,22 +910,7 @@ export class LibraryRepository {
   }
 
   async initializeBackupStatus() {
-    try {
-      const latestPath = join(this.backupDir, "library-latest.sqlite3");
-      const latest = await stat(latestPath);
-      await this.#verifyDatabaseFile(latestPath);
-      this.backupStatus = {
-        ok: true,
-        lastBackupAt: latest.mtime.toISOString(),
-      };
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        this.backupStatus = {
-          ok: false,
-          message: `无法读取 iCloud 备份状态：${error.message}`,
-        };
-      }
-    }
+    this.backupStatus = await readSqliteBackupStatus(this.backupDir);
     if (this.seededOnOpen || this.schemaMigrated) {
       await this.#createBackup();
     }
@@ -1157,6 +1139,13 @@ export class LibraryRepository {
           REFERENCES ai_services(id) ON DELETE CASCADE,
         model TEXT NOT NULL,
         resolved_model TEXT NOT NULL DEFAULT '',
+        reasoning_effort TEXT
+          CHECK (
+            reasoning_effort IS NULL
+            OR reasoning_effort IN (
+              'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'
+            )
+          ),
         active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
         verified_at TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -1252,6 +1241,10 @@ export class LibraryRepository {
         .prepare("PRAGMA table_info(radar_settings)")
         .all()
         .map((column) => column.name);
+      const aiModelColumns = this.db
+        .prepare("PRAGMA table_info(ai_models)")
+        .all()
+        .map((column) => column.name);
       const alterations = [];
       if (!categoryColumns.includes("deleted_at")) {
         alterations.push(
@@ -1277,11 +1270,37 @@ export class LibraryRepository {
           "ALTER TABLE radar_settings ADD COLUMN prompt_template TEXT NOT NULL DEFAULT ''",
         );
       }
+      const addedReasoningEffort = !aiModelColumns.includes("reasoning_effort");
+      if (addedReasoningEffort) {
+        alterations.push(
+          `ALTER TABLE ai_models
+           ADD COLUMN reasoning_effort TEXT
+             CHECK (
+               reasoning_effort IS NULL
+               OR reasoning_effort IN (
+                 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'
+               )
+             )`,
+        );
+      }
       const removedKeywords = paperColumns.includes("keywords_json");
       if (removedKeywords) {
         alterations.push("ALTER TABLE papers DROP COLUMN keywords_json");
       }
       for (const statement of alterations) this.db.exec(statement);
+      if (addedReasoningEffort) {
+        this.db
+          .prepare(
+            `UPDATE ai_models
+             SET reasoning_effort = CASE
+               WHEN lower(model) LIKE 'deepseek-%' THEN 'max'
+               WHEN lower(model) LIKE 'gpt-5.5-pro%' THEN 'high'
+               WHEN lower(model) LIKE 'gpt-5%' THEN 'medium'
+               ELSE NULL
+             END`,
+          )
+          .run();
+      }
       this.db
         .prepare(
           `UPDATE radar_settings
@@ -1386,15 +1405,16 @@ export class LibraryRepository {
           this.db
             .prepare(
               `INSERT OR IGNORE INTO ai_models (
-                 id, service_id, model, resolved_model, active,
-                 verified_at, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                 id, service_id, model, resolved_model, reasoning_effort,
+                 active, verified_at, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(
               randomUUID(),
               connection.provider,
               connection.model,
               connection.resolvedModel,
+              defaultReasoningEffort(connection.model),
               connection.active,
               connection.verifiedAt,
               connection.createdAt,
@@ -2343,7 +2363,8 @@ export class LibraryRepository {
     const models = this.db
       .prepare(
         `SELECT id, service_id AS serviceId, model,
-                resolved_model AS resolvedModel, active,
+                resolved_model AS resolvedModel,
+                reasoning_effort AS reasoningEffort, active,
                 verified_at AS verifiedAt,
                 created_at AS createdAt, updated_at AS updatedAt
          FROM ai_models
@@ -2385,6 +2406,7 @@ export class LibraryRepository {
     baseUrl,
     model,
     resolvedModel,
+    reasoningEffort = defaultReasoningEffort(model),
     makeActive = false,
   }) {
     return this.#queueMutation(async () => {
@@ -2402,6 +2424,8 @@ export class LibraryRepository {
       const normalizedResolvedModel = resolvedModel
         ? validateAiModel(resolvedModel, "resolvedModel")
         : "";
+      const normalizedReasoningEffort =
+        validateAiReasoningEffort(reasoningEffort);
       const currentService = this.db
         .prepare(
           `SELECT id, base_url AS baseUrl, credential_key AS credentialKey,
@@ -2478,11 +2502,12 @@ export class LibraryRepository {
         this.db
           .prepare(
             `INSERT INTO ai_models (
-               id, service_id, model, resolved_model, active,
+               id, service_id, model, resolved_model, reasoning_effort, active,
                verified_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(service_id, model) DO UPDATE SET
                resolved_model = excluded.resolved_model,
+               reasoning_effort = excluded.reasoning_effort,
                active = excluded.active,
                verified_at = excluded.verified_at,
                updated_at = excluded.updated_at`,
@@ -2492,6 +2517,7 @@ export class LibraryRepository {
             normalizedConnectionId,
             normalizedModel,
             normalizedResolvedModel,
+            normalizedReasoningEffort,
             shouldActivate ? 1 : 0,
             now,
             currentModel?.createdAt ?? now,
@@ -2533,6 +2559,31 @@ export class LibraryRepository {
         this.db.exec("ROLLBACK");
         throw error;
       }
+      const backup = await this.#createBackup();
+      return { model: this.getAiModel(normalizedModelId), backup };
+    });
+  }
+
+  async updateAiModelReasoningEffort(modelId, reasoningEffort) {
+    return this.#queueMutation(async () => {
+      const normalizedModelId = validateAiEntityId(modelId, "modelId");
+      const normalizedReasoningEffort =
+        validateAiReasoningEffort(reasoningEffort);
+      const model = this.db
+        .prepare("SELECT id FROM ai_models WHERE id = ?")
+        .get(normalizedModelId);
+      if (!model) throw new NotFoundError("未找到该 AI 模型配置。");
+      this.db
+        .prepare(
+          `UPDATE ai_models
+           SET reasoning_effort = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          normalizedReasoningEffort,
+          this.now().toISOString(),
+          normalizedModelId,
+        );
       const backup = await this.#createBackup();
       return { model: this.getAiModel(normalizedModelId), backup };
     });
@@ -3312,100 +3363,154 @@ export class LibraryRepository {
     });
   }
 
+  #preparePaperInsert(input) {
+    const normalized = validatePaperInput(input, { creating: true });
+    const id = normalized.id ?? `local-${randomUUID()}`;
+    const categoryIds = normalized.categoryIds ?? [];
+    this.#assertCategoriesExist(categoryIds);
+    if (this.getPaper(id, { includeDeleted: true })) {
+      throw new ConflictError(`论文 ${id} 已存在。`);
+    }
+    const duplicates = this.findPaperDuplicates({
+      identifiers: normalized.identifiers ?? [],
+      title: normalized.title,
+    });
+    if (duplicates.length) {
+      throw new ConflictError("发现重复论文，未添加到知识库。", {
+        duplicates,
+      });
+    }
+
+    const now = this.now().toISOString();
+    const nextOrder = Number(
+      this.db
+        .prepare(
+          "SELECT COALESCE(MAX(sort_order), -1) + 1 AS value FROM papers",
+        )
+        .get().value,
+    );
+    return paperInsertValues(
+      {
+        ...input,
+        ...normalized,
+        id,
+        categoryIds,
+      },
+      now,
+      nextOrder,
+    );
+  }
+
+  #insertPaper(paper) {
+    this.db
+      .prepare(`
+          INSERT INTO papers (
+            id, zotero_key, title, zh_title, authors, institution, source,
+            publication_date, date_added, status, ai_summary, note,
+            note_count, favorite, watch_later, has_pdf, pdf_attachment_key, pdf_url,
+            original_url, code_provider, code_url, project_provider, project_url,
+            sort_order, created_at, updated_at
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          )
+        `)
+      .run(
+        paper.id,
+        paper.zoteroKey,
+        paper.title,
+        paper.zhTitle,
+        paper.authors,
+        paper.institution,
+        paper.source,
+        paper.date,
+        paper.dateAdded,
+        paper.status,
+        paper.aiSummary,
+        paper.note,
+        paper.noteCount,
+        sqliteBoolean(paper.favorite),
+        sqliteBoolean(paper.watchLater),
+        sqliteBoolean(paper.hasPdf),
+        paper.pdfAttachmentKey,
+        paper.pdfUrl,
+        paper.originalUrl,
+        paper.codeProvider,
+        paper.codeUrl,
+        paper.projectProvider,
+        paper.projectUrl,
+        paper.sortOrder,
+        paper.createdAt,
+        paper.updatedAt,
+      );
+    this.#replacePaperCategories(paper.id, paper.categoryIds);
+    this.#replacePaperIdentifiers(
+      paper.id,
+      paper.identifiers,
+      paper.createdAt,
+    );
+  }
+
   async createPaper(input) {
     return this.#queueMutation(async () => {
-      const normalized = validatePaperInput(input, { creating: true });
-      const id = normalized.id ?? `local-${randomUUID()}`;
-      const categoryIds = normalized.categoryIds ?? [];
-      this.#assertCategoriesExist(categoryIds);
-      if (this.getPaper(id, { includeDeleted: true })) {
-        throw new ConflictError(`论文 ${id} 已存在。`);
-      }
-      const duplicates = this.findPaperDuplicates({
-        identifiers: normalized.identifiers ?? [],
-        title: normalized.title,
-      });
-      if (duplicates.length) {
-        throw new ConflictError("发现重复论文，未添加到知识库。", {
-          duplicates,
-        });
-      }
-
-      const now = this.now().toISOString();
-      const nextOrder = Number(
-        this.db
-          .prepare(
-            "SELECT COALESCE(MAX(sort_order), -1) + 1 AS value FROM papers",
-          )
-          .get().value,
-      );
-      const paper = paperInsertValues(
-        {
-          ...input,
-          ...normalized,
-          id,
-          categoryIds,
-        },
-        now,
-        nextOrder,
-      );
-      const insert = this.db.prepare(`
-        INSERT INTO papers (
-          id, zotero_key, title, zh_title, authors, institution, source,
-          publication_date, date_added, status, ai_summary, note,
-          note_count, favorite, watch_later, has_pdf, pdf_attachment_key, pdf_url,
-          original_url, code_provider, code_url, project_provider, project_url,
-          sort_order, created_at, updated_at
-        ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
-      `);
-
+      const paper = this.#preparePaperInsert(input);
       this.db.exec("BEGIN IMMEDIATE");
       try {
-        insert.run(
-          paper.id,
-          paper.zoteroKey,
-          paper.title,
-          paper.zhTitle,
-          paper.authors,
-          paper.institution,
-          paper.source,
-          paper.date,
-          paper.dateAdded,
-          paper.status,
-          paper.aiSummary,
-          paper.note,
-          paper.noteCount,
-          sqliteBoolean(paper.favorite),
-          sqliteBoolean(paper.watchLater),
-          sqliteBoolean(paper.hasPdf),
-          paper.pdfAttachmentKey,
-          paper.pdfUrl,
-          paper.originalUrl,
-          paper.codeProvider,
-          paper.codeUrl,
-          paper.projectProvider,
-          paper.projectUrl,
-          paper.sortOrder,
-          paper.createdAt,
-          paper.updatedAt,
-        );
-        this.#replacePaperCategories(paper.id, paper.categoryIds);
-        this.#replacePaperIdentifiers(paper.id, paper.identifiers, paper.createdAt);
+        this.#insertPaper(paper);
         this.db.exec("COMMIT");
       } catch (error) {
         this.db.exec("ROLLBACK");
         if (/UNIQUE constraint failed/i.test(error?.message ?? "")) {
-          throw new ConflictError(`论文 ${id} 已存在。`);
+          throw new ConflictError(`论文 ${paper.id} 已存在。`);
         }
         throw error;
       }
 
-      const created = this.getPaper(id);
+      const created = this.getPaper(paper.id);
       const backup = await this.#createBackup();
       return { paper: created, backup };
+    });
+  }
+
+  async createPaperFromRadarItem(radarItemId, input) {
+    return this.#queueMutation(async () => {
+      validateAiEntityId(radarItemId, "id");
+      const item = this.getRadarItem(radarItemId);
+      if (!item) throw new NotFoundError("未找到文献雷达条目。");
+      if (item.status !== "pending") {
+        throw new ConflictError("只有待审核论文可以加入知识库。");
+      }
+
+      const paper = this.#preparePaperInsert(input);
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.#insertPaper(paper);
+        const updateResult = this.db
+          .prepare(
+            `UPDATE radar_items
+             SET status = 'added', added_paper_id = ?, updated_at = ?
+             WHERE id = ? AND status = 'pending'`,
+          )
+          .run(paper.id, this.now().toISOString(), radarItemId);
+        if (Number(updateResult.changes) !== 1) {
+          throw new ConflictError("只有待审核论文可以加入知识库。");
+        }
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        if (/UNIQUE constraint failed/i.test(error?.message ?? "")) {
+          throw new ConflictError(`论文 ${paper.id} 已存在。`);
+        }
+        throw error;
+      }
+
+      const created = this.getPaper(paper.id);
+      const backup = await this.#createBackup();
+      return {
+        paper: created,
+        item: this.getRadarItem(radarItemId),
+        backup,
+      };
     });
   }
 
@@ -3951,112 +4056,13 @@ export class LibraryRepository {
     return rows.map((row) => row.integrity_check);
   }
 
-  async #uniqueVersionPath(date) {
-    const base = `library-${isoFileTimestamp(date)}`;
-    for (let suffix = 0; suffix < 10_000; suffix += 1) {
-      const candidate = join(
-        this.backupDir,
-        `${base}${suffix ? `-${suffix}` : ""}.sqlite3`,
-      );
-      try {
-        await access(candidate);
-      } catch (error) {
-        if (error?.code === "ENOENT") return candidate;
-        throw error;
-      }
-    }
-    throw new Error("无法为备份生成唯一文件名。");
-  }
-
-  async #verifyDatabaseFile(path) {
-    const database = new DatabaseSync(path, { readOnly: true });
-    try {
-      const results = database.prepare("PRAGMA integrity_check").all();
-      if (
-        results.length !== 1 ||
-        String(results[0].integrity_check).toLocaleLowerCase("en") !== "ok"
-      ) {
-        throw new Error(
-          `SQLite 完整性检查失败：${results
-            .map((result) => result.integrity_check)
-            .join("；")}`,
-        );
-      }
-    } finally {
-      database.close();
-    }
-  }
-
-  async #retainRecentBackups(limit = 30) {
-    const entries = await readdir(this.backupDir, { withFileTypes: true });
-    const versions = entries
-      .filter(
-        (entry) =>
-          entry.isFile() &&
-          /^library-\d{4}-\d{2}-\d{2}T.*\.sqlite3$/.test(entry.name),
-      )
-      .map((entry) => entry.name)
-      .sort()
-      .reverse();
-    await Promise.all(
-      versions
-        .slice(limit)
-        .map((name) => rm(join(this.backupDir, name), { force: true })),
-    );
-  }
-
   async #createBackup() {
-    const date = this.now();
-    const token = `${process.pid}-${randomUUID()}`;
-    const sqliteTemporaryPath = join(
-      this.backupDir,
-      `.library-${token}.tmp.sqlite3`,
-    );
-    const latestTemporaryPath = join(
-      this.backupDir,
-      `.library-latest-${token}.tmp.sqlite3`,
-    );
-
-    try {
-      await mkdir(this.backupDir, { recursive: true, mode: 0o700 });
-      const versionPath = await this.#uniqueVersionPath(date);
-      await sqliteBackup(this.db, sqliteTemporaryPath);
-      await this.#verifyDatabaseFile(sqliteTemporaryPath);
-      await rename(sqliteTemporaryPath, versionPath);
-      await copyFile(versionPath, latestTemporaryPath);
-      await this.#verifyDatabaseFile(latestTemporaryPath);
-      await rename(
-        latestTemporaryPath,
-        join(this.backupDir, "library-latest.sqlite3"),
-      );
-
-      let cleanupMessage;
-      try {
-        await this.#retainRecentBackups(30);
-      } catch (error) {
-        cleanupMessage = `备份已完成，但旧版本清理失败：${error.message}`;
-      }
-
-      this.backupStatus = {
-        ok: true,
-        lastBackupAt: date.toISOString(),
-        ...(cleanupMessage ? { message: cleanupMessage } : {}),
-      };
-    } catch (error) {
-      this.backupStatus = {
-        ok: false,
-        ...(this.backupStatus.lastBackupAt
-          ? { lastBackupAt: this.backupStatus.lastBackupAt }
-          : {}),
-        message: backupStatusMessage(error),
-      };
-    } finally {
-      await Promise.all([
-        rm(sqliteTemporaryPath, { force: true }).catch(() => undefined),
-        rm(latestTemporaryPath, { force: true }).catch(() => undefined),
-      ]);
-    }
-
+    this.backupStatus = await createSqliteBackup({
+      db: this.db,
+      backupDir: this.backupDir,
+      date: this.now(),
+      previousStatus: this.backupStatus,
+    });
     return { ...this.backupStatus };
   }
 

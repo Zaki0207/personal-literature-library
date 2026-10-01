@@ -4,38 +4,50 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createLibraryRepository } from "../scripts/library-repository.mjs";
+import { createLibraryApi } from "../scripts/library-api.mjs";
 import { createPaperIntakeService } from "../scripts/paper-intake.mjs";
 
-async function makeFixture(t, name, { aiService, fetchImpl } = {}) {
-  const directory = await mkdtemp(join(tmpdir(), `paper-intake-${name}-`));
+const PAPER_URL = "https://papers.example/smoke";
+const SOURCE_FIELDS = ["title", "authors", "institution", "source", "date", "aiSummary", "originalUrl", "pdfUrl", "codeUrl", "projectUrl", "identifiers"];
+
+function researchResult(paperPatch = {}) {
+  return {
+    status: "ready",
+    matchReason: "标题、作者和项目主页一致。",
+    warnings: [],
+    paper: {
+      title: "A Test Paper",
+      zhTitle: "烟雾体重建",
+      authors: "Alice Researcher; Bob Researcher",
+      institution: "Tsinghua University, Department of Computer Science and Technology",
+      source: "2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)",
+      date: "2025-06-12",
+      aiSummary: "本文研究烟雾体的三维重建，结合物理约束恢复体积结构。",
+      categoryIds: ["SMOKE001", "UNKNOWN", "SMOKE001"],
+      originalUrl: PAPER_URL,
+      pdfUrl: "https://papers.example/smoke.pdf",
+      codeUrl: "https://github.com/example/smoke",
+      projectUrl: "https://project.example/smoke",
+      publicationStatus: "published",
+      identifiers: [{ kind: "doi", value: "10.1145/1234.5678" }, { kind: "arxiv", value: "2501.12345v2" }],
+      ...paperPatch,
+    },
+    sources: [{ title: "论文原文", url: PAPER_URL, fields: [...SOURCE_FIELDS] }],
+  };
+}
+
+async function makeFixture(t, { result = researchResult(), generateText, webSearchUsed = true, webSources } = {}) {
+  const directory = await mkdtemp(join(tmpdir(), "paper-research-"));
   const seedPath = join(directory, "seed.json");
-  await writeFile(
-    seedPath,
-    JSON.stringify({
-      categoryRecords: [
-        {
-          id: "ROOT0001",
-          name: "计算机视觉",
-          parentId: null,
-          sourceKind: "test",
-          sortOrder: 0,
-          sidebarVisible: true,
-        },
-        {
-          id: "SMOKE001",
-          name: "烟雾重建",
-          parentId: "ROOT0001",
-          sourceKind: "test",
-          sortOrder: 1,
-          sidebarVisible: true,
-        },
-      ],
-      papers: [],
-    }),
-    "utf8",
-  );
+  await writeFile(seedPath, JSON.stringify({
+    categoryRecords: [
+      { id: "ROOT0001", name: "计算机视觉", parentId: null, sortOrder: 0 },
+      { id: "SMOKE001", name: "烟雾重建", parentId: "ROOT0001", sortOrder: 1 },
+    ],
+    papers: [],
+  }));
   const repository = await createLibraryRepository({
-    dbPath: join(directory, "database", "library.sqlite3"),
+    dbPath: join(directory, "library.sqlite3"),
     backupDir: join(directory, "backups"),
     seedPath,
   });
@@ -43,736 +55,333 @@ async function makeFixture(t, name, { aiService, fetchImpl } = {}) {
     await repository.close();
     await rm(directory, { recursive: true, force: true });
   });
-  const resolvedAiService =
-    aiService ??
-    {
-      async generateText() {
-        return {
-          resolvedModel: "test-model",
-          text: JSON.stringify({
-            zhTitle: "用于烟雾重建的测试论文",
-            institution: "Example University",
-            source: "CVPR 2025",
-            aiSummary: "本文研究烟雾场景的三维重建，并提出一种基于测试数据的稳定方法。",
-            categoryIds: ["SMOKE001", "NOT_ALLOWED"],
-          }),
-        };
-      },
-    };
-  return {
-    repository,
-    service: createPaperIntakeService({
-      repository,
-      aiService: resolvedAiService,
-      fetchImpl,
-    }),
+  const requests = [];
+  const aiService = {
+    async generateText(request) {
+      requests.push(request);
+      if (generateText) return generateText(request);
+      return {
+        text: typeof result === "string" ? result : JSON.stringify(result),
+        resolvedModel: "research-model",
+        webSearchUsed,
+        webSources: webSources ?? [{ url: PAPER_URL, title: "联网工具返回的论文标题" }],
+      };
+    },
   };
+  return { repository, requests, aiService, service: createPaperIntakeService({ repository, aiService }) };
 }
 
-function crossrefResponse({
-  doi = "10.1145/1234.5678",
-  title = "A Test Paper",
-  institution = "Example University",
-  source = "CVPR",
-  abstract = "<jats:p>We reconstruct volumetric smoke.</jats:p>",
-  published = [2025, 6, 12],
-} = {}) {
-  return new Response(
-    JSON.stringify({
-      status: "ok",
-      message: {
-        DOI: doi,
-        title: [title],
-        author: [
-          {
-            given: "Alice",
-            family: "Researcher",
-            affiliation: [{ name: institution }],
-          },
-        ],
-        "container-title": [source],
-        published: { "date-parts": [published] },
-        abstract,
-        URL: `https://doi.org/${doi}`,
-        link: [
-          {
-            "content-type": "application/pdf",
-            URL: "https://publisher.example/paper.pdf",
-          },
-        ],
-      },
-    }),
-    { status: 200, headers: { "Content-Type": "application/json" } },
-  );
-}
-
-function emptyCrossrefSearchResponse() {
-  return new Response(JSON.stringify({ message: { items: [] } }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-test("DOI 先获取权威元数据，再让 AI 只补全知识库需要的字段", async (t) => {
-  const prompts = [];
-  const aiTimeouts = [];
-  const fixture = await makeFixture(t, "doi", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (/api\.crossref\.org\/works\/10\.1145%2F1234\.5678/u.test(href)) {
-        return crossrefResponse({
-          institution:
-            "Tsinghua University, Beijing National Research Center for Information Science and Technology (BNRist), Department of Computer Science and Technology; Hong Kong University of Science and Technology",
-        });
-      }
-      if (href === "https://doi.org/10.1145/1234.5678") {
-        return new Response(
-          '<a href="https://github.com/example/smoke-reconstruction">Code</a><a href="https://project.example/smoke">Project Page</a>',
-          { status: 200, headers: { "Content-Type": "text/html" } },
-        );
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-    aiService: {
-      async generateText({ input, timeoutMs }) {
-        prompts.push(input);
-        aiTimeouts.push(timeoutMs);
-        return {
-          resolvedModel: "deepseek-v4-pro",
-          text: '{"zhTitle":"烟雾体重建","institution":"Tsinghua University, Beijing National Research Center for Information Science and Technology (BNRist), Department of Computer Science and Technology","source":"2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)","aiSummary":"本文研究烟雾体的三维重建方法，并依据论文摘要整理其问题、方法与贡献。","categoryIds":["SMOKE001","UNKNOWN"]}',
-        };
-      },
-    },
-  });
-
-  const result = await fixture.service.analyze({ reference: "10.1145/1234.5678" });
-  assert.equal(result.status, "ready");
-  assert.equal(result.draft.title, "A Test Paper");
-  assert.equal(result.draft.authors, "Alice Researcher");
-  assert.equal(result.draft.institution, "Tsinghua University");
-  assert.match(result.metadata.institution, /Beijing National Research Center/u);
-  assert.equal(result.draft.source, "CVPR 2025");
-  assert.equal(result.draft.date, "2025-06-12");
-  assert.equal(result.draft.zhTitle, "烟雾体重建");
-  assert.deepEqual(result.draft.categoryIds, ["SMOKE001"]);
-  assert.deepEqual(
-    result.draft.identifiers.filter((item) => item.kind === "doi"),
-    [{ kind: "doi", value: "10.1145/1234.5678" }],
-  );
-  assert.equal(
-    result.draft.identifiers.some((item) => item.kind === "arxiv"),
-    false,
-    "DOI 尾部的年份与编号不能被误判为 arXiv",
-  );
-  assert.equal(result.ai.model, "deepseek-v4-pro");
-  assert.equal(result.ai.institution, "Tsinghua University");
-  assert.equal(result.ai.source, "CVPR 2025");
-  assert.equal(result.draft.codeUrl, "https://github.com/example/smoke-reconstruction");
-  assert.equal(result.draft.projectUrl, "https://project.example/smoke");
-  assert.equal(result.metadata.codeEvidence, "论文页面直接链接");
-  assert.equal(prompts.length, 1);
-  assert.deepEqual(aiTimeouts, [3 * 60_000]);
-  assert.match(prompts[0], /只返回一个 JSON 对象/u);
-  assert.match(
-    prompts[0],
-    /"zhTitle":"","institution":"","source":"","aiSummary":"","categoryIds":\[\]/u,
-  );
-  assert.match(prompts[0], /只保留第一作者的首个顶层机构/u);
-  assert.match(prompts[0], /CVPR 2025 \(Oral\)/u);
-  assert.match(prompts[0], /"publicationStatus":"published"/u);
-  assert.doesNotMatch(prompts[0], /keywords|关键词/iu);
-  assert.doesNotMatch(prompts[0], /zotero/iu);
+test("名称、项目主页、DOI、arXiv、PDF 和自然语言线索均由 AI 联网完成，分析不入库", async (t) => {
+  const fixture = await makeFixture(t);
+  for (const reference of [
+    "A Test Paper",
+    "https://project.example/smoke",
+    "https://github.com/example/smoke",
+    "10.1145/1234.5678",
+    "https://arxiv.org/abs/2501.12345v4",
+    "https://papers.example/smoke.pdf",
+    "Alice 那篇利用物理约束重建烟雾的论文，发表于 2025 年",
+    "这是项目的介绍：请查这篇论文 https://project.example/smoke",
+    "  项目线索\nhttps://github.com/example/smoke\n保留完整输入  ",
+  ]) {
+    const result = await fixture.service.analyze({ reference });
+    assert.equal(result.status, "ready", reference);
+    assert.equal(result.draft.title, "A Test Paper");
+    assert.equal(result.draft.institution, researchResult().paper.institution);
+    assert.equal(result.draft.source, researchResult().paper.source);
+    assert.equal(result.draft.zhTitle, "烟雾体重建");
+    assert.deepEqual(result.draft.categoryIds, ["SMOKE001"]);
+    assert.equal(result.draft.hasPdf, true);
+    assert.equal(result.draft.codeProvider, "GitHub");
+    assert.equal(result.draft.projectUrl, "https://project.example/smoke");
+    assert.equal(result.metadata.sources[0].title, "论文原文");
+    assert.equal(result.ai.model, "research-model");
+    assert.equal(fixture.requests.at(-1).webSearch, true);
+    assert.ok(fixture.requests.at(-1).input.includes(JSON.stringify(reference)));
+    assert.equal(result.reference, reference);
+  }
+  assert.equal(fixture.repository.getLibrary().papers.length, 0);
+  const prompt = fixture.requests[0].input;
+  assert.match(prompt, /不能新建分类/u);
+  assert.match(prompt, /计算机视觉 › 烟雾重建/u);
 });
 
-test("IEEE DOI 优先使用 OpenAlex 发现的开放获取 PDF", async (t) => {
-  const doi = "10.1109/tvcg.2024.3358636";
-  const openAccessPdf =
-    "https://durham-repository.worktribe.com/file/2407995/1/Accepted%20Journal%20Article";
-  const fixture = await makeFixture(t, "ieee-open-access-pdf", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (/api\.crossref\.org\/works\/10\.1109%2Ftvcg\.2024\.3358636/iu.test(href)) {
-        return new Response(
-          JSON.stringify({
-            message: {
-              DOI: doi,
-              title: [
-                "Laplacian Projection Based Global Physical Prior Smoke Reconstruction",
-              ],
-              author: [{ given: "Shibang", family: "Xiao" }],
-              "container-title": [
-                "IEEE Transactions on Visualization and Computer Graphics",
-              ],
-              published: { "date-parts": [[2024, 12]] },
-              URL: `https://doi.org/${doi}`,
-              resource: {
-                primary: {
-                  URL: "https://ieeexplore.ieee.org/document/10414126/",
-                },
-              },
-              link: [
-                {
-                  URL: "http://xplorestaging.ieee.org/ielx7/2945/10737249/10414126.pdf?arnumber=10414126",
-                  "content-type": "unspecified",
-                  "intended-application": "similarity-checking",
-                },
-              ],
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      if (/api\.openalex\.org\/works\/https%3A%2F%2Fdoi\.org%2F10\.1109%2Ftvcg\.2024\.3358636/iu.test(href)) {
-        return new Response(
-          JSON.stringify({
-            doi: `https://doi.org/${doi}`,
-            best_oa_location: {
-              is_oa: true,
-              pdf_url: openAccessPdf,
-            },
-            locations: [],
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      if (href === `https://doi.org/${doi}`) {
-        return new Response("<html><body>IEEE paper</body></html>", {
-          status: 200,
-        });
-      }
-      if (/api\.github\.com\/search\/repositories/iu.test(href)) {
-        return new Response(JSON.stringify({ items: [] }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
-
-  const result = await fixture.service.analyze({ reference: doi });
-
-  assert.equal(result.status, "ready");
-  assert.equal(result.draft.pdfUrl, openAccessPdf);
-  assert.equal(result.draft.hasPdf, true);
-  assert.equal(
-    result.draft.originalUrl,
-    "https://doi.org/10.1109/tvcg.2024.3358636",
-  );
-});
-
-test("IEEE DOI 无开放副本时从 Crossref 文档号推导官方 PDF 页", async (t) => {
-  const doi = "10.1109/tvcg.2024.3358636";
-  const fixture = await makeFixture(t, "ieee-publisher-pdf", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (/api\.crossref\.org\/works\/10\.1109%2Ftvcg\.2024\.3358636/iu.test(href)) {
-        return new Response(
-          JSON.stringify({
-            message: {
-              DOI: doi,
-              title: [
-                "Laplacian Projection Based Global Physical Prior Smoke Reconstruction",
-              ],
-              author: [{ given: "Shibang", family: "Xiao" }],
-              "container-title": [
-                "IEEE Transactions on Visualization and Computer Graphics",
-              ],
-              published: { "date-parts": [[2024, 12]] },
-              resource: {
-                primary: {
-                  URL: "https://ieeexplore.ieee.org/document/10414126/",
-                },
-              },
-              link: [
-                {
-                  URL: "http://xplorestaging.ieee.org/ielx7/2945/10737249/10414126.pdf?arnumber=10414126",
-                  "content-type": "unspecified",
-                  "intended-application": "similarity-checking",
-                },
-              ],
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      if (/api\.openalex\.org\/works\//iu.test(href)) {
-        return new Response(
-          JSON.stringify({
-            doi: `https://doi.org/${doi}`,
-            best_oa_location: null,
-            locations: [],
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      if (href === `https://doi.org/${doi}`) {
-        return new Response("<html><body>IEEE paper</body></html>", {
-          status: 200,
-        });
-      }
-      if (/api\.github\.com\/search\/repositories/iu.test(href)) {
-        return new Response(JSON.stringify({ items: [] }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
-
-  const result = await fixture.service.analyze({ reference: doi });
-
-  assert.equal(
-    result.draft.pdfUrl,
-    "https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10414126",
-  );
-  assert.equal(result.draft.hasPdf, true);
-});
-
-test("arXiv 链接会规范化版本号，并按标题与作者匹配正式发表版本", async (t) => {
-  const fixture = await makeFixture(t, "arxiv", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (/export\.arxiv\.org\/api\/query\?id_list=2401\.01234/u.test(href)) {
-        return new Response(
-          `<?xml version="1.0"?><feed xmlns:arxiv="http://arxiv.org/schemas/atom"><entry>
-            <id>https://arxiv.org/abs/2401.01234v2</id>
-            <published>2024-01-03T00:00:00Z</published>
-            <title>Learning Smoke Reconstruction</title>
-            <summary>We introduce a smoke reconstruction method.</summary>
-            <author><name>Alice Example</name></author>
-            <author><name>Bob Example</name></author>
-            <arxiv:primary_category term="cs.CV" />
-            <link title="pdf" href="https://arxiv.org/pdf/2401.01234v2" />
-          </entry></feed>`,
-          { status: 200, headers: { "Content-Type": "application/atom+xml" } },
-        );
-      }
-      if (/api\.crossref\.org\/works\?/u.test(href)) {
-        return new Response(
-          JSON.stringify({
-            message: {
-              items: [
-                {
-                  DOI: "10.1109/CVPR.2025.01234",
-                  title: ["Learning Smoke Reconstruction"],
-                  author: [
-                    { given: "Alice", family: "Example" },
-                    { given: "Bob", family: "Example" },
-                  ],
-                  "container-title": ["CVPR"],
-                  published: { "date-parts": [[2025, 6]] },
-                  abstract: "The published smoke reconstruction paper.",
-                },
-              ],
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      if (href === "https://arxiv.org/abs/2401.01234") {
-        return new Response("<html></html>", { status: 200 });
-      }
-      if (href === "https://doi.org/10.1109/cvpr.2025.01234") {
-        return new Response(
-          '<a href="https://github.com/example/published-smoke">Official code</a>',
-          { status: 200 },
-        );
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
-
-  const result = await fixture.service.analyze({
-    reference: "https://arxiv.org/abs/2401.01234v2",
-  });
-  assert.equal(result.status, "ready");
-  assert.equal(result.draft.title, "Learning Smoke Reconstruction");
-  assert.equal(result.draft.authors, "Alice Example; Bob Example");
-  assert.equal(result.draft.date, "2025-06");
-  assert.equal(result.draft.source, "CVPR 2025");
-  assert.equal(result.draft.originalUrl, "https://doi.org/10.1109/cvpr.2025.01234");
-  assert.equal(result.draft.pdfUrl, "https://arxiv.org/pdf/2401.01234v2");
-  assert.equal(result.metadata.publicationStatus, "published");
-  assert.equal(result.metadata.publicationMatch.method, "title-author");
-  assert.equal(result.metadata.preprint.arxivId, "2401.01234");
-  assert.equal(result.draft.codeUrl, "https://github.com/example/published-smoke");
-  assert.ok(
-    result.draft.identifiers.some(
-      (identifier) =>
-        identifier.kind === "arxiv" && identifier.value === "2401.01234",
-    ),
-  );
-  assert.ok(
-    result.draft.identifiers.some(
-      (identifier) =>
-        identifier.kind === "doi" &&
-        identifier.value === "10.1109/cvpr.2025.01234",
-    ),
-  );
-});
-
-test("论文页面无资源链接时，会用论文标识验证 GitHub 仓库和项目主页", async (t) => {
-  const fixture = await makeFixture(t, "github-resource", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (/export\.arxiv\.org\/api\/query\?id_list=2501\.09999/u.test(href)) {
-        return new Response(
-          `<?xml version="1.0"?><feed><entry>
-            <id>https://arxiv.org/abs/2501.09999</id>
-            <published>2025-01-20T00:00:00Z</published>
-            <title>Verified Neural Smoke</title>
-            <summary>Smoke reconstruction.</summary>
-            <author><name>Alice Example</name></author>
-            <link title="pdf" href="https://arxiv.org/pdf/2501.09999" />
-          </entry></feed>`,
-          { status: 200 },
-        );
-      }
-      if (/api\.crossref\.org\/works\?/u.test(href)) {
-        return emptyCrossrefSearchResponse();
-      }
-      if (href === "https://arxiv.org/abs/2501.09999") {
-        return new Response("<html><body>No resource link</body></html>", {
-          status: 200,
-        });
-      }
-      if (/api\.github\.com\/search\/repositories/u.test(href)) {
-        return new Response(
-          JSON.stringify({
-            items: [
-              {
-                full_name: "research/verified-neural-smoke",
-                name: "verified-neural-smoke",
-                html_url: "https://github.com/research/verified-neural-smoke",
-                homepage: "https://research.example/verified-smoke",
-                description: "Official implementation",
-                archived: false,
-                fork: false,
-              },
-            ],
-          }),
-          { status: 200 },
-        );
-      }
-      if (href === "https://api.github.com/repos/research/verified-neural-smoke/readme") {
-        return new Response("Official code for arXiv:2501.09999", { status: 200 });
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
-
-  const result = await fixture.service.analyze({ reference: "arXiv:2501.09999" });
-  assert.equal(result.status, "ready");
-  assert.equal(
-    result.draft.codeUrl,
-    "https://github.com/research/verified-neural-smoke",
-  );
-  assert.equal(result.draft.projectUrl, "https://research.example/verified-smoke");
-  assert.match(result.metadata.codeEvidence, /README 引用了论文标识/u);
-});
-
-test("已存在的 DOI 在访问外部元数据和 AI 前就停止", async (t) => {
-  let metadataCalls = 0;
-  let aiCalls = 0;
-  const fixture = await makeFixture(t, "duplicate", {
-    fetchImpl: async () => {
-      metadataCalls += 1;
-      return crossrefResponse();
-    },
-    aiService: {
-      async generateText() {
-        aiCalls += 1;
-        throw new Error("不应调用 AI");
-      },
-    },
-  });
-  await fixture.repository.createPaper({
-    title: "Existing Paper",
-    originalUrl: "https://doi.org/10.1145/1234.5678",
-    identifiers: [{ kind: "doi", value: "10.1145/1234.5678" }],
-  });
-
-  const result = await fixture.service.analyze({
-    reference: "https://doi.org/10.1145/1234.5678",
-  });
-  assert.equal(result.status, "duplicate");
-  assert.equal(result.duplicates.length, 1);
-  assert.equal(result.duplicates[0].paper.title, "Existing Paper");
-  assert.equal(metadataCalls, 0);
-  assert.equal(aiCalls, 0);
-});
-
-test("已删除的论文不参与查重，可以重新分析并添加", async (t) => {
-  const fixture = await makeFixture(t, "deleted-duplicate", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (/api\.crossref\.org\/works\/10\.1145%2F1234\.5678/u.test(href)) {
-        return crossrefResponse();
-      }
-      if (href === "https://doi.org/10.1145/1234.5678") {
-        return new Response(
-          '<a href="https://github.com/example/smoke-reconstruction">Code</a>',
-          { status: 200, headers: { "Content-Type": "text/html" } },
-        );
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
-  const original = await fixture.repository.createPaper({
+test("已有明确标识或标题也先交给 AI，识别结果返回后查重", async (t) => {
+  const fixture = await makeFixture(t);
+  const created = await fixture.repository.createPaper({
     title: "A Test Paper",
     identifiers: [{ kind: "doi", value: "10.1145/1234.5678" }],
   });
-  await fixture.repository.deletePaper(original.paper.id);
-
-  const analyzed = await fixture.service.analyze({
-    reference: "https://doi.org/10.1145/1234.5678",
-  });
-  assert.equal(analyzed.status, "ready");
-
-  const replacement = await fixture.repository.createPaper(analyzed.draft);
-  assert.equal(fixture.repository.getLibrary().papers.length, 1);
-  assert.equal(replacement.paper.title, "A Test Paper");
-
-  await assert.rejects(
-    fixture.repository.restorePaper(original.paper.id),
-    (error) =>
-      error?.code === "CONFLICT" &&
-      error.details?.duplicates?.[0]?.paper.id === replacement.paper.id,
-  );
+  for (const reference of ["https://doi.org/10.1145/1234.5678", "a TEST paper!"]) {
+    const result = await fixture.service.analyze({ reference });
+    assert.equal(result.status, "duplicate");
+    assert.equal(result.duplicates[0].paper.id, created.paper.id);
+  }
+  assert.equal(fixture.requests.length, 2);
 });
 
-test("网页元数据解析后会再次按规范化标题查重", async (t) => {
-  let aiCalls = 0;
-  const fixture = await makeFixture(t, "title-duplicate", {
-    fetchImpl: async () =>
-      new Response(
-        '<html><head><meta name="citation_title" content="Exact Paper: A Study"><meta name="citation_author" content="Bob"><meta name="citation_conference_title" content="CVPR"></head></html>',
-        { status: 200, headers: { "Content-Type": "text/html" } },
-      ),
-    aiService: {
-      async generateText() {
-        aiCalls += 1;
-        throw new Error("不应调用 AI");
-      },
-    },
-  });
-  await fixture.repository.createPaper({ title: "Exact Paper — A Study" });
-
-  const result = await fixture.service.analyze({
-    reference: "https://papers.example/new-url",
-  });
+test("从描述识别出已有论文后再次查重", async (t) => {
+  const fixture = await makeFixture(t);
+  await fixture.repository.createPaper({ title: "a test paper!" });
+  const result = await fixture.service.analyze({ reference: "Alice 的烟雾重建论文" });
   assert.equal(result.status, "duplicate");
-  assert.equal(result.duplicates[0].reasons[0].type, "title");
-  assert.equal(aiCalls, 0);
+  assert.equal(fixture.requests.length, 1);
 });
 
-test("PDF 直链不会按网页大小拒绝，并会从对应论文页补全元数据", async (t) => {
-  const pdfUrl = "https://pranav-jain.github.io/projects/nmcfs/nmcfs.pdf";
-  const projectUrl = "https://pranav-jain.github.io/projects/nmcfs/";
-  const prompts = [];
-  const fixture = await makeFixture(t, "direct-pdf", {
-    aiService: {
-      async generateText({ input }) {
-        prompts.push(input);
-        return {
-          resolvedModel: "test-model",
-          text: JSON.stringify({
-            zhTitle: "神经蒙特卡罗流体模拟",
-            institution: "University of Southern California",
-            source: "SIGGRAPH 2024",
-            aiSummary: "本文提出结合神经场与蒙特卡罗压力求解的无网格流体模拟方法。",
-            categoryIds: ["SMOKE001"],
-          }),
-        };
-      },
-    },
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (href === pdfUrl) {
-        return new Response("%PDF", {
-          status: 200,
-          headers: {
-            "Content-Type": "application/pdf",
-            "Content-Length": "38123376",
-          },
-        });
-      }
-      if (href === projectUrl || href === projectUrl.slice(0, -1)) {
-        return new Response(
-          `<html><head><title>Neural Monte Carlo Fluid Simulation</title></head>
-           <body><p class="venue">SIGGRAPH 2024</p>
-           <section class="abstract"><h2>Abstract</h2><p>A mesh-free neural fluid method with a Monte Carlo pressure solver.</p></section>
-           <a href="https://dl.acm.org/doi/10.1145/3641519.3657438">ACM Library</a>
-           <a href="./nmcfs.pdf">Paper</a>
-           <a href="https://github.com/Pranav-Jain/Neural-Monte-Carlo-Fluid-Simulation">Code</a></body></html>`,
-          { status: 200, headers: { "Content-Type": "text/html" } },
-        );
-      }
-      if (
-        /api\.crossref\.org\/works\/10\.1145%2F3641519\.3657438/u.test(
-          href,
-        )
-      ) {
-        return crossrefResponse({
-          doi: "10.1145/3641519.3657438",
-          title: "Neural Monte Carlo Fluid Simulation",
-          institution: "University of Southern California",
-          source:
-            "Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers",
-          abstract: "",
-          published: [2024, 7, 13],
-        });
-      }
-      if (href === "https://doi.org/10.1145/3641519.3657438") {
-        return new Response("<html></html>", {
-          status: 200,
-          headers: { "Content-Type": "text/html" },
-        });
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
+test("已删除论文不参与查重，可以重新分析", async (t) => {
+  const fixture = await makeFixture(t);
+  const created = await fixture.repository.createPaper({ title: "A Test Paper" });
+  await fixture.repository.deletePaper(created.paper.id);
+  assert.equal((await fixture.service.analyze({ reference: "A Test Paper" })).status, "ready");
+});
 
-  const result = await fixture.service.analyze({ reference: pdfUrl });
+test("真正模糊或冲突的线索要求补充，不生成可保存草稿或反复检索", async (t) => {
+  for (const clarificationReason of ["ambiguous", "conflicting", "insufficient_input"]) {
+    const fixture = await makeFixture(t, { result: {
+      status: "needs_clarification", clarificationReason, message: "请补充作者或年份。", sources: [],
+    } });
+    const result = await fixture.service.analyze({ reference: "NeRF 的改进方法" });
+    assert.equal(result.status, "needs_clarification");
+    assert.equal(result.reference, "NeRF 的改进方法");
+    assert.equal(result.message, "请补充作者或年份。");
+    assert.equal(result.draft, undefined);
+    assert.equal(fixture.requests.length, 1);
+  }
+});
 
+test("直接展示 AI 返回的未找到、未完成和需补充状态，不自动补查或改写判断", async (t) => {
+  for (const status of ["not_found", "research_incomplete", "needs_clarification"]) {
+    const fixture = await makeFixture(t, { result: {
+      status, clarificationReason: "insufficient_input", message: "请提供论文标题。", sources: [],
+    } });
+    const result = await fixture.service.analyze({ reference: "https://yvette256.github.io/thermalnerf/" });
+    assert.equal(result.status, status);
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(result.reference, "https://yvette256.github.io/thermalnerf/");
+    assert.equal(result.draft, undefined);
+    assert.equal(result.message, "请提供论文标题。");
+    assert.equal(fixture.repository.getLibrary().papers.length, 0);
+  }
+});
+
+test("直接采用 AI 列出的来源，不要求来源与工具记录逐条匹配", async (t) => {
+  const fixture = await makeFixture(t, { webSources: [{ url: "https://unrelated.example/", title: "无关页面" }] });
+  const result = await fixture.service.analyze({ reference: "烟雾论文" });
   assert.equal(result.status, "ready");
-  assert.equal(result.draft.title, "Neural Monte Carlo Fluid Simulation");
-  assert.equal(result.draft.source, "SIGGRAPH 2024");
-  assert.equal(result.draft.pdfUrl, pdfUrl);
-  assert.equal(result.draft.hasPdf, true);
-  assert.equal(result.draft.originalUrl, "https://doi.org/10.1145/3641519.3657438");
-  assert.equal(
-    result.draft.codeUrl,
-    "https://github.com/Pranav-Jain/Neural-Monte-Carlo-Fluid-Simulation",
-  );
-  assert.equal(result.draft.projectUrl, projectUrl.slice(0, -1));
-  assert.ok(
-    result.draft.identifiers.some(
-      (identifier) =>
-        identifier.kind === "doi" &&
-        identifier.value === "10.1145/3641519.3657438",
-    ),
-  );
-  assert.match(prompts[0], /mesh-free neural fluid method/u);
-});
-
-test("包含 DOI 的 ACM ePDF 链接绕过浏览器挑战并保留为 PDF 资源", async (t) => {
-  const epdfUrl = "https://dl.acm.org/doi/epdf/10.1145/3680528.3687628";
-  let acmRequests = 0;
-  const fixture = await makeFixture(t, "publisher-doi-pdf", {
-    fetchImpl: async (url) => {
-      const href = String(url);
-      if (href.startsWith("https://dl.acm.org/")) {
-        acmRequests += 1;
-        return new Response("Cloudflare challenge", { status: 403 });
-      }
-      if (
-        /api\.crossref\.org\/works\/10\.1145%2F3680528\.3687628/u.test(
-          href,
-        )
-      ) {
-        return crossrefResponse({
-          doi: "10.1145/3680528.3687628",
-          title: "Neural Implicit Reduced Fluid Simulation",
-          institution: "McGill University",
-          source: "SIGGRAPH Asia 2024 Conference Papers",
-          abstract: "",
-          published: [2024, 12, 3],
-        });
-      }
-      throw new Error(`未预期的请求：${href}`);
-    },
-  });
-
-  const result = await fixture.service.analyze({ reference: epdfUrl });
-
-  assert.equal(result.status, "ready");
-  assert.equal(result.draft.title, "Neural Implicit Reduced Fluid Simulation");
-  assert.equal(result.draft.source, "SIGGRAPH Asia 2024");
-  assert.equal(result.draft.pdfUrl, epdfUrl);
-  assert.equal(result.draft.hasPdf, true);
-  assert.equal(result.draft.originalUrl, "https://doi.org/10.1145/3680528.3687628");
-  assert.equal(acmRequests, 0);
-  assert.ok(
-    result.draft.identifiers.some(
-      (identifier) =>
-        identifier.kind === "doi" &&
-        identifier.value === "10.1145/3680528.3687628",
-    ),
-  );
-  assert.ok(
-    result.draft.identifiers.some(
-      (identifier) =>
-        identifier.kind === "url" && identifier.value === epdfUrl,
-    ),
-  );
-});
-
-test("超过安全上限的普通网页仍会被拒绝", async (t) => {
-  const fixture = await makeFixture(t, "oversized-html", {
-    fetchImpl: async () =>
-      new Response("<html></html>", {
-        status: 200,
-        headers: {
-          "Content-Type": "text/html",
-          "Content-Length": String(3 * 1_024 * 1_024),
-        },
-      }),
-  });
-
-  await assert.rejects(
-    fixture.service.analyze({ reference: "https://papers.example/large" }),
-    (error) => error?.code === "METADATA_TOO_LARGE",
-  );
-});
-
-test("AI 失败时保留元数据草稿，允许人工审核后继续添加", async (t) => {
-  const rawInstitution =
-    "Tsinghua University, Beijing National Research Center for Information Science and Technology (BNRist), Department of Computer Science and Technology; Hong Kong University of Science and Technology";
-  const fixture = await makeFixture(t, "ai-fallback", {
-    fetchImpl: async () =>
-      crossrefResponse({
-        doi: "10.5555/9876.5432",
-        institution: rawInstitution,
-      }),
-    aiService: {
-      async generateText() {
-        const error = new Error("AI 服务暂时不可用。");
-        error.code = "PROVIDER_UNAVAILABLE";
-        error.details = { action: "请稍后重试。" };
-        throw error;
-      },
-    },
-  });
-
-  const result = await fixture.service.analyze({ reference: "10.5555/9876.5432" });
-  assert.equal(result.status, "ready");
+  assert.equal(fixture.requests.length, 1);
+  assert.deepEqual(result.metadata.sources, [{ url: PAPER_URL, title: "论文原文" }]);
   assert.equal(result.draft.title, "A Test Paper");
-  assert.equal(result.draft.institution, "Tsinghua University");
-  assert.equal(result.metadata.institution, rawInstitution);
-  assert.equal(result.draft.zhTitle, "");
-  assert.equal(result.ai, null);
-  assert.equal(result.aiError.code, "PROVIDER_UNAVAILABLE");
-  assert.equal(result.aiError.action, "请稍后重试。");
 });
 
-test("保存接口会再次检查标识和标题，阻止并发或绕过审核造成的重复", async (t) => {
-  const fixture = await makeFixture(t, "save-guard", {
-    fetchImpl: async () => crossrefResponse(),
-  });
-  await fixture.repository.createPaper({
-    title: "First Copy",
-    identifiers: [{ kind: "doi", value: "10.1145/1234.5678" }],
-  });
+test("AI 确认论文后，来源字段标注或可选作者缺失不会阻止草稿", async (t) => {
+  const onlyTitle = researchResult();
+  onlyTitle.sources[0].fields = ["title"];
+  for (const result of [onlyTitle, researchResult({ authors: "" })]) {
+    const fixture = await makeFixture(t, { result });
+    const response = await fixture.service.analyze({ reference: "烟雾论文" });
+    assert.equal(response.status, "ready");
+    assert.equal(response.draft.authors, result.paper.authors);
+    assert.equal(fixture.requests.length, 1);
+  }
+});
 
-  await assert.rejects(
-    fixture.repository.createPaper({
-      title: "Second Copy",
-      identifiers: [{ kind: "doi", value: "https://doi.org/10.1145/1234.5678" }],
-    }),
-    (error) => error?.code === "CONFLICT" && error.details?.duplicates?.length === 1,
-  );
+test("ThermalNeRF 项目页可支持标题、作者和其链接的 arXiv 原文，无需重复索要线索", async (t) => {
+  const projectUrl = "https://yvette256.github.io/thermalnerf/";
+  const result = researchResult({
+    title: "ThermalNeRF: Thermal Radiance Fields",
+    zhTitle: "ThermalNeRF：热辐射场",
+    authors: "Yvette Y. Lin; Xin-Yi Pan; Sara Fridovich-Keil; Gordon Wetzstein",
+    institution: "Stanford University",
+    source: "ICCP 2024", date: "2024",
+    originalUrl: "https://arxiv.org/abs/2407.15337",
+    pdfUrl: "https://arxiv.org/pdf/2407.15337",
+    aiSummary: "使用可见光和长波红外图像构建多光谱辐射场，以重建热场景。",
+    codeUrl: "https://github.com/yvette256/nerfstudio-thermal", projectUrl,
+    identifiers: [{ kind: "arxiv", value: "2407.15337" }],
+  });
+  result.sources = [{ url: projectUrl, title: result.paper.title, fields: [...SOURCE_FIELDS] }];
+  const fixture = await makeFixture(t, { result, webSources: [{ url: projectUrl, title: result.paper.title }] });
+  const response = await fixture.service.analyze({ reference: projectUrl });
+  assert.equal(response.status, "ready");
+  assert.equal(response.draft.title, result.paper.title);
+  assert.equal(response.draft.authors, result.paper.authors);
+  assert.equal(response.draft.originalUrl, "https://arxiv.org/abs/2407.15337");
+  assert.equal(response.draft.source, "ICCP 2024");
+  assert.equal(response.metadata.sources[0].url, projectUrl);
+  assert.equal(fixture.requests.length, 1);
+  assert.equal(fixture.repository.getLibrary().papers.length, 0);
+});
+
+test("保留 AI 返回的原文链接，不用来源页面覆盖", async (t) => {
+  const result = researchResult({ originalUrl: "https://other.example/unverified" });
+  result.sources[0].fields = ["title", "authors"];
+  const fixture = await makeFixture(t, { result });
+  const response = await fixture.service.analyze({ reference: "烟雾论文" });
+  assert.equal(response.status, "ready");
+  assert.equal(response.draft.originalUrl, result.paper.originalUrl);
+  assert.deepEqual(response.metadata.warnings, []);
+});
+
+test("完整检索交给一次 AI 任务，选定模型透传，未完成时由用户重试", async (t) => {
+  const fixture = await makeFixture(t, { generateText: async () => {
+    return {
+      text: JSON.stringify({ status: "research_incomplete", message: "网页未读完。", sources: [] }),
+      webSearchUsed: true,
+      webSources: [{ url: PAPER_URL, title: "工具来源" }],
+      resolvedModel: "research-model",
+    };
+  } });
+  const response = await fixture.service.analyze({ reference: "https://project.example/smoke", modelId: "selected" });
+  assert.equal(response.status, "research_incomplete");
+  assert.equal(response.message, "网页未读完。");
+  assert.equal(fixture.requests.length, 1);
+  assert.ok(fixture.requests.every((request) => request.modelId === "selected" && request.webSearch));
+  assert.match(fixture.requests[0].input, /一次任务内完成必要的补查/u);
+});
+
+test("项目页确实存在多篇候选时仍允许询问，不强行选取一篇", async (t) => {
+  const fixture = await makeFixture(t, { result: {
+    status: "needs_clarification", clarificationReason: "ambiguous",
+    message: "该页有两篇不同论文，你指的是哪一篇？", sources: [],
+  } });
+  const result = await fixture.service.analyze({ reference: "https://project.example/two-papers" });
+  assert.equal(result.status, "needs_clarification");
+  assert.equal(fixture.requests.length, 1);
+});
+
+test("事实核对交给 AI，不因缺少字段级证据标记清空返回资料", async (t) => {
+  const result = researchResult();
+  result.sources[0].fields = ["title", "authors", "source", "date"];
+  const fixture = await makeFixture(t, { result });
+  const response = await fixture.service.analyze({ reference: "烟雾论文" });
+  assert.equal(response.status, "ready");
+  for (const field of ["institution", "source", "date", "aiSummary", "codeUrl", "projectUrl", "pdfUrl"]) {
+    assert.equal(response.draft[field], result.paper[field]);
+  }
+  assert.equal(response.draft.hasPdf, true);
+  assert.deepEqual(response.metadata.warnings, []);
+});
+
+test("私网、带凭据、非 HTTP 的资源不会被保存；畸形标识不会导致崩溃", async (t) => {
+  const fixture = await makeFixture(t, { result: researchResult({
+    pdfUrl: "http://127.0.0.1/private.pdf",
+    codeUrl: "javascript:alert(1)",
+    projectUrl: "https://user:secret@project.example/",
+    identifiers: [{ kind: "doi", value: "%invalid" }, { kind: "url", value: "http://[::1]/private" }],
+  }) });
+  const response = await fixture.service.analyze({ reference: "烟雾论文" });
+  assert.equal(response.status, "ready");
+  assert.equal(response.draft.pdfUrl, "");
+  assert.equal(response.draft.codeUrl, "");
+  assert.equal(response.draft.projectUrl, "");
+  assert.deepEqual(response.draft.identifiers, []);
+});
+
+test("保留 AI 提供的来源链接及参数", async (t) => {
+  const result = researchResult();
+  result.sources = [
+    { url: PAPER_URL + "?utm_source=search", title: "原文", fields: ["title"] },
+    { url: PAPER_URL, title: "原文", fields: ["authors", "source", "date"] },
+  ];
+  const fixture = await makeFixture(t, { result });
+  const response = await fixture.service.analyze({ reference: "烟雾论文" });
+  assert.equal(response.status, "ready");
+  assert.equal(response.metadata.sources.length, 2);
+  assert.equal(response.metadata.sources[0].url, PAPER_URL + "?utm_source=search");
+});
+
+test("输入标识识别和一致性判断交给 AI，本地采用返回的论文标识", async (t) => {
+  const fixture = await makeFixture(t);
+  const response = await fixture.service.analyze({ reference: "10.1145/9999.9999" });
+  assert.equal(response.status, "ready");
+  assert.ok(fixture.requests[0].input.includes("10.1145/9999.9999"));
+  assert.ok(response.draft.identifiers.some((id) => id.value === "10.1145/1234.5678"));
+});
+
+test("用户描述中其他论文的标识不会混入已确认论文", async (t) => {
+  const fixture = await makeFixture(t);
+  const response = await fixture.service.analyze({ reference: "找引用了 10.1234/other 的那篇烟雾重建论文" });
+  assert.equal(response.status, "ready");
+  assert.equal(response.draft.identifiers.some((id) => id.value === "10.1234/other"), false);
+});
+
+test("AI 返回有效资料即可生成草稿，不依赖服务商额外的联网记录字段", async (t) => {
+  const fixture = await makeFixture(t, { webSearchUsed: false });
+  assert.equal((await fixture.service.analyze({ reference: "烟雾论文" })).status, "ready");
+  assert.equal(fixture.requests[0].webSearch, true);
+});
+
+test("未配置、联网不支持或超时不退回凭记忆填写", async (t) => {
+  for (const code of ["AI_NOT_CONFIGURED", "WEB_SEARCH_UNSUPPORTED", "TIMEOUT"]) {
+    const fixture = await makeFixture(t, { generateText: async () => { throw Object.assign(new Error(code), { code }); } });
+    await assert.rejects(fixture.service.analyze({ reference: "烟雾论文" }), { code });
+    assert.equal(fixture.repository.getLibrary().papers.length, 0);
+  }
+});
+
+test("无效 AI JSON 拒绝，允许正文后附带完整 JSON 和引用", async (t) => {
+  const invalid = await makeFixture(t, { result: "not JSON" });
+  await assert.rejects(invalid.service.analyze({ reference: "烟雾论文" }), { code: "INVALID_AI_RESULT" });
+  const valid = await makeFixture(t, { result: "检索结果\n\`\`\`json\n" + JSON.stringify(researchResult()) + "\n\`\`\`\n来源说明" });
+  assert.equal((await valid.service.analyze({ reference: "烟雾论文" })).status, "ready");
+});
+
+test("JSON 之前正文中的未闭合引号不会导致有效论文结果被漏读", async (t) => {
+  const fixture = await makeFixture(t, {
+    result: '对输入 "https://github.com/JiaxiongQ/NeuSmoke 的检索结果：\n' + JSON.stringify(researchResult()),
+  });
+  const response = await fixture.service.analyze({ reference: "https://github.com/JiaxiongQ/NeuSmoke" });
+  assert.equal(response.status, "ready");
+  assert.equal(response.draft.title, "A Test Paper");
+  assert.equal(fixture.requests.length, 1);
+});
+
+test("空白最终答复明确报告服务未返回内容，不误报论文 JSON 格式错误", async (t) => {
+  const fixture = await makeFixture(t, { result: " " });
+  await assert.rejects(fixture.service.analyze({ reference: "https://github.com/JiaxiongQ/NeuSmoke" }), {
+    code: "EMPTY_AI_RESPONSE", message: "AI 服务未返回最终答复，请重试。",
+  });
+  assert.equal(fixture.repository.getLibrary().papers.length, 0);
+});
+
+test("缺少可保存标题或返回错误的数据类型时，展示格式错误而不保存", async (t) => {
+  for (const result of [{ status: "ready" }, researchResult({ title: "" }), researchResult({ title: 42 })]) {
+    const fixture = await makeFixture(t, { result });
+    await assert.rejects(fixture.service.analyze({ reference: "烟雾论文" }), { code: "INVALID_AI_RESULT" });
+    assert.equal(fixture.requests.length, 1);
+    assert.equal(fixture.repository.getLibrary().papers.length, 0);
+  }
+});
+
+test("空白和超长线索在 AI 请求前拒绝，明确模型选择会透传", async (t) => {
+  const fixture = await makeFixture(t);
+  for (const reference of ["   ", "a".repeat(12_001)]) await assert.rejects(fixture.service.analyze({ reference }));
+  assert.equal(fixture.requests.length, 0);
+  await fixture.service.analyze({ reference: "烟雾论文", modelId: "selected-model" });
+  assert.equal(fixture.requests[0].modelId, "selected-model");
+});
+
+test("HTTP 分析返回来源但不写入；确认保存、再次保存查重均生效", async (t) => {
+  const fixture = await makeFixture(t);
+  const api = await createLibraryApi({ repository: fixture.repository, aiService: fixture.aiService, port: 0 });
+  const address = await api.listen();
+  t.after(() => api.close());
+  const request = (path, body) => fetch(address.url + "/api" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "http://localhost:3000" },
+    body: JSON.stringify(body),
+  });
+  const analyzed = await request("/paper-intake/analyze", { reference: "Alice 的烟雾论文" });
+  assert.equal(analyzed.status, 200);
+  const result = await analyzed.json();
+  assert.equal(result.status, "ready");
+  assert.equal(result.metadata.sources.length, 1);
+  assert.equal(fixture.repository.getLibrary().papers.length, 0);
+  const saved = await request("/papers", result.draft);
+  assert.equal(saved.status, 201);
+  const payload = await saved.json();
+  assert.equal(payload.paper.title, "A Test Paper");
+  assert.equal(payload.backup.ok, true);
+  assert.equal((await request("/papers", result.draft)).status, 409);
   assert.equal(fixture.repository.getLibrary().papers.length, 1);
 });

@@ -421,12 +421,37 @@ test("删除为可恢复的软删除，主库和最新备份都通过完整性�
     false,
   );
 
+  const rejectedRestore = await jsonRequest(
+    baseUrl,
+    `/api/papers/${paperId}/restore`,
+    {
+      method: "POST",
+      headers: { Origin: "https://malicious.example" },
+    },
+  );
+  assert.equal(rejectedRestore.response.status, 403);
+  assert.equal(rejectedRestore.body.error.code, "ORIGIN_NOT_ALLOWED");
+  assert.equal(
+    (await jsonRequest(baseUrl, "/api/library")).body.papers.some(
+      (paper) => paper.id === paperId,
+    ),
+    false,
+    "外部网页来源不能恢复已删除论文",
+  );
+
   const restored = await jsonRequest(
     baseUrl,
     `/api/papers/${paperId}/restore`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { Origin: "http://localhost:3001" },
+    },
   );
   assert.equal(restored.response.status, 200);
+  assert.equal(
+    restored.response.headers.get("access-control-allow-origin"),
+    "http://localhost:3001",
+  );
   assert.equal(restored.body.paper.id, paperId);
   assert.equal(restored.body.paper.deletedAt, undefined);
   assert.equal(restored.body.backup.ok, true);

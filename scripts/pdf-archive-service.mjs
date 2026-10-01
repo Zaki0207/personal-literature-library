@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createProxyAwareFetch } from "./ai/providers.mjs";
+import { createPublicNetworkFetch } from "./network-safety.mjs";
 
 export const DEFAULT_PDF_DIRECTORY = join(
   homedir(),
@@ -183,12 +184,19 @@ export class PdfArchiveService {
     allowPrivateNetwork = false,
     maxBytes = MAX_PDF_BYTES,
     timeoutMs = FETCH_TIMEOUT_MS,
+    resolveHost,
   } = {}) {
     if (!repository) throw new Error("PdfArchiveService 需要 repository。");
     this.repository = repository;
     this.pdfDirectory = resolve(pdfDirectory);
     this.temporaryDirectory = resolve(this.pdfDirectory, ".tmp");
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = createPublicNetworkFetch(fetchImpl, {
+      ...(allowPrivateNetwork
+        ? { lookupImpl: null }
+        : resolveHost !== undefined
+          ? { lookupImpl: resolveHost }
+          : {}),
+    });
     this.allowPrivateNetwork = allowPrivateNetwork;
     this.maxBytes = maxBytes;
     this.timeoutMs = timeoutMs;
@@ -495,5 +503,11 @@ export class PdfArchiveService {
 }
 
 export function createPdfArchiveService(options = {}) {
-  return new PdfArchiveService(options);
+  return new PdfArchiveService({
+    ...options,
+    ...(Object.hasOwn(options, "fetchImpl") &&
+    !Object.hasOwn(options, "resolveHost")
+      ? { resolveHost: null }
+      : {}),
+  });
 }

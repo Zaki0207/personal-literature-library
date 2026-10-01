@@ -133,7 +133,7 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.equal(firstRun.body.lastRun.insufficient, false);
   assert.equal(webSearchBodies.length, 2);
   assert.deepEqual(webSearchBodies[0].tools, [{ type: "web_search" }]);
-  assert.equal(webSearchBodies[0].tool_choice, "required");
+  assert.equal(webSearchBodies[0].tool_choice, "auto");
   assert.match(webSearchBodies[0].input, /Existing Paper/u);
 
   const firstTrace = await jsonRequest(baseUrl, "/api/radar/ai-trace");
@@ -220,22 +220,55 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.equal(unreviewedAdd.response.status, 400);
   assert.match(unreviewedAdd.body.error.message, /(title|标题)/u);
 
+  const reviewedPaperInput = {
+    title: "New Paper B — Manually Reviewed",
+    zhTitle: "人工修改后的中文标题",
+    authors: paperB.authors,
+    institution: "Reviewed Lab",
+    source: paperB.source,
+    date: paperB.date,
+    aiSummary: "人工修改后的摘要",
+    originalUrl: paperB.originalUrl,
+    identifiers: paperB.identifiers,
+  };
+  api.repository.db.exec(`
+    CREATE TRIGGER reject_radar_added_for_test
+    BEFORE UPDATE OF status ON radar_items
+    WHEN NEW.status = 'added'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced radar status failure');
+    END
+  `);
+  const interruptedAdd = await jsonRequest(
+    baseUrl,
+    `/api/radar/items/${paperB.id}/add`,
+    {
+      method: "POST",
+      body: JSON.stringify(reviewedPaperInput),
+    },
+  );
+  assert.equal(interruptedAdd.response.status, 500);
+  const libraryAfterFailure = await jsonRequest(baseUrl, "/api/library");
+  assert.equal(
+    libraryAfterFailure.body.papers.some(
+      (entry) => entry.title === reviewedPaperInput.title,
+    ),
+    false,
+    "雷达状态更新失败时必须回滚论文写入",
+  );
+  const radarAfterFailure = await jsonRequest(baseUrl, "/api/radar");
+  assert.equal(
+    radarAfterFailure.body.pending.some((entry) => entry.id === paperB.id),
+    true,
+  );
+  api.repository.db.exec("DROP TRIGGER reject_radar_added_for_test");
+
   const added = await jsonRequest(
     baseUrl,
     `/api/radar/items/${paperB.id}/add`,
     {
       method: "POST",
-      body: JSON.stringify({
-        title: "New Paper B — Manually Reviewed",
-        zhTitle: "人工修改后的中文标题",
-        authors: paperB.authors,
-        institution: "Reviewed Lab",
-        source: paperB.source,
-        date: paperB.date,
-        aiSummary: "人工修改后的摘要",
-        originalUrl: paperB.originalUrl,
-        identifiers: paperB.identifiers,
-      }),
+      body: JSON.stringify(reviewedPaperInput),
     },
   );
   assert.equal(added.response.status, 201);
@@ -326,7 +359,7 @@ test("DeepSeek V4 Flash 通过 Responses API 执行联网检索", async (t) => {
   assert.equal(calls.length, 3);
   assert.match(calls[1].url, /\/responses$/u);
   assert.deepEqual(calls[1].body.tools, [{ type: "web_search" }]);
-  assert.equal(calls[1].body.tool_choice, "required");
+  assert.equal(calls[1].body.tool_choice, "auto");
   assert.deepEqual(calls[2].body.tools, [{ type: "web_search" }]);
 
   const trace = await jsonRequest(baseUrl, "/api/radar/ai-trace");

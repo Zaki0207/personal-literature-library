@@ -28,8 +28,8 @@ const PUBLIC_ERRORS = {
     retryable: false,
   },
   INVALID_REQUEST: {
-    message: "当前模型不支持这次验证请求。",
-    action: "请检查模型 ID，或改用支持文本生成的模型。",
+    message: "AI 服务拒绝了请求参数。",
+    action: "请检查所选模型与服务支持的请求参数。",
     statusCode: 400,
     retryable: false,
   },
@@ -59,7 +59,7 @@ const PUBLIC_ERRORS = {
   },
   REQUEST_TIMEOUT: {
     message: "连接 AI 服务超时。",
-    action: "请检查网络后重试。",
+    action: "请重试；如果使用高思考强度，可降低一级后再试。",
     statusCode: 504,
     retryable: true,
   },
@@ -68,6 +68,24 @@ const PUBLIC_ERRORS = {
     action: "请重试，或更换模型 ID。",
     statusCode: 502,
     retryable: true,
+  },
+  STREAM_INTERRUPTED: {
+    message: "Responses 连接提前中断，尚未收到完整结果。",
+    action: "请重试；如果持续出现，请检查网关的流式连接支持。",
+    statusCode: 502,
+    retryable: true,
+  },
+  RESPONSE_INCOMPLETE: {
+    message: "Responses 未能完成这次生成。",
+    action: "请重试，或检查所选模型的输出限制。",
+    statusCode: 502,
+    retryable: false,
+  },
+  RESPONSES_UNSUPPORTED: {
+    message: "当前服务地址未提供可用的 Responses 接口。",
+    action: "请检查服务地址是否正确，以及服务是否支持 Responses API。不会自动切换到 Chat Completions。",
+    statusCode: 400,
+    retryable: false,
   },
   AI_NOT_CONFIGURED: {
     message: "AI 服务尚未完成配置。",
@@ -130,6 +148,7 @@ export function aiErrorFromHttp({ provider, response, payload }) {
     httpStatus: status,
     upstreamCode,
     requestId: response.headers.get("x-request-id") ?? undefined,
+    retryAfter: response.headers.get("retry-after") ?? undefined,
   };
 
   if (status === 401) {

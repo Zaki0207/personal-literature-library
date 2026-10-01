@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { MacOsKeychainCredentialStore } from "./credential-store.mjs";
 import { createAiProviders } from "./providers.mjs";
 import { AiServiceError, keychainAiError } from "./errors.mjs";
+import {
+  defaultReasoningEffort,
+  reasoningEffortOptions,
+} from "./reasoning-effort.mjs";
 
 function validationError(message, field) {
   const error = new Error(message);
@@ -44,6 +48,22 @@ function validateModel(model) {
     );
   }
   return model.trim();
+}
+
+function validateReasoningEffort(value, model) {
+  const options = reasoningEffortOptions(model);
+  if (value === undefined || value === null || value === "") {
+    return defaultReasoningEffort(model);
+  }
+  if (typeof value !== "string" || !options.includes(value)) {
+    throw validationError(
+      options.length
+        ? `该模型的思考强度必须是：${options.join("、")}。`
+        : "该模型不支持可配置的思考强度。",
+      "reasoningEffort",
+    );
+  }
+  return value;
 }
 
 function validateApiKey(apiKey) {
@@ -183,6 +203,9 @@ export function createAiService({
             id: model.id,
             model: model.model,
             resolvedModel: model.resolvedModel,
+            reasoningEffort:
+              model.reasoningEffort ?? defaultReasoningEffort(model.model),
+            reasoningEffortOptions: reasoningEffortOptions(model.model),
             verifiedAt: model.verifiedAt,
             persistedActive: Boolean(model.active),
           })),
@@ -208,6 +231,8 @@ export function createAiService({
         id: model.id,
         model: model.model,
         resolvedModel: model.resolvedModel,
+        reasoningEffort: model.reasoningEffort,
+        reasoningEffortOptions: model.reasoningEffortOptions,
         verifiedAt: model.verifiedAt,
         active: Boolean(connection.configured && model.id === activeModelId),
       })),
@@ -310,10 +335,15 @@ export function createAiService({
         throw new AiServiceError("AI_NOT_CONFIGURED");
       }
 
+      const reasoningEffort = validateReasoningEffort(
+        input.reasoningEffort ?? duplicateModel?.reasoningEffort,
+        model,
+      );
       const verification = await compatibleProvider.verify({
         apiKey,
         model,
         baseUrl,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
       });
 
       const currentSettings = await settings();
@@ -330,6 +360,7 @@ export function createAiService({
           baseUrl,
           model,
           resolvedModel: verification.resolvedModel,
+          reasoningEffort,
           makeActive:
             input.makeActive === true || currentSettings.activeModelId === null,
         });
@@ -396,6 +427,27 @@ export function createAiService({
       return { settings: await settings(), backup: saved.backup };
     },
 
+    async updateModelReasoningEffort(modelId, input = {}) {
+      const normalizedModelId = validateEntityId(modelId, "modelId");
+      const model = repository.getAiModel(normalizedModelId);
+      if (!model) {
+        const error = new Error("未找到该 AI 模型配置。");
+        error.name = "NotFoundError";
+        error.statusCode = 404;
+        error.code = "NOT_FOUND";
+        throw error;
+      }
+      const reasoningEffort = validateReasoningEffort(
+        input.reasoningEffort,
+        model.model,
+      );
+      const saved = await repository.updateAiModelReasoningEffort(
+        normalizedModelId,
+        reasoningEffort,
+      );
+      return { settings: await settings(), backup: saved.backup };
+    },
+
     async deleteModel(modelId) {
       const normalizedModelId = validateEntityId(modelId, "modelId");
       const deleted = await repository.deleteAiModel(normalizedModelId);
@@ -454,6 +506,9 @@ export function createAiService({
         baseUrl: selected.service.baseUrl,
         input: input.trim(),
         webSearch: webSearch === true,
+        ...(selected.reasoningEffort
+          ? { reasoningEffort: selected.reasoningEffort }
+          : {}),
         ...(timeoutMs ? { timeoutMs } : {}),
       });
     },

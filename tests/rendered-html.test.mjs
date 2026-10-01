@@ -62,8 +62,10 @@ test("server-renders the literature knowledge base", async () => {
 });
 
 test("keeps the agreed navigation and resource states in the product source", async () => {
-  const [page, styles, layout, packageJson] = await Promise.all([
+  const [page, apiClient, presentation, styles, layout, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/library/api-client.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/library/presentation.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -95,12 +97,12 @@ test("keeps the agreed navigation and resource states in the product source", as
   assert.match(page, /watchLaterOnly/);
   assert.match(page, /paper\.watchLater/);
   assert.match(page, /favoriteOnly/);
-  assert.match(page, /legacyWatchCategoryIds/);
+  assert.match(presentation, /legacyWatchCategoryIds/);
   assert.match(page, /className="resource-slot is-available"/);
   assert.match(page, /className="resource-slot is-missing"/);
   assert.match(page, /paper\.hasPdf/);
   assert.match(page, /pdfArchive/);
-  assert.match(page, /\/pdf\/open/);
+  assert.match(apiClient, /\/pdf\/open/);
   assert.match(page, /\/pdf\/archive/);
   assert.match(page, /本地副本/);
   assert.match(page, /选择本地 PDF/);
@@ -122,7 +124,7 @@ test("keeps the agreed navigation and resource states in the product source", as
   assert.match(page, /className="paper-preview-layer"/);
   assert.match(styles, /\.paper-title-list li/);
   assert.match(styles, /\.paper-preview-dialog/);
-  assert.match(page, /LIBRARY_API_BASE/);
+  assert.match(apiClient, /LIBRARY_API_BASE/);
   assert.match(page, /编辑论文/);
   assert.match(page, /className="edit-drawer"/);
   assert.match(page, /role="dialog"/);
@@ -137,8 +139,10 @@ test("keeps the agreed navigation and resource states in the product source", as
   assert.match(page, /sameCategorySelection/);
   assert.match(page, /analyzePaperReference/);
   assert.match(page, /\/paper-intake\/analyze/);
-  assert.match(page, /识别与查重/);
-  assert.match(page, /元数据与 AI/);
+  assert.match(page, /提供线索/);
+  assert.match(page, /AI 联网整理/);
+  assert.match(page, /needs_clarification/);
+  assert.match(page, /PaperIntakeSources/);
   assert.match(page, /确认添加到知识库/);
   assert.match(page, /addingPaperRef\.current/);
   assert.match(page, /disabled=\{addingPaper\}/);

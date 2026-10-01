@@ -14,7 +14,7 @@ The project is designed for individual research workflows. It is currently Chine
 - Open locally archived PDFs first; on the first open, keep the source link responsive while archiving a verified local copy in the background.
 - Detect duplicate papers using normalized titles and identifiers such as DOI and arXiv IDs.
 - Discover recent papers with the AI Literature Radar, choose the number of candidates for each run, and review them before they enter the library.
-- Add papers from a DOI, arXiv identifier, web page, direct PDF URL, or publisher ePDF link; resolve metadata and optionally enrich the draft with an AI model you configure.
+- Give the configured AI a paper title, project page, repository, DOI, arXiv, PDF link, or natural-language clue; it searches the web and assembles an editable paper draft with clickable sources.
 - Store library data locally in SQLite and create integrity-checked backups after successful changes.
 
 ## Main Interface
@@ -74,13 +74,27 @@ The **View this AI record** action shows and lets you copy the exact rendered pr
 
 AI integration is optional. From **AI Settings**, add a service connection with a display name, base URL, API key, and one or more model IDs. A model is verified with a minimal request before it is saved, and a single service connection can share its credential across multiple models.
 
-The application prefers the Responses API and falls back to Chat Completions only when a compatible provider explicitly returns a `404` for the first endpoint. AI requests respect the HTTP/HTTPS proxy available when the application starts.
+Reasoning-capable models show a per-model **Reasoning effort** selector in AI Settings. The selected value is stored with that model and sent with subsequent Responses requests, so switching models also restores each model's chosen effort.
 
-The Literature Radar requires a model and provider that support Responses API Web Search. Paper intake and radar use separate request limits so a slow web search does not look like a short metadata failure:
+All AI provider requests use a 20-minute timeout, including model verification, enrichment, and web-search requests.
 
-- Paper metadata requests wait up to 20 seconds and cap HTML metadata at 2 MiB.
-- AI enrichment during paper intake waits up to 3 minutes. If it times out, the metadata draft is kept and can be completed manually.
-- A radar web-search run can wait up to 20 minutes while it searches and checks multiple rounds of candidates.
+All configured service connections use streaming Responses (`/responses`), including model verification. They never fall back to Chat Completions after an error. A connection must support Responses; paper intake and radar additionally require its web-search tool. AI requests respect the HTTP/HTTPS proxy available when the application starts.
+
+Transient Responses server errors, rate limits, network failures, and interrupted streams receive at most two retries with backoff within the original 20-minute request budget. Long `Retry-After` instructions are surfaced without an immediate retry. Authentication, quota, parameter, and unsupported-endpoint errors are not retried. Failures identify Responses, the upstream HTTP status when available, and the number of retries without exposing provider error bodies or credentials. A completed stream event returns immediately; partial text without a completion event is never treated as a finished result.
+
+Paper intake and Literature Radar require a model and provider that support Responses API Web Search. Each AI request can wait up to 20 minutes. A model that only supports ordinary chat cannot perform paper intake in this mode; the UI reports configuration, unsupported-search, and timeout failures without silently generating facts from memory.
+
+### AI Paper Intake
+
+The input accepts up to 12,000 characters of titles, links, author information, abstracts, or other paper clues. The AI chooses its search strategy, identifies the paper, checks publication versions, and fills bibliographic information, a Chinese title and summary, up to three existing categories, and PDF/code/project links. The submitted clues and existing category paths are sent to the configured provider; credentials and library contents are not included in the research prompt.
+
+The original input is passed unchanged to the configured model together with the fixed instructions in `scripts/prompts/paper-intake.txt` and the existing category paths. Every input follows the same AI request path, including titles, paper links, and GitHub repositories. The AI decides how to read links, identify the paper, follow up on incomplete searches, verify facts and sources, and fill the result. The local service does not classify the input, extract identifiers from it, or run a preliminary duplicate check.
+
+Web-search requests expose the search tool with automatic tool selection. The fixed instructions require research, while the model can stop searching and produce its final answer. An empty final answer is reported separately from invalid paper JSON.
+
+The local service parses the returned JSON and adapts it to an editable draft, retaining the AI's factual fields and listed sources without imposing field-by-field evidence gates or triggering another research request. Only basic data handling remains: a non-empty title for a usable draft, safe resource links, valid category IDs and identifiers, and a duplicate check on the identified paper. AI statuses for clarification, incomplete research, and no match are displayed directly, with the original input preserved for retry. Sources and metadata are AI-provided and should be reviewed before confirmation. Provider transport retries remain independent of this single research request.
+
+Analysis never inserts a paper. Confirmation performs another duplicate check and saves to local SQLite with a backup. Search sources and the matching explanation are shown during review; the saved paper retains its resource URLs, not a permanent copy of the search transcript.
 
 ### Credential Handling
 
@@ -129,12 +143,11 @@ background archive. HTML login pages, error pages, and files larger than 200 MiB
 are rejected rather than saved as PDFs. The editor also supports retrying,
 manual PDF import, and removal of the local copy.
 
-The paper-intake editor treats direct PDF links as paper references: it detects the
-PDF response without loading the entire file just to read metadata, then tries the
-nearby project or landing page and Crossref to identify the paper. DOI-bearing
-publisher ePDF links, including ACM links that challenge automated clients, use the
-DOI/Crossref metadata path while preserving the original ePDF as the paper's PDF
-resource.
+PDF and publisher ePDF links can be passed directly to the AI as research clues.
+The model looks for a matching paper page or accessible copy; successful identification
+is not guaranteed for inaccessible files. Intake does not itself download or parse a
+PDF or imply that the model read its full text. Local PDF archiving remains a separate
+action after the paper has been saved.
 
 PDF files are not embedded in SQLite or copied into each versioned SQLite backup.
 Use Time Machine or a separate sync/backup strategy for the archive directory if
