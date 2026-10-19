@@ -1,4 +1,4 @@
-import { NotFoundError } from "../library-repository.mjs";
+import { NotFoundError, ValidationError } from "../library-repository.mjs";
 import {
   assertAiRequestOrigin,
   assertPdfRequestOrigin,
@@ -37,6 +37,38 @@ export async function handlePaperRoutes({
     const result = await paperIntakeService.analyze(
       await readJsonBody(request),
     );
+    sendJson(response, request, 200, result);
+    return true;
+  }
+
+  if (pathname === "/api/paper-intake/prompt-template") {
+    if (request.method === "GET") {
+      assertAiRequestOrigin(request);
+      sendJson(response, request, 200, paperIntakeService.getPromptTemplate());
+      return true;
+    }
+    if (request.method === "PUT") {
+      assertAiRequestOrigin(request);
+      const input = await readJsonBody(request);
+      if (
+        !input || typeof input !== "object" || Array.isArray(input) ||
+        Object.keys(input).some((field) => field !== "promptTemplate")
+      ) {
+        throw new ValidationError("请求正文仅支持 promptTemplate 字段。");
+      }
+      const result = await paperIntakeService.savePromptTemplate(input.promptTemplate);
+      sendJson(response, request, 200, result);
+      return true;
+    }
+  }
+
+  if (request.method === "POST" && pathname === "/api/paper-intake/prompt-template/reset") {
+    assertAiRequestOrigin(request);
+    const input = await readOptionalJsonBody(request);
+    if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length) {
+      throw new ValidationError("恢复默认提示词请求正文必须是空 JSON 对象。");
+    }
+    const result = await paperIntakeService.resetPromptTemplate();
     sendJson(response, request, 200, result);
     return true;
   }

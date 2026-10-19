@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { MacOsKeychainCredentialStore } from "./credential-store.mjs";
-import { createAiProviders } from "./providers.mjs";
+import { createAiProviders, isOfficialDeepSeekBaseUrl } from "./providers.mjs";
 import { AiServiceError, keychainAiError } from "./errors.mjs";
 import {
   defaultReasoningEffort,
@@ -265,8 +265,29 @@ export function createAiService({
     return { settings: resolvedSettings, backup };
   };
 
+  const resolveSelectedModel = async (modelId) => {
+    let selected;
+    if (modelId) {
+      selected = repository.getAiModel(validateEntityId(modelId, "modelId"));
+    } else {
+      const activeModelId = (await settings()).activeModelId;
+      selected = activeModelId ? repository.getAiModel(activeModelId) : null;
+    }
+    if (!selected) throw new AiServiceError("AI_NOT_CONFIGURED");
+    return selected;
+  };
+
   return {
     getSettings: settings,
+
+    async getResearchCapabilities({ modelId } = {}) {
+      const selected = await resolveSelectedModel(modelId);
+      return {
+        mode: isOfficialDeepSeekBaseUrl(selected.service.baseUrl)
+          ? "linked_pages" : "hosted_search",
+        modelId: selected.id,
+      };
+    },
 
     async verifyAndSave(connectionId, input = {}) {
       const normalizedConnectionId = connectionId
@@ -484,20 +505,20 @@ export function createAiService({
       modelId,
       webSearch = false,
       timeoutMs,
+      instructions,
+      responseFormat,
     } = {}) {
       if (typeof input !== "string" || !input.trim()) {
         throw validationError("AI 输入不能为空。", "input");
       }
-      let selected;
-      if (modelId) {
-        selected = repository.getAiModel(validateEntityId(modelId, "modelId"));
-      } else {
-        const activeModelId = (await settings()).activeModelId;
-        selected = activeModelId
-          ? repository.getAiModel(activeModelId)
-          : null;
+      if (instructions !== undefined && typeof instructions !== "string") {
+        throw validationError("AI 系统指令必须是文本。", "instructions");
       }
-      if (!selected) throw new AiServiceError("AI_NOT_CONFIGURED");
+      if (responseFormat !== undefined && (!responseFormat ||
+        typeof responseFormat !== "object" || Array.isArray(responseFormat))) {
+        throw validationError("AI 输出格式必须是结构化对象。", "responseFormat");
+      }
+      const selected = await resolveSelectedModel(modelId);
       const apiKey = await readCredential(selected.service.credentialKey);
       if (!apiKey) throw new AiServiceError("AI_NOT_CONFIGURED");
       return compatibleProvider.generateText({
@@ -506,6 +527,8 @@ export function createAiService({
         baseUrl: selected.service.baseUrl,
         input: input.trim(),
         webSearch: webSearch === true,
+        ...(instructions !== undefined ? { instructions } : {}),
+        ...(responseFormat !== undefined ? { responseFormat } : {}),
         ...(selected.reasoningEffort
           ? { reasoningEffort: selected.reasoningEffort }
           : {}),

@@ -62,6 +62,14 @@ export function createProxyAwareFetch(environment = process.env) {
 const defaultProviderFetch = createProxyAwareFetch();
 const WEB_SEARCH_TIMEOUT_MS = 20 * 60_000;
 
+export function isOfficialDeepSeekBaseUrl(baseUrl) {
+  try {
+    return new URL(baseUrl).hostname === "api.deepseek.com";
+  } catch {
+    return false;
+  }
+}
+
 function webSearchEvidence(payload) {
   const sources = new Map();
   let used = false;
@@ -241,12 +249,31 @@ function providerEndpoint(baseUrl, pathname) {
 
 function openAiOutputText(payload) {
   if (!Array.isArray(payload?.output)) return "";
-  return payload.output
-    .filter((item) => item?.type === "message")
-    .flatMap((item) => (Array.isArray(item.content) ? item.content : []))
-    .filter((content) => content?.type === "output_text")
-    .map((content) => (typeof content.text === "string" ? content.text : ""))
-    .join("");
+  const messages = payload.output.filter((item) => item?.type === "message");
+  const finalMessages = messages.filter((item) => item.phase === "final_answer");
+  // Explicit final answers take precedence even when empty. Commentary is not a
+  // substitute for a missing final answer; older gateways may omit phase.
+  const selectedMessages = finalMessages.length
+    ? finalMessages.slice(-1)
+    : messages.filter((item) => item.phase !== "commentary");
+  return selectedMessages
+    .map((item) => (Array.isArray(item.content) ? item.content : [])
+      .filter((content) => content?.type === "output_text")
+      .map((content) => (typeof content.text === "string" ? content.text : ""))
+      .join(""))
+    .join("\n");
+}
+
+function hasUnexecutedToolRequest(payload, text) {
+  // Responses function/tool calls require a client tool loop. This application
+  // only accepts hosted search results and never executes model-written tools.
+  if (!text.trim() && payload?.output?.some((item) =>
+    ["function_call", "custom_tool_call", "tool_call"].includes(item?.type))) {
+    return true;
+  }
+  // Some compatible services serialize a requested tool call as ordinary text.
+  // It is not a completed answer, even if labeled as a final_answer message.
+  return /^\s*<\|tool_calls?\|>/u.test(text);
 }
 
 function chatCompletionText(payload) {
@@ -413,8 +440,16 @@ export class OpenAiProvider extends BaseProvider {
     baseUrl,
     webSearch = false,
     reasoningEffort,
+    instructions,
+    responseFormat,
   }) {
     const resolvedBaseUrl = baseUrl ?? AI_PROVIDER_DEFINITIONS.openai.baseUrl;
+    if (webSearch && isOfficialDeepSeekBaseUrl(resolvedBaseUrl)) {
+      throw new AiServiceError("WEB_SEARCH_UNSUPPORTED", {
+        provider: this.id,
+        message: "DeepSeek 官方 API 没有内建联网检索。添加论文时可提供项目、DOI 或 arXiv 链接，由应用读取后整理；文献雷达和题目搜索需要支持联网检索的服务。",
+      });
+    }
     const result = await this.requestResponses(
       providerEndpoint(resolvedBaseUrl, "responses"),
       {
@@ -426,6 +461,9 @@ export class OpenAiProvider extends BaseProvider {
           input,
           store: false,
           stream: true,
+          ...(typeof instructions === "string" && instructions.trim()
+            ? { instructions } : {}),
+          ...(responseFormat ? { text: { format: responseFormat } } : {}),
           ...(reasoningEffort
             ? isDeepSeekModel(model)
               ? { thinking: { type: "enabled" }, reasoning_effort: reasoningEffort }
@@ -439,12 +477,16 @@ export class OpenAiProvider extends BaseProvider {
         },
       },
     );
+    const text = openAiOutputText(result.payload);
+    if (hasUnexecutedToolRequest(result.payload, text)) {
+      throw new AiServiceError("AI_TOOL_NOT_EXECUTED", { provider: this.id });
+    }
     return {
       provider: this.id,
       protocol: "responses",
       requestedModel: model,
       resolvedModel: typeof result.payload.model === "string" ? result.payload.model : model,
-      text: openAiOutputText(result.payload),
+      text,
       usage: result.payload.usage ?? null,
       latencyMs: result.latencyMs,
       requestId: result.requestId,

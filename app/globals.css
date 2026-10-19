@@ -3509,8 +3509,12 @@ a:focus-visible {
   max-height: min(860px, calc(100vh - 48px));
   padding: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background: #fbfbf9;
 }
+
+.paper-intake-modal > :not(form) { flex-shrink: 0; }
 
 .paper-intake-modal > .modal-heading {
   margin: 0;
@@ -3524,6 +3528,17 @@ a:focus-visible {
   color: var(--muted);
   font-size: 12px;
   font-weight: 450;
+}
+
+.paper-intake-modal > .paper-intake-hint {
+  margin: 0;
+  padding: 12px 27px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.paper-intake-modal[data-pdf-intake-mode="document"] .paper-intake-review-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .paper-intake-steps {
@@ -3639,8 +3654,9 @@ a:focus-visible {
 
 .paper-intake-start {
   display: grid;
-  min-height: 360px;
-  max-height: calc(min(860px, 100vh - 48px) - 156px);
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
   align-content: start;
   gap: 16px;
   padding: 30px 32px 26px;
@@ -3885,7 +3901,9 @@ a:focus-visible {
 }
 
 .paper-intake-review {
-  max-height: calc(min(860px, 100vh - 48px) - 156px);
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
   padding: 22px 28px 26px;
   overflow-y: auto;
 }
@@ -3949,7 +3967,7 @@ a:focus-visible {
 
 .paper-intake-modal.has-radar-context .paper-intake-start,
 .paper-intake-modal.has-radar-context .paper-intake-review {
-  max-height: calc(min(860px, 100vh - 48px) - 207px);
+  max-height: none;
 }
 
 .paper-intake-review-meta {
@@ -5707,3 +5725,15 @@ a:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+.paper-detail-title {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+.paper-detail-title:hover { text-decoration: underline; text-underline-offset: 4px; }
+.library-app.is-reading > :is(.sidebar, .main-content) { display: none; }
+.reader-loading { padding: 48px; }

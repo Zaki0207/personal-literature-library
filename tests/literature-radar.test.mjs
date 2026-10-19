@@ -287,7 +287,7 @@ test("文献雷达把知识库和已丢弃论文作为永久排重源", async (t
   assert.equal(state.body.pending.some((item) => item.title === "New Paper B"), false);
 });
 
-test("DeepSeek V4 Flash 通过 Responses API 执行联网检索", async (t) => {
+test("支持联网检索的网关可让 DeepSeek V4 Flash 通过 Responses API 运行雷达", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "literature-radar-deepseek-"));
   const seedPath = join(directory, "seed.json");
   await writeFile(
@@ -337,8 +337,8 @@ test("DeepSeek V4 Flash 通过 Responses API 执行联网检索", async (t) => {
   const configured = await jsonRequest(baseUrl, "/api/ai/connections", {
     method: "POST",
     body: JSON.stringify({
-      name: "DeepSeek",
-      baseUrl: "https://api.deepseek.com",
+      name: "DeepSeek Search Gateway",
+      baseUrl: "https://gateway.example/v1",
       model: "deepseek-v4-flash",
       apiKey: "ds-test-only",
     }),
@@ -357,6 +357,7 @@ test("DeepSeek V4 Flash 通过 Responses API 执行联网检索", async (t) => {
   assert.equal(radar.body.lastRun.rounds, 2);
   assert.equal(radar.body.lastRun.invalidResponses, 1);
   assert.equal(calls.length, 3);
+  assert.equal(calls[1].url, "https://gateway.example/v1/responses");
   assert.match(calls[1].url, /\/responses$/u);
   assert.deepEqual(calls[1].body.tools, [{ type: "web_search" }]);
   assert.equal(calls[1].body.tool_choice, "auto");
@@ -372,4 +373,65 @@ test("DeepSeek V4 Flash 通过 Responses API 执行联网检索", async (t) => {
   );
   assert.match(trace.body.trace.exchanges[0].errorMessage, /格式无效/u);
   assert.match(trace.body.trace.exchanges[1].response, /DeepSeek Radar Paper/u);
+});
+
+test("官方 DeepSeek 不支持内置联网检索，雷达明确报错且不请求搜索或添加论文", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "literature-radar-deepseek-official-"));
+  const seedPath = join(directory, "seed.json");
+  await writeFile(seedPath, JSON.stringify({ categoryRecords: [], papers: [] }), "utf8");
+  const calls = [];
+  const api = await createLibraryApi({
+    port: 0,
+    dbPath: join(directory, "library.sqlite3"),
+    backupDir: join(directory, "backups"),
+    seedPath,
+    credentialStore: new MemoryCredentialStore(),
+    aiFetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      calls.push({ url: String(url), body });
+      return aiResponse(body.model, "OK");
+    },
+  });
+  const { url: baseUrl } = await api.listen();
+  t.after(async () => {
+    await api.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const configured = await jsonRequest(baseUrl, "/api/ai/connections", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Official DeepSeek",
+      baseUrl: "https://api.deepseek.com",
+      model: "deepseek-v4-flash",
+      apiKey: "ds-test-only",
+    }),
+  });
+  assert.equal(configured.response.status, 200);
+  assert.equal(calls.length, 1, "唯一上游请求应为凭据验证");
+  assert.equal(calls[0].url, "https://api.deepseek.com/responses");
+  assert.equal(calls[0].body.tools, undefined);
+
+  const radar = await jsonRequest(baseUrl, "/api/radar/run", {
+    method: "POST",
+    body: JSON.stringify({ prompt: "检索测试方向论文", count: 1 }),
+  });
+  assert.equal(radar.response.status, 400);
+  assert.equal(radar.body.error.code, "WEB_SEARCH_UNSUPPORTED");
+  assert.match(radar.body.error.details.action, /文献雷达.*切换/u);
+  assert.equal(calls.length, 1, "不支持联网检索时不得发出搜索请求");
+
+  const state = await jsonRequest(baseUrl, "/api/radar");
+  assert.equal(state.response.status, 200);
+  assert.deepEqual(state.body.pending, []);
+  assert.equal(state.body.counts.library, 0);
+  assert.equal(state.body.counts.added, 0);
+  assert.equal(state.body.settings.prompt, "检索测试方向论文", "保留已填写的雷达条件以便切换服务后重试");
+  const library = await jsonRequest(baseUrl, "/api/library");
+  assert.deepEqual(library.body.papers, []);
+  const trace = await jsonRequest(baseUrl, "/api/radar/ai-trace");
+  assert.equal(trace.body.trace.status, "failed");
+  assert.equal(trace.body.trace.exchanges.length, 1);
+  assert.equal(trace.body.trace.exchanges[0].response, "");
+  assert.match(trace.body.trace.errorMessage, /没有内建联网检索/u);
 });

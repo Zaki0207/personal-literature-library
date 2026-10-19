@@ -143,6 +143,16 @@ background archive. HTML login pages, error pages, and files larger than 200 MiB
 are rejected rather than saved as PDFs. The editor also supports retrying,
 manual PDF import, and removal of the local copy.
 
+On desktop, dropping PDFs or choosing **File → Import PDF** opens a local document
+draft. Blog posts, tutorials, lecture notes, and other non-paper PDFs can be saved
+with just a title in any language; source/site, institution, author, publication,
+category, link, and personal-note fields are optional and editable before saving.
+Notes are saved with the initial record and are available in the PDF reader.
+This path does not require AI or academic identifiers. Multiple files
+are confirmed one at a time. Optional paper recognition remains available for
+academic material. Saving checks normalized titles and recorded identifiers;
+the stored PDF SHA-256 is not used for cross-record file deduplication.
+
 PDF and publisher ePDF links can be passed directly to the AI as research clues.
 The model looks for a matching paper page or accessible copy; successful identification
 is not guaranteed for inaccessible files. Intake does not itself download or parse a
@@ -166,6 +176,13 @@ Personal library exports and local seed data are intentionally ignored by Git. P
 | `npm run start` | Start the built web application. |
 | `npm run lint` | Run ESLint. |
 | `npm test` | Build the project and run the test suite. |
+| `npm run desktop:dev` | Start the macOS desktop development app. |
+| `npm run desktop:package` | Build the Apple Silicon application and DMG. |
+| `npm run desktop:update` | Build and verify the packaged app, quit the old app normally, install it to Applications, and start the new version. |
+| `npm run desktop:install` | Install and start an already verified local package. |
+| `npm run desktop:smoke` | Check the desktop app using an isolated temporary library. |
+
+Local desktop updates respect the existing save-before-quit checks. An unsaved draft or failed save prevents replacement. The installer verifies a staged copy and retains the previous application until the new process and authenticated local service are ready. Failed replacement or startup attempts restore the old copy when it can be done safely. This workflow delivers local development updates; it does not poll an Internet update server. See the [macOS user guide](docs/macos-user-guide.md).
 
 ## Project Structure
 

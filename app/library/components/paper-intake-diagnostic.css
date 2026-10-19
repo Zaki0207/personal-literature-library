@@ -1,0 +1,34 @@
+.paper-intake-diagnostic {
+  min-width: 0;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid #dfe4ed;
+  border-radius: 10px;
+  background: #f7f9fc;
+  color: #46536a;
+  font-size: 13px;
+}
+
+.paper-intake-diagnostic summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.paper-intake-diagnostic summary:focus-visible {
+  outline: 2px solid #506bd8;
+  outline-offset: 4px;
+}
+
+.paper-intake-diagnostic p {
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+
+.paper-intake-diagnostic pre {
+  max-height: min(280px, 35vh);
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+}

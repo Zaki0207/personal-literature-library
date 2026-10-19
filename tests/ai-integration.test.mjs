@@ -11,7 +11,103 @@ import {
   MemoryCredentialStore,
 } from "../scripts/ai/credential-store.mjs";
 import { createAiService } from "../scripts/ai/ai-service.mjs";
+import { OpenAiProvider } from "../scripts/ai/providers.mjs";
 import { createLibraryApi } from "../scripts/library-api.mjs";
+
+const phaseTestRequest = {
+  apiKey: "mock-phase-test-key",
+  model: "mock-research-model",
+  input: "https://jna-358.github.io/gaussians_on_fire/",
+  baseUrl: "https://mock-gateway.example/v1",
+  webSearch: true,
+};
+
+function phaseMessage(id, phase, ...parts) {
+  return {
+    id, type: "message", role: "assistant", status: "completed",
+    ...(phase !== undefined ? { phase } : {}),
+    content: parts.map((text) => ({ type: "output_text", text })),
+  };
+}
+
+function completedPhaseResponse(output) {
+  return { status: "completed", model: phaseTestRequest.model, output };
+}
+
+function mockResponsesTransport(payload, streamed) {
+  return streamed
+    ? new Response("data: " + JSON.stringify({ type: "response.completed", response: payload }) + "\n\n", {
+      headers: { "Content-Type": "text/event-stream" },
+    })
+    : new Response(JSON.stringify(payload), { headers: { "Content-Type": "application/json" } });
+}
+
+test("Responses 优先最后一个明确最终答复，不拼接检索说明和先前占位结果", async () => {
+  const finalText = JSON.stringify({ status: "ready", paper: { title: "Mock project paper" }, sources: [] });
+  const output = [
+    phaseMessage("old-final", "final_answer", '{"status":"ready"}'),
+    phaseMessage("commentary", "commentary", "检索计划：{项目主页，论文链接"),
+    phaseMessage("final", "final_answer", finalText.slice(0, 20), finalText.slice(20)),
+    phaseMessage("trailing-commentary", "commentary", "补查完成。"),
+  ];
+  for (const streamed of [false, true]) {
+    let calls = 0;
+    const provider = new OpenAiProvider({ fetchImpl: async () => {
+      calls += 1;
+      return mockResponsesTransport(completedPhaseResponse(output), streamed);
+    } });
+    assert.equal((await provider.generateText(phaseTestRequest)).text, finalText);
+    assert.equal(calls, 1);
+  }
+});
+
+test("旧 Responses 网关无 phase 时保留消息边界，并排除明确 commentary", async () => {
+  const output = [
+    phaseMessage("commentary", "commentary", "前导检索说明：{未闭合"),
+    phaseMessage("first", undefined, "第一条", "消息"),
+    { type: "reasoning", content: [{ type: "output_text", text: "不能当最终正文" }] },
+    phaseMessage("second", undefined, "第二条消息"),
+  ];
+  for (const streamed of [false, true]) {
+    const provider = new OpenAiProvider({ fetchImpl: async () => mockResponsesTransport(completedPhaseResponse(output), streamed) });
+    assert.equal((await provider.generateText(phaseTestRequest)).text, "第一条消息\n第二条消息");
+  }
+});
+
+test("只有 commentary 或空 final_answer 时不回退为检索说明或旧消息", async () => {
+  const commentary = phaseMessage("commentary", "commentary", '{"status":"ready","paper":{"title":"不能保存的检索说明"}}');
+  for (const output of [
+    [commentary],
+    [commentary, phaseMessage("empty-final", "final_answer", "")],
+    [phaseMessage("legacy", undefined, "旧正文"), commentary, phaseMessage("empty-final", "final_answer")],
+    [phaseMessage("prior-final", "final_answer", "旧最终正文"), phaseMessage("empty-final", "final_answer", "")],
+  ]) {
+    for (const streamed of [false, true]) {
+      const provider = new OpenAiProvider({ fetchImpl: async () => mockResponsesTransport(completedPhaseResponse(output), streamed) });
+      assert.equal((await provider.generateText(phaseTestRequest)).text, "");
+    }
+  }
+});
+
+test("SSE 完成事件省略 output 时，从已完成条目恢复最终答复并遵守 phase", async () => {
+  const finalText = '{"status":"ready","paper":{"title":"Mock completed item paper"}}';
+  const items = [
+    phaseMessage("commentary", "commentary", "检索过程：{未闭合"),
+    phaseMessage("final", "final_answer", finalText),
+  ];
+  for (const output of [undefined, []]) {
+    const terminalResponse = { status: "completed", model: phaseTestRequest.model, ...(output ? { output } : {}) };
+    const events = [
+      ...items.map((item) => ({ type: "response.output_item.done", item })),
+      { type: "response.completed", response: terminalResponse },
+    ];
+    const provider = new OpenAiProvider({ fetchImpl: async () => new Response(
+      events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join(""),
+      { headers: { "Content-Type": "text/event-stream" } },
+    ) });
+    assert.equal((await provider.generateText(phaseTestRequest)).text, finalText);
+  }
+});
 
 async function makeAiFixture(t, name, { aiFetch, credentialStore } = {}) {
   const directory = await mkdtemp(join(tmpdir(), `library-ai-${name}-`));
@@ -84,6 +180,50 @@ function chatSuccess(model) {
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 }
+
+test("研究能力沿用当前与指定模型解析，仅对 DeepSeek 官方主机改为读取网页", async (t) => {
+  const calls = [];
+  const fixture = await makeAiFixture(t, "research-capabilities", {
+    aiFetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      calls.push({ url: String(url), body });
+      return responsesSuccess(body.model);
+    },
+  });
+  await assert.rejects(fixture.api.aiService.getResearchCapabilities(), { code: "AI_NOT_CONFIGURED" });
+  const official = await fixture.api.aiService.verifyAndSave(null, {
+    baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash", apiKey: "mock-official-key",
+  });
+  const officialModelId = official.verification.modelId;
+  const gateway = await fixture.api.aiService.verifyAndSave(null, {
+    baseUrl: "https://deepseek-compatible.example/v1", model: "deepseek-v4-flash", apiKey: "mock-gateway-key",
+    makeActive: true,
+  });
+  const gatewayModelId = gateway.verification.modelId;
+  const callCount = calls.length;
+  assert.deepEqual(await fixture.api.aiService.getResearchCapabilities(), { mode: "hosted_search", modelId: gatewayModelId });
+  assert.deepEqual(await fixture.api.aiService.getResearchCapabilities({ modelId: officialModelId }), { mode: "linked_pages", modelId: officialModelId });
+  await fixture.api.aiService.setActiveModel(officialModelId);
+  assert.deepEqual(await fixture.api.aiService.getResearchCapabilities(), { mode: "linked_pages", modelId: officialModelId });
+  assert.deepEqual(await fixture.api.aiService.getResearchCapabilities({ modelId: gatewayModelId }), { mode: "hosted_search", modelId: gatewayModelId });
+  await assert.rejects(fixture.api.aiService.getResearchCapabilities({ modelId: "missing-model" }), { code: "AI_NOT_CONFIGURED" });
+  await assert.rejects(fixture.api.aiService.getResearchCapabilities({ modelId: "invalid id" }), { code: "VALIDATION_ERROR" });
+  assert.equal(calls.length, callCount, "能力判断不产生验证或生成 HTTP 请求");
+  await assert.rejects(fixture.api.aiService.generateText({ input: "搜索论文", webSearch: true }), { code: "WEB_SEARCH_UNSUPPORTED" });
+  assert.equal(calls.length, callCount);
+
+  const instructions = "Use only supplied sources and return complete JSON.";
+  const responseFormat = { type: "json_schema", name: "paper_intake", strict: true, schema: { type: "object" } };
+  await fixture.api.aiService.generateText({ input: "Project page source text", modelId: officialModelId, instructions, responseFormat });
+  assert.equal(calls.at(-1).url, "https://api.deepseek.com/responses");
+  assert.equal(calls.at(-1).body.instructions, instructions);
+  assert.deepEqual(calls.at(-1).body.text, { format: responseFormat });
+  assert.equal("tools" in calls.at(-1).body, false);
+  await fixture.api.aiService.generateText({ input: "Search through the gateway", modelId: gatewayModelId, webSearch: true });
+  assert.equal(calls.at(-1).url, "https://deepseek-compatible.example/v1/responses");
+  assert.deepEqual(calls.at(-1).body.tools, [{ type: "web_search" }]);
+  assert.equal((await fixture.api.aiService.getSettings()).activeModelId, officialModelId, "指定模型请求不改变活动模型");
+});
 
 test("服务连接共享钥匙串密钥，并可添加和切换多个模型", async (t) => {
   const calls = [];

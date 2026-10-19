@@ -1,0 +1,67 @@
+html[data-desktop="true"] { color-scheme: light dark; }
+html[data-desktop="true"] body { background: light-dark(#f4f5f3, #202522); color: light-dark(#182d25, #e2eae4); }
+html[data-desktop="true"] .library-app {
+  --card: light-dark(#fff, #29312c);
+  --canvas: light-dark(#f4f5f3, #202522);
+  --line: light-dark(#dde5df, #424d45);
+  --line-strong: light-dark(#b7cabc, #738778);
+  --ink: light-dark(#1d4033, #d7eadb);
+  --ink-soft: light-dark(#e8f1eb, #354b3c);
+  --muted: light-dark(#62756a, #b3c0b7);
+  --faint: light-dark(#84968a, #9aaba0);
+  --success-soft: light-dark(#e6f2eb, #334b3b);
+  --note: light-dark(#eee7d8, #48412f);
+  --note-strong: light-dark(#79643b, #ddc792);
+  --shadow: none;
+  color: var(--ink);
+}
+html[data-desktop="true"] .sidebar { background: light-dark(#edf2ee, #242d27); border-color: var(--line); padding-top: 24px; }
+html[data-desktop="true"] .main-content {
+  padding-top: 0;
+  container: library-main / inline-size;
+}
+html[data-desktop="true"] .topbar {
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+  background: var(--canvas);
+}
+html[data-desktop="true"] .search-box { min-width: 0; }
+html[data-desktop="true"] .sort-control { display: block; }
+html[data-desktop="true"] .paper-card-top { flex-wrap: wrap; align-items: flex-start; }
+html[data-desktop="true"] .paper-badges { min-width: 0; max-width: 100%; }
+html[data-desktop="true"] .category-path { max-width: 100%; white-space: normal; }
+html[data-desktop="true"] .paper-top-actions { max-width: 100%; flex-wrap: wrap; margin-left: auto; }
+html[data-desktop="true"] .paper-source { white-space: normal; overflow-wrap: anywhere; }
+html[data-desktop="true"] .paper-card-footer { flex-wrap: wrap; }
+html[data-desktop="true"] .resource-grid { display: flex; flex-wrap: wrap; min-width: 0; }
+html[data-desktop="true"] .ai-connection-editor { container: ai-editor / inline-size; }
+html[data-desktop="true"] .ai-field,
+html[data-desktop="true"] .ai-field input { min-width: 0; }
+
+@container ai-editor (max-width: 480px) {
+  html[data-desktop="true"] .ai-service-fields { grid-template-columns: minmax(0, 1fr); }
+  html[data-desktop="true"] .ai-model-row { grid-template-columns: minmax(0, 1fr); }
+  html[data-desktop="true"] .ai-model-actions { justify-content: flex-start; }
+}
+
+/* Use the library pane's width: the sidebar changes it independently of the window. */
+@container library-main (max-width: 820px) {
+  html[data-desktop="true"] .topbar { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+  html[data-desktop="true"] .mobile-menu-button { grid-column: 1; grid-row: 1; }
+  html[data-desktop="true"] .search-box { grid-column: 2 / -1; grid-row: 1; }
+  html[data-desktop="true"] .filter-anchor { grid-column: 1; grid-row: 2; }
+  html[data-desktop="true"] .sort-control { grid-column: 2; grid-row: 2; }
+  html[data-desktop="true"] .ai-settings-button { grid-column: 3; grid-row: 2; }
+  html[data-desktop="true"] .topbar > .primary-button { grid-column: 4; grid-row: 2; }
+  html[data-desktop="true"] .filter-popover { left: 0; right: auto; }
+}
+html[data-desktop="true"] :is(.modal,.edit-drawer,.paper-preview-dialog,.ai-settings-dialog,.category-manager-dialog,.filter-popover,.card-menu,.text-size-popover) { background: var(--card); color: var(--ink); }
+html[data-desktop="true"] :is(input,textarea,select) { color: var(--ink); background: var(--card); }
+html[data-desktop="true"] .paper-title-block :is(h2,.chinese-title),
+html[data-desktop="true"] :is(.summary-row,.note-row) p { color: var(--ink); }
+html[data-desktop="true"] .note-row { background: light-dark(#faf7ef,#343127); }
+html[data-desktop="true"] .category-path { background: var(--ink-soft); color: var(--ink); border-color: var(--line); }
+html[data-desktop="true"] .paper-card { border-radius: 12px; }
+html[data-desktop="true"] .paper-card:hover { transform: none; box-shadow: none; }
+html[data-desktop="true"] .resource-slot.is-available { color: var(--ink); background: var(--success-soft); border-color: var(--line); }
+html[data-desktop="true"] .resource-slot.is-missing { background: var(--canvas); }
+html[data-desktop="true"] .brand-name { color: var(--ink); }

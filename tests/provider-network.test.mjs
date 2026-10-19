@@ -355,3 +355,87 @@ test("原生 DeepSeek 不会尝试执行不支持的联网请求", async () => {
   await assert.rejects(provider.generateText({ ...requestInput, model: "deepseek-v4-pro" }), { code: "WEB_SEARCH_UNSUPPORTED" });
   assert.equal(calls, 0);
 });
+
+test("DeepSeek 官方 Responses 在 HTTP 前拒绝联网工具，不按模型名称限制兼容网关", async () => {
+  const calls = [];
+  const provider = new OpenAiProvider({ fetchImpl: async (url, init) => {
+    calls.push({ url: String(url), body: JSON.parse(init.body) });
+    return jsonResponse();
+  } });
+  for (const baseUrl of ["https://api.deepseek.com", "https://API.DEEPSEEK.COM/v1/"]) {
+    await assert.rejects(provider.generateText({ ...requestInput, baseUrl, model: "other-model" }), (error) => {
+      assert.equal(error.code, "WEB_SEARCH_UNSUPPORTED");
+      assert.equal(error.details.retryable, false);
+      assert.match(error.message, /DeepSeek.*项目.*DOI.*arXiv.*雷达/u);
+      return true;
+    });
+  }
+  assert.equal(calls.length, 0);
+  await provider.generateText({ ...requestInput, model: "deepseek-v4-flash" });
+  await provider.generateText({ ...requestInput, baseUrl: "https://api.deepseek.com.gateway.example/v1", model: "deepseek-v4-flash" });
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((call) => call.body.tools?.[0]?.type === "web_search"));
+});
+
+test("读取网页模式使用 Responses 系统指令和 JSON Schema，完全不发送联网工具参数", async () => {
+  let received;
+  const instructions = "Only use the supplied research sources and return the required JSON.";
+  const responseFormat = {
+    type: "json_schema", name: "paper_intake", strict: true,
+    schema: { type: "object", properties: { status: { type: "string" } }, required: ["status"], additionalProperties: false },
+  };
+  const provider = new OpenAiProvider({ fetchImpl: async (url, init) => {
+    received = { url: String(url), body: JSON.parse(init.body) };
+    return jsonResponse();
+  } });
+  const result = await provider.generateText({
+    ...requestInput, baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash",
+    input: "Untrusted project page contents", webSearch: false, instructions, responseFormat,
+  });
+  assert.equal(received.url, "https://api.deepseek.com/responses");
+  assert.equal(received.body.instructions, instructions);
+  assert.deepEqual(received.body.text, { format: responseFormat });
+  assert.equal(received.body.input, "Untrusted project page contents");
+  for (const field of ["tools", "tool_choice", "include"]) assert.equal(field in received.body, false);
+  assert.equal(result.webSearchUsed, false);
+});
+
+test("服务仅返回未执行工具或伪工具文字时明确拒绝，不执行它们也不自动重新请求", async () => {
+  const capturedToolText = '<|tool_calls|>{"name":"web.run","arguments":{"url":"https://jna-358.github.io/gaussians_on_fire/"}}</|tool_calls|>';
+  for (const output of [
+    [{ type: "function_call", name: "web.run", arguments: '{"search_query":[]}', call_id: "call_mock" }],
+    [{ type: "custom_tool_call", name: "browser", input: "open project page", call_id: "call_mock" }],
+    [{ type: "message", phase: "final_answer", content: [{ type: "output_text", text: capturedToolText }] }],
+  ]) {
+    for (const streamed of [false, true]) {
+      let calls = 0;
+      const payload = { status: "completed", model: "deepseek-v4-flash", output };
+      const provider = new OpenAiProvider({ fetchImpl: async () => {
+        calls += 1;
+        return streamed ? eventResponse({ type: "response.completed", response: payload }) : jsonResponse(payload);
+      } });
+      await assert.rejects(provider.generateText({ ...requestInput, model: "deepseek-v4-flash" }), (error) => {
+        assert.equal(error.code, "AI_TOOL_NOT_EXECUTED");
+        assert.equal(error.details.retryable, false);
+        assert.match(error.message, /尚未执行的工具调用/u);
+        assert.equal(JSON.stringify(error).includes("jna-358"), false);
+        return true;
+      });
+      assert.equal(calls, 1);
+    }
+  }
+});
+
+test("已执行托管检索与最终答复不会被之前的工具说明误拦截", async () => {
+  const provider = new OpenAiProvider({ fetchImpl: async () => jsonResponse({
+    status: "completed", model: "test-model", output: [
+      { type: "function_call", name: "previous_tool", arguments: "{}" },
+      { type: "message", phase: "commentary", content: [{ type: "output_text", text: "<|tool_calls|>previous_tool {}" }] },
+      { type: "web_search_call", status: "completed", action: { type: "search", sources: [] } },
+      { type: "message", phase: "final_answer", content: [{ type: "output_text", text: '{"status":"ready"}' }] },
+    ],
+  }) });
+  const result = await provider.generateText(requestInput);
+  assert.equal(result.text, '{"status":"ready"}');
+  assert.equal(result.webSearchUsed, true);
+});

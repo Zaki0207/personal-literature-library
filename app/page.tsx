@@ -8,10 +8,14 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  lazy,
+  Suspense,
 } from "react";
+import type { DesktopCommand, DesktopPdfGrant } from "../desktop/shared/bridge";
 import {
   comparePaperSearchMatches,
   matchPaperSearch,
@@ -56,9 +60,11 @@ import type {
   RadarPromptTemplateResponse,
   RadarStateResponse,
 } from "./library/contracts";
-import { libraryRequest, pdfOpenUrl } from "./library/api-client";
+import { ApiRequestError, libraryRequest, pdfOpenUrl, type PaperIntakeDiagnostic as IntakeDiagnostic } from "./library/api-client";
 import { RadarSurface } from "./library/components/radar-surface";
 import { PaperIntakeSources } from "./library/components/paper-intake-sources";
+import { PaperIntakePromptEditor } from "./library/components/paper-intake-prompt-editor";
+import { PaperIntakeDiagnostic } from "./library/components/paper-intake-diagnostic";
 import {
   AI_REASONING_EFFORT_LABELS,
   cardTextSizeLabels,
@@ -87,8 +93,21 @@ import {
 const initialPapers: Paper[] = [];
 const initialCategories: Category[] = [];
 const initialCategoryRecords: CategoryRecord[] = [];
+const PdfReader = lazy(() => import("./library/components/pdf-reader").then((module) => ({ default: module.PdfReader })));
+
+function emptyIntakeDraft(title = ""): PaperIntakeDraft {
+  return { title, zhTitle: "", authors: "", institution: "", source: "", date: "", aiSummary: "", note: "", categoryIds: [], originalUrl: "", pdfUrl: "", hasPdf: false, codeUrl: "", codeProvider: "", projectUrl: "", projectProvider: "", identifiers: [] };
+}
 
 export default function Home() {
+  const [readingPaperId, setReadingPaperId] = useState<string | null>(null);
+  const [pendingPdfGrants, setPendingPdfGrants] = useState<DesktopPdfGrant[]>([]);
+  const [desktopDataOpen, setDesktopDataOpen] = useState(false);
+  const [desktopDropBusy, setDesktopDropBusy] = useState(false);
+  const desktopCommandRef = useRef<(command: DesktopCommand) => void>(() => {});
+  const libraryScrollRef = useRef(0);
+  const libraryReaderTriggerRef = useRef<HTMLElement | null>(null);
+  const libraryReturnPaperRef = useRef<string | null>(null);
   const [papers, setPapers] = useState(initialPapers);
   const [categories, setCategories] = useState(initialCategories);
   const [activeSurface, setActiveSurface] = useState<"library" | "radar">(
@@ -144,10 +163,13 @@ export default function Home() {
   const [paperIntakeDraft, setPaperIntakeDraft] =
     useState<PaperIntakeDraft | null>(null);
   const [paperIntakeBusy, setPaperIntakeBusy] = useState(false);
+  const [paperIntakePromptDirty, setPaperIntakePromptDirty] = useState(false);
+  const [paperIntakePromptBusy, setPaperIntakePromptBusy] = useState(false);
   const [paperDuplicateBusyId, setPaperDuplicateBusyId] = useState<string | null>(
     null,
   );
   const [paperIntakeError, setPaperIntakeError] = useState("");
+  const [paperIntakeDiagnostic, setPaperIntakeDiagnostic] = useState<IntakeDiagnostic | null>(null);
   const [aiSettingsOpen, setAiSettingsOpen] = useState(false);
   const [aiSettings, setAiSettings] = useState<AiSettingsResponse | null>(
     null,
@@ -238,7 +260,12 @@ export default function Home() {
   const modalTriggerRef = useRef<HTMLElement | null>(null);
   const modalWasOpenRef = useRef(false);
   const addingPaperRef = useRef(false);
+  const manualPdfDraftRef = useRef<PaperIntakeDraft | null>(null);
+  const localPdfDraft = Boolean(
+    pendingPdfGrants.length && paperIntakeDraft && paperIntakeResult?.status !== "ready",
+  );
   const modalOpen =
+    desktopDataOpen ||
     addPaperOpen ||
     aiSettingsOpen ||
     categoryManagerOpen ||
@@ -261,6 +288,18 @@ export default function Home() {
   const titlePreviewPaper = titlePreviewPaperId
     ? papers.find((paper) => paper.id === titlePreviewPaperId) ?? null
     : null;
+  const readingPaper = readingPaperId ? papers.find((paper) => paper.id === readingPaperId) ?? null : null;
+
+  useLayoutEffect(() => {
+    const paperId = libraryReturnPaperRef.current;
+    if (readingPaperId || !paperId) return;
+    libraryReturnPaperRef.current = null;
+    window.scrollTo({ top: libraryScrollRef.current, behavior: "instant" });
+    const trigger = libraryReaderTriggerRef.current?.isConnected
+      ? libraryReaderTriggerRef.current
+      : document.querySelector<HTMLElement>(`[data-title-paper="${paperId}"]`) ?? searchRef.current;
+    trigger?.focus({ preventScroll: true });
+  }, [readingPaperId]);
   const editDirty = Boolean(
     editDraft && JSON.stringify(editDraft) !== editBaseline,
   );
@@ -290,19 +329,24 @@ export default function Home() {
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      if (!readingPaper && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         searchRef.current?.focus();
       }
 
       if (event.key === "Escape") {
+        setDesktopDataOpen(false);
         setFiltersOpen(false);
         setTextSizeOpen(false);
         setOpenMenu(null);
         setTitlePreviewPaperId(null);
-        if (!paperIntakeBusy && !addingPaper) {
-          setAddPaperOpen(false);
-          setRadarIntakeItem(null);
+        if (!paperIntakeBusy && !addingPaper && !paperIntakePromptBusy) {
+          if (paperIntakePromptDirty) {
+            setToast("提示词尚未保存，请先保存或取消修改。");
+          } else {
+            setAddPaperOpen(false);
+            setRadarIntakeItem(null);
+          }
         }
         if (!aiBusyAction) setAiSettingsOpen(false);
         setMobileNavOpen(false);
@@ -311,7 +355,7 @@ export default function Home() {
 
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [addingPaper, aiBusyAction, paperIntakeBusy]);
+  }, [addingPaper, aiBusyAction, paperIntakeBusy, paperIntakePromptBusy, paperIntakePromptDirty, readingPaper]);
 
   useEffect(() => {
     let cancelled = false;
@@ -499,16 +543,6 @@ export default function Home() {
       document.body.style.overflow = previousOverflow;
     };
   }, [modalOpen]);
-
-  useEffect(() => {
-    if (!editDirty && !categoryManagerDirty) return;
-    const preventUnload = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", preventUnload);
-    return () => window.removeEventListener("beforeunload", preventUnload);
-  }, [categoryManagerDirty, editDirty]);
 
   const flattenedCategories = useMemo(
     () => flattenCategoryTree(categories),
@@ -1095,7 +1129,12 @@ export default function Home() {
 
   const analyzePaperReference = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (paperIntakeBusy || !paperReference.trim()) return;
+    if (paperIntakeBusy || paperIntakePromptBusy || !paperReference.trim()) return;
+    setPaperIntakeDiagnostic(null);
+    if (paperIntakePromptDirty) {
+      setPaperIntakeError("请先保存或取消提示词修改，再交给 AI 整理。");
+      return;
+    }
     if (libraryConnection !== "ready") {
       setPaperIntakeError("本机数据库未连接，暂时无法分析论文。");
       return;
@@ -1117,6 +1156,7 @@ export default function Home() {
       if (response.status === "ready") {
         setPaperIntakeDraft({
           ...response.draft,
+          note: manualPdfDraftRef.current?.note ?? "",
           categoryIds: ensureCategoryAncestors(response.draft.categoryIds),
           codeUrl: response.draft.codeUrl ?? "",
           codeProvider: response.draft.codeProvider ?? "",
@@ -1128,6 +1168,7 @@ export default function Home() {
       setPaperIntakeError(
         error instanceof Error ? error.message : "论文分析失败，请重试。",
       );
+      setPaperIntakeDiagnostic(error instanceof ApiRequestError ? error.details?.intakeDiagnostic ?? null : null);
     } finally {
       setPaperIntakeBusy(false);
     }
@@ -1146,6 +1187,11 @@ export default function Home() {
     duplicate: PaperDuplicateMatch["paper"],
   ) => {
     if (paperDuplicateBusyId) return;
+    setPaperIntakeDiagnostic(null);
+    if (paperIntakePromptDirty || paperIntakePromptBusy) {
+      setPaperIntakeError("请先保存或取消提示词修改，再查看已有论文。");
+      return;
+    }
     if (duplicate.deletedAt) {
       setPaperDuplicateBusyId(duplicate.id);
       setPaperIntakeError("");
@@ -1184,13 +1230,18 @@ export default function Home() {
   const addPaper = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (addingPaperRef.current) return;
+    setPaperIntakeDiagnostic(null);
+    if (paperIntakePromptDirty || paperIntakePromptBusy) {
+      setPaperIntakeError("请先保存或取消提示词修改，再确认添加。");
+      return;
+    }
     if (libraryConnection !== "ready") {
       setToast("本机数据库未连接，暂时无法添加论文");
       return;
     }
 
     if (!paperIntakeDraft?.title.trim()) {
-      setPaperIntakeError("英文标题不能为空。");
+      setPaperIntakeError("标题不能为空。");
       return;
     }
 
@@ -1203,10 +1254,12 @@ export default function Home() {
       date: paperIntakeDraft.date.trim(),
       dateAdded: new Date().toISOString(),
       aiSummary: paperIntakeDraft.aiSummary.trim(),
+      note: paperIntakeDraft.note.trim(),
+      noteCount: paperIntakeDraft.note.trim() ? 1 : 0,
       categoryIds: paperIntakeDraft.categoryIds,
       favorite: false,
       watchLater: false,
-      hasPdf: Boolean(paperIntakeDraft.hasPdf && paperIntakeDraft.pdfUrl),
+      hasPdf: Boolean(pendingPdfGrants.length || (paperIntakeDraft.hasPdf && paperIntakeDraft.pdfUrl)),
       pdfUrl:
         paperIntakeDraft.hasPdf && paperIntakeDraft.pdfUrl.trim()
           ? paperIntakeDraft.pdfUrl.trim()
@@ -1247,15 +1300,34 @@ export default function Home() {
         );
         setPapers((current) => [response.paper, ...current]);
         applyBackupStatus(response.backup);
-        setToast(savedMessage("论文已添加", response.backup));
+        setToast(savedMessage(pendingPdfGrants.length ? "资料已添加" : "论文已添加", response.backup));
+        if (pendingPdfGrants[0] && window.literatureDesktop) {
+          try {
+            const imported = await window.literatureDesktop.importPdf(response.paper.id, pendingPdfGrants[0].id) as PaperMutationResponse;
+            replacePaper(imported.paper);
+            applyBackupStatus(imported.backup);
+            setToast(savedMessage("资料与本地 PDF 已收集", imported.backup));
+          } catch (error) {
+            setToast(`资料已保存；PDF 导入失败：${error instanceof Error ? error.message : "请在编辑页重新选择文件"}`);
+          }
+        }
       }
       setAddPaperOpen(false);
       setRadarIntakeItem(null);
       setPaperReference("");
       setPaperIntakeResult(null);
       setPaperIntakeDraft(null);
+      manualPdfDraftRef.current = null;
       setPaperIntakeError("");
+      setPaperIntakeDiagnostic(null);
       setActiveScope("all");
+      const remainingFiles = pendingPdfGrants.slice(1);
+      setPendingPdfGrants(remainingFiles);
+      if (remainingFiles[0]) {
+        setPaperReference(remainingFiles[0].name.replace(/\.pdf$/i, ""));
+        setPaperIntakeDraft(emptyIntakeDraft(remainingFiles[0].name.replace(/\.pdf$/i, "")));
+        setAddPaperOpen(true);
+      }
     } catch (error) {
       setPaperIntakeError(
         error instanceof Error ? error.message : "添加失败，请重试。",
@@ -1483,12 +1555,15 @@ export default function Home() {
 
     modalTriggerRef.current = document.activeElement as HTMLElement;
     setRadarError("");
+    manualPdfDraftRef.current = null;
+    setPendingPdfGrants([]);
     setRadarIntakeItem(item);
     setPaperReference(reference);
     setPaperIntakeResult(null);
     setPaperIntakeDraft(null);
     setPaperDuplicateBusyId(null);
     setPaperIntakeError("");
+    setPaperIntakeDiagnostic(null);
     setAddPaperOpen(true);
   };
 
@@ -2462,6 +2537,27 @@ export default function Home() {
     );
   };
 
+  const hasPendingChanges = Boolean(
+    (editingPaper && editDirty) ||
+    (categoryManagerOpen && categoryManagerDirty) ||
+    (aiSettingsOpen && hasUnsavedAiSettings()) ||
+    savingPaper || categoryActionBusy || aiBusyAction || paperIntakeBusy || paperIntakePromptBusy || addingPaper || desktopDropBusy ||
+    (addPaperOpen && paperIntakePromptDirty) ||
+    (addPaperOpen && Boolean(paperReference.trim() || paperIntakeDraft)) ||
+    (radarPromptEditorOpen && radarPromptTemplateDirty),
+  );
+
+  useEffect(() => {
+    if (!hasPendingChanges) return;
+    const preventUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+      setToast("请先保存或关闭当前编辑。");
+    };
+    window.addEventListener("beforeunload", preventUnload);
+    return () => window.removeEventListener("beforeunload", preventUnload);
+  }, [hasPendingChanges]);
+
   const loadAiSettings = async () => {
     setAiSettingsLoading(true);
     setAiInlineError(null);
@@ -2720,14 +2816,124 @@ export default function Home() {
 
   const openAddPaperModal = () => {
     modalTriggerRef.current = document.activeElement as HTMLElement;
+    manualPdfDraftRef.current = null;
     setRadarIntakeItem(null);
     setPaperReference("");
     setPaperIntakeResult(null);
     setPaperIntakeDraft(null);
     setPaperDuplicateBusyId(null);
     setPaperIntakeError("");
+    setPaperIntakeDiagnostic(null);
+    setPaperIntakePromptDirty(false);
+    setPaperIntakePromptBusy(false);
+    setPendingPdfGrants([]);
     setAddPaperOpen(true);
   };
+
+  const requestCloseAddPaperModal = () => {
+    if (paperIntakeBusy || addingPaper || paperIntakePromptBusy) return;
+    if (paperIntakePromptDirty) {
+      setToast("提示词尚未保存，请先保存或取消修改。");
+      return;
+    }
+    setAddPaperOpen(false);
+    setRadarIntakeItem(null);
+  };
+
+  const acceptPdfGrants = async (files: DesktopPdfGrant[]) => {
+    if (!files.length) return;
+    if (readingPaper) {
+      setToast("请先返回文献库，再导入 PDF。");
+      return;
+    }
+    if (modalOpen && !editingPaper) {
+      setToast("请先完成或关闭当前编辑，再导入 PDF。");
+      return;
+    }
+    if (editingPaper) {
+      try {
+        const imported = await window.literatureDesktop!.importPdf(editingPaper.id, files[0].id) as PaperMutationResponse;
+        replacePaper(imported.paper);
+        applyBackupStatus(imported.backup);
+        setToast(savedMessage("PDF 已导入到当前论文", imported.backup));
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "导入 PDF 失败");
+      }
+      return;
+    }
+    openAddPaperModal();
+    setPendingPdfGrants(files);
+    setPaperReference(files[0].name.replace(/\.pdf$/i, ""));
+    setPaperIntakeDraft(emptyIntakeDraft(files[0].name.replace(/\.pdf$/i, "")));
+  };
+
+  const readPaper = (paper: Paper, trigger?: HTMLElement) => {
+    libraryScrollRef.current = window.scrollY;
+    libraryReaderTriggerRef.current = trigger ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    setTitlePreviewPaperId(null);
+    setOpenMenu(null);
+    setFiltersOpen(false);
+    setTextSizeOpen(false);
+    setReadingPaperId(paper.id);
+    window.scrollTo({ top: 0 });
+  };
+
+  const openPaperFromLibrary = (paper: Paper, trigger: HTMLButtonElement) => {
+    if (!window.literatureDesktop) {
+      openTitlePreview(paper.id, trigger);
+      return;
+    }
+    if (modalOpen) {
+      setToast("请先完成或关闭当前编辑。");
+      return;
+    }
+    if (paper.pdfArchive?.status === "ready" || safeExternalUrl(paper.pdfUrl)) {
+      readPaper(paper, trigger);
+      return;
+    }
+    openEditPaper(paper);
+    setToast("这篇论文尚未关联可阅读的 PDF，可选择本地 PDF 或补充来源链接。");
+  };
+
+  useEffect(() => {
+    desktopCommandRef.current = (command) => {
+      if (command.type === "save-before-quit") {
+        if (readingPaper) {
+          window.dispatchEvent(new CustomEvent("literature-save-before-quit", { detail: { complete: (allow = true) => window.literatureDesktop?.acknowledgeQuit(allow, command.requestId) } }));
+        } else if (hasPendingChanges) {
+          setToast("请先保存或关闭当前编辑，再退出应用。");
+          window.literatureDesktop?.acknowledgeQuit(false, command.requestId);
+        } else window.literatureDesktop?.acknowledgeQuit(true, command.requestId);
+        return;
+      }
+      if (command.type === "import-pdf") { void acceptPdfGrants(command.files); return; }
+      if (modalOpen) {
+        setToast("请先完成或关闭当前编辑。");
+        return;
+      }
+      if (command.type === "settings") {
+        if (command.section === "ai") void openAiSettings();
+        else setDesktopDataOpen(true);
+        return;
+      }
+      if (readingPaper) {
+        if (command.type === "search" || command.type === "command-search") window.dispatchEvent(new CustomEvent("literature-reader-find"));
+        return;
+      }
+      if (command.type === "add-paper") openAddPaperModal();
+      if (command.type === "radar") openLiteratureRadar();
+      if (command.type === "search" || command.type === "command-search") searchRef.current?.focus();
+      if (command.type === "view-mode") changePaperViewMode(command.mode);
+    };
+  });
+
+  useEffect(() => {
+    const bridge = window.literatureDesktop;
+    if (!bridge) return;
+    const unsubscribe = bridge.onCommand((command) => desktopCommandRef.current(command));
+    bridge.ready();
+    return unsubscribe;
+  }, []);
 
   const handleModalKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.key !== "Tab") return;
@@ -2736,7 +2942,7 @@ export default function Home() {
 
     const focusable = Array.from(
       modal.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]',
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], summary',
       ),
     ).filter(
       (element) =>
@@ -3565,11 +3771,11 @@ export default function Home() {
                   <button
                     onClick={() => {
                       navigator.clipboard?.writeText(paper.title);
-                      setToast("英文标题已复制");
+                      setToast("标题已复制");
                       setOpenMenu(null);
                     }}
                   >
-                    复制英文标题
+                    复制标题
                   </button>
                   <button
                     className="danger-menu-item"
@@ -3584,7 +3790,16 @@ export default function Home() {
         </div>
 
         <div className="paper-title-block">
-          <h2>{paper.title}</h2>
+          <h2>
+            <button
+              type="button"
+              className="paper-detail-title"
+              data-title-paper={paper.id}
+              onClick={(event) => openPaperFromLibrary(paper, event.currentTarget)}
+            >
+              {paper.title}
+            </button>
+          </h2>
           {paper.zhTitle.trim() &&
             paper.zhTitle.trim() !== paper.title.trim() && (
               <p className="chinese-title">{paper.zhTitle.trim()}</p>
@@ -3638,9 +3853,17 @@ export default function Home() {
                 href={pdfHref}
                 target="_blank"
                 rel="noopener noreferrer"
-                onClick={() => queuePdfArchive(paper)}
+                onClick={(event) => {
+                  if (!window.literatureDesktop && libraryConnection !== "ready") { queuePdfArchive(paper); return; }
+                  if (!window.literatureDesktop && (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)) { queuePdfArchive(paper); return; }
+                  event.preventDefault();
+                  readPaper(paper);
+                }}
                 onAuxClick={(event) => {
-                  if (event.button === 1) queuePdfArchive(paper);
+                  if (event.button === 1) {
+                    if (window.literatureDesktop) { event.preventDefault(); readPaper(paper); }
+                    else queuePdfArchive(paper);
+                  }
                 }}
                 aria-label={
                   pdfIsLocal
@@ -3756,7 +3979,46 @@ export default function Home() {
   };
 
   return (
-    <div className="library-app">
+    <div className={`library-app${readingPaper ? " is-reading" : ""}`}
+      onDragOver={(event) => {
+        if (window.literatureDesktop && event.dataTransfer.types.includes("Files")) event.preventDefault();
+      }}
+      onDrop={(event) => {
+        const bridge = window.literatureDesktop;
+        if (!bridge || !event.dataTransfer.files.length) return;
+        event.preventDefault();
+        if (desktopDropBusy || readingPaper) return;
+        const files = Array.from(event.dataTransfer.files).filter((file) => /\.pdf$/i.test(file.name));
+        if (!files.length) { setToast("请拖入 PDF 文件。"); return; }
+        setDesktopDropBusy(true);
+        void Promise.all(files.map((file) => bridge.grantDroppedPdf(file)))
+          .then(acceptPdfGrants)
+          .catch((error) => setToast(error instanceof Error ? error.message : "无法导入文件"))
+          .finally(() => setDesktopDropBusy(false));
+      }}
+    >
+      {readingPaper && (
+        <Suspense fallback={<div className="reader-loading" role="status">正在打开阅读器…</div>}>
+          <PdfReader paper={readingPaper} onPaperUpdated={replacePaper} onBack={() => {
+            libraryReturnPaperRef.current = readingPaper.id;
+            setReadingPaperId(null);
+          }} />
+        </Suspense>
+      )}
+      {desktopDataOpen && (
+        <div className="modal-layer">
+          <section ref={modalRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="desktop-data-title" onKeyDown={handleModalKeyDown}>
+            <div className="modal-heading"><h2 id="desktop-data-title">数据与 Codex 连接</h2><button className="modal-close" aria-label="关闭数据设置" onClick={() => setDesktopDataOpen(false)}>×</button></div>
+            <p>文献、分类和笔记保存在本机。数据库备份与 PDF 归档分别保存；数据库快照不包含 PDF。</p>
+            <div className="modal-actions">
+              {([['database', '数据库'], ['pdf', 'PDF 归档'], ['backups', '数据库备份']] as const).map(([kind, label]) => <button key={kind} className="secondary-button" onClick={() => { void window.literatureDesktop?.showDataInFinder(kind).catch(() => setToast("该目录暂时无法打开")); }}>{label} · Finder</button>)}
+            </div>
+            <h3>Codex 论文库</h3><p>启用「我的论文库」MCP 连接后，Codex 可以按需检索标题、分类、AI 总结和个人笔记。请保持应用运行；读取到的相关内容将用于当前 Codex 讨论。</p>
+            <p>讨论中选中的新论文，可复制题目或 DOI 到「添加论文」识别并确认入库。本地连接不触发应用内 AI 请求。</p>
+            <div className="modal-actions"><button className="primary-button" onClick={() => setDesktopDataOpen(false)}>完成</button></div>
+          </section>
+        </div>
+      )}
       {isMobile && mobileNavOpen && (
         <button
           className="mobile-scrim is-visible"
@@ -4230,9 +4492,8 @@ export default function Home() {
                       type="button"
                       data-title-paper={paper.id}
                       onClick={(event) =>
-                        openTitlePreview(paper.id, event.currentTarget)
+                        openPaperFromLibrary(paper, event.currentTarget)
                       }
-                      aria-haspopup="dialog"
                     >
                       {paper.title}
                     </button>
@@ -4734,7 +4995,7 @@ export default function Home() {
                 <fieldset className="edit-section">
                   <legend>基本信息</legend>
                   <label className="edit-field edit-field-wide">
-                    <span>英文标题</span>
+                    <span>标题</span>
                     <textarea
                       value={editDraft.title}
                       onChange={(event) =>
@@ -4974,6 +5235,13 @@ export default function Home() {
                           href={pdfOpenUrl(editingPaper.id)}
                           target="_blank"
                           rel="noopener noreferrer"
+                          onClick={(event) => {
+                            if (!window.literatureDesktop) return;
+                            event.preventDefault();
+                            if (editDirty || savingPaper) { setToast("请先保存或关闭当前编辑，再打开 PDF。"); return; }
+                            closeEditor();
+                            readPaper(editingPaper);
+                          }}
                         >
                           打开本地 ↗
                         </a>
@@ -5856,14 +6124,7 @@ export default function Home() {
         <div
           className="modal-layer"
           onMouseDown={(event) => {
-            if (
-              event.currentTarget === event.target &&
-              !paperIntakeBusy &&
-              !addingPaper
-            ) {
-              setAddPaperOpen(false);
-              setRadarIntakeItem(null);
-            }
+            if (event.currentTarget === event.target) requestCloseAddPaperModal();
           }}
         >
           <section
@@ -5873,35 +6134,48 @@ export default function Home() {
             }`}
             role="dialog"
             aria-modal="true"
-            aria-busy={paperIntakeBusy || addingPaper}
+            aria-busy={paperIntakeBusy || addingPaper || paperIntakePromptBusy}
             aria-labelledby="add-paper-title"
+            data-pdf-intake-mode={localPdfDraft ? "document" : undefined}
             onKeyDown={handleModalKeyDown}
           >
             <div className="modal-heading">
               <div>
                 <h2 id="add-paper-title">
-                  {radarIntakeItem ? "核对并加入论文" : "添加论文"}
+                  {radarIntakeItem ? "核对并加入论文" : pendingPdfGrants.length ? "导入 PDF 资料" : "添加论文"}
                 </h2>
                 <p>
                   {radarIntakeItem
                     ? "AI 联网核对这篇候选论文，确认信息后加入知识库。"
-                    : "给出任何论文线索，让 AI 联网查找并整理完整资料。"}
+                    : localPdfDraft
+                      ? "支持博客、教程、讲义及论文。标题可使用任意语言，其余信息选填。"
+                      : "给出任何论文线索，让 AI 联网查找并整理完整资料。"}
                 </p>
               </div>
               <button
                 className="modal-close"
-                onClick={() => {
-                  setAddPaperOpen(false);
-                  setRadarIntakeItem(null);
-                }}
+                onClick={requestCloseAddPaperModal}
                 aria-label="关闭"
-                disabled={paperIntakeBusy || addingPaper}
+                disabled={paperIntakeBusy || addingPaper || paperIntakePromptBusy}
               >
                 ×
               </button>
             </div>
 
-            <ol className="paper-intake-steps" aria-label="添加进度">
+            {(!localPdfDraft || paperIntakePromptDirty || paperIntakePromptBusy) && <PaperIntakePromptEditor
+              disabled={paperIntakeBusy || addingPaper}
+              onDirtyChange={setPaperIntakePromptDirty}
+              onBusyChange={setPaperIntakePromptBusy}
+              onSaved={(backup) => {
+                applyBackupStatus(backup);
+                setPaperIntakeDiagnostic(null);
+              }}
+            />}
+
+            {pendingPdfGrants[0] && (
+              <p className="paper-intake-hint">待归档文件：{pendingPdfGrants[0].name}{pendingPdfGrants.length > 1 ? `（共 ${pendingPdfGrants.length} 个，逐份确认）` : ""}。确认入库后保存到本机。{localPdfDraft ? "填写标题即可保存，无需 AI 识别。" : "AI 识别仅使用输入线索，不读取 PDF 内容。"}</p>
+            )}
+            {!localPdfDraft && <ol className="paper-intake-steps" aria-label="添加进度">
               <li className={!paperIntakeDraft ? "is-active" : "is-complete"}>
                 <span>1</span>
                 提供线索
@@ -5922,7 +6196,7 @@ export default function Home() {
                 <span>3</span>
                 人工确认
               </li>
-            </ol>
+            </ol>}
 
             {radarIntakeItem && (
               <div className="paper-intake-radar-context" role="status">
@@ -6045,23 +6319,27 @@ export default function Home() {
                     {paperIntakeError}
                   </p>
                 )}
+                {paperIntakeDiagnostic && <PaperIntakeDiagnostic diagnostic={paperIntakeDiagnostic} />}
 
                 <div className="modal-actions paper-intake-start-actions">
+                  <button type="button" className="secondary-button" disabled={paperIntakeBusy}
+                    onClick={() => {
+                      setPaperIntakeError("");
+                      setPaperIntakeDiagnostic(null);
+                      setPaperIntakeDraft(manualPdfDraftRef.current ?? emptyIntakeDraft(paperReference.trim()));
+                    }}>手动填写</button>
                   <button
                     type="button"
                     className="secondary-button"
-                    onClick={() => {
-                      setAddPaperOpen(false);
-                      setRadarIntakeItem(null);
-                    }}
-                    disabled={paperIntakeBusy}
+                    onClick={requestCloseAddPaperModal}
+                    disabled={paperIntakeBusy || paperIntakePromptBusy}
                   >
                     取消
                   </button>
                   <button
                     type="submit"
                     className="primary-button"
-                    disabled={paperIntakeBusy || !paperReference.trim()}
+                    disabled={paperIntakeBusy || paperIntakePromptBusy || paperIntakePromptDirty || !paperReference.trim()}
                   >
                     {paperIntakeBusy ? "AI 正在查找…" : "交给 AI 整理"}
                   </button>
@@ -6075,7 +6353,7 @@ export default function Home() {
                     <strong>
                       {paperIntakeResult?.status === "ready"
                         ? paperIntakeResult.metadata.metadataSource
-                        : "论文页面"}
+                        : localPdfDraft ? "本地 PDF 资料" : "手动填写"}
                     </strong>
                   </div>
                   {paperIntakeResult?.status === "ready" && (
@@ -6107,7 +6385,7 @@ export default function Home() {
                   )}
                   <div>
                     <span>重复检测</span>
-                    <strong className="is-safe">未发现重复</strong>
+                    <strong>{paperIntakeResult?.status === "ready" ? "已检查，保存时再次核对" : "确认保存时检查"}</strong>
                   </div>
                 </div>
 
@@ -6127,19 +6405,43 @@ export default function Home() {
                 )}
 
                 <fieldset className="paper-intake-section">
-                  <legend>发表信息</legend>
+                  <legend>{localPdfDraft ? "资料信息" : "发表信息"}</legend>
                   <label className="paper-intake-field paper-intake-field-wide">
-                    <span>英文标题</span>
+                    <span>标题</span>
                     <textarea
+                      data-intake-field="title"
                       value={paperIntakeDraft.title}
                       onChange={(event) =>
                         updatePaperIntakeDraft("title", event.target.value)
                       }
                       rows={2}
                       required
+                      autoFocus={localPdfDraft}
                     />
                   </label>
                   <div className="paper-intake-field-grid">
+                    <label className="paper-intake-field">
+                      <span>{localPdfDraft ? "来源 / 网站（选填）" : "会议 / 期刊"}</span>
+                      <input
+                        data-intake-field="source"
+                        value={paperIntakeDraft.source}
+                        onChange={(event) =>
+                          updatePaperIntakeDraft("source", event.target.value)
+                        }
+                        placeholder={localPdfDraft ? "例如博客名称、网站或出版方" : "可手动填写"}
+                      />
+                    </label>
+                    <label className="paper-intake-field">
+                      <span>机构（选填）</span>
+                      <input
+                        data-intake-field="institution"
+                        value={paperIntakeDraft.institution}
+                        onChange={(event) =>
+                          updatePaperIntakeDraft("institution", event.target.value)
+                        }
+                        placeholder="例如作者所属机构或发布单位"
+                      />
+                    </label>
                     <label className="paper-intake-field paper-intake-field-wide">
                       <span>作者</span>
                       <input
@@ -6150,7 +6452,7 @@ export default function Home() {
                       />
                     </label>
                     <label className="paper-intake-field">
-                      <span>发表日期</span>
+                      <span>{localPdfDraft ? "日期（选填）" : "发表日期"}</span>
                       <input
                         value={paperIntakeDraft.date}
                         onChange={(event) =>
@@ -6159,29 +6461,26 @@ export default function Home() {
                         placeholder="YYYY-MM-DD"
                       />
                     </label>
-                    <label className="paper-intake-field">
-                      <span>会议 / 期刊</span>
-                      <input
-                        value={paperIntakeDraft.source}
-                        onChange={(event) =>
-                          updatePaperIntakeDraft("source", event.target.value)
-                        }
-                      />
-                    </label>
-                    <label className="paper-intake-field">
-                      <span>机构</span>
-                      <input
-                        value={paperIntakeDraft.institution}
-                        onChange={(event) =>
-                          updatePaperIntakeDraft("institution", event.target.value)
-                        }
-                        placeholder="元数据未提供时可留空"
-                      />
-                    </label>
                   </div>
                 </fieldset>
 
-                <fieldset className="paper-intake-section is-ai-section">
+                <fieldset className="paper-intake-section">
+                  <legend>笔记 / 备注（选填）</legend>
+                  <label className="paper-intake-field">
+                    <span>我的笔记</span>
+                    <textarea
+                      data-intake-field="note"
+                      value={paperIntakeDraft.note}
+                      onChange={(event) =>
+                        updatePaperIntakeDraft("note", event.target.value)
+                      }
+                      rows={4}
+                      placeholder="记录阅读目的、要点或个人备注，随资料一起保存。"
+                    />
+                  </label>
+                </fieldset>
+
+                {!localPdfDraft && <fieldset className="paper-intake-section is-ai-section">
                   <legend>
                     AI 整理
                     <small>可修改</small>
@@ -6205,12 +6504,12 @@ export default function Home() {
                       rows={5}
                     />
                   </label>
-                </fieldset>
+                </fieldset>}
 
                 <fieldset className="paper-intake-section">
                   <legend>
                     分类
-                    <small>AI 只会从现有分类中推荐</small>
+                    <small>{localPdfDraft ? "选填，可在入库后调整" : "AI 只会从现有分类中推荐"}</small>
                   </legend>
                   <div className="paper-intake-categories">
                     {flattenedCategories.map((category) => {
@@ -6239,7 +6538,7 @@ export default function Home() {
                 </fieldset>
 
                 <fieldset className="paper-intake-section">
-                  <legend>论文资源</legend>
+                  <legend>{localPdfDraft ? "相关链接（选填）" : "论文资源"}</legend>
                   <label className="paper-intake-field">
                     <span>原文页面</span>
                     <input
@@ -6270,7 +6569,7 @@ export default function Home() {
                       />
                     </label>
                   )}
-                  <label className="paper-intake-field">
+                  {!localPdfDraft && <label className="paper-intake-field">
                     <span>代码仓库</span>
                     <input
                       value={paperIntakeDraft.codeUrl}
@@ -6285,8 +6584,8 @@ export default function Home() {
                           来源说明：{paperIntakeResult.metadata.codeEvidence}
                         </small>
                       )}
-                  </label>
-                  <label className="paper-intake-field">
+                  </label>}
+                  {!localPdfDraft && <label className="paper-intake-field">
                     <span>项目主页</span>
                     <input
                       value={paperIntakeDraft.projectUrl}
@@ -6301,7 +6600,7 @@ export default function Home() {
                           来源说明：{paperIntakeResult.metadata.projectEvidence}
                         </small>
                       )}
-                  </label>
+                  </label>}
                   <div className="paper-identifier-list" aria-label="用于查重的论文标识">
                     {paperIntakeDraft.identifiers
                       .filter((identifier) => identifier.kind !== "url")
@@ -6318,24 +6617,30 @@ export default function Home() {
                     {paperIntakeError}
                   </p>
                 )}
+                {paperIntakeDiagnostic && <PaperIntakeDiagnostic diagnostic={paperIntakeDiagnostic} />}
 
                 <div className="modal-actions paper-intake-review-actions">
                   <button
                     type="button"
                     className="secondary-button"
                     onClick={() => {
+                      if (pendingPdfGrants.length) {
+                        manualPdfDraftRef.current = paperIntakeDraft;
+                        setPaperReference(paperIntakeDraft.title);
+                      }
                       setPaperIntakeDraft(null);
                       setPaperIntakeResult(null);
                       setPaperIntakeError("");
+                      setPaperIntakeDiagnostic(null);
                     }}
                     disabled={addingPaper}
                   >
-                    重新识别
+                    {localPdfDraft ? "按论文识别" : "重新识别"}
                   </button>
                   <button
                     type="submit"
                     className="primary-button"
-                    disabled={addingPaper || !paperIntakeDraft.title.trim()}
+                    disabled={addingPaper || paperIntakePromptBusy || paperIntakePromptDirty || !paperIntakeDraft.title.trim()}
                   >
                     {addingPaper ? "正在添加…" : "确认添加到知识库"}
                   </button>

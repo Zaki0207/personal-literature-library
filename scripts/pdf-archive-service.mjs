@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createProxyAwareFetch } from "./ai/providers.mjs";
 import { createPublicNetworkFetch } from "./network-safety.mjs";
 
@@ -19,6 +20,19 @@ export const DEFAULT_PDF_DIRECTORY = join(
 const MAX_PDF_BYTES = 200 * 1_024 * 1_024;
 const FETCH_TIMEOUT_MS = 120_000;
 const MAX_REDIRECTS = 5;
+const MAX_FETCH_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 400;
+const MAX_RETRY_DELAY_MS = 2_000;
+const RETRYABLE_HTTP_STATUSES = new Set([500, 502, 503, 504]);
+const RETRYABLE_NETWORK_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
 const PDF_MAGIC = Buffer.from("%PDF-");
 const PDF_HEADER_BYTES = 1_024;
 
@@ -89,6 +103,10 @@ function assertSafePdfUrl(value, { allowPrivateNetwork = false } = {}) {
   return url;
 }
 
+function isKnownLoginRedirect(url) {
+  return url.hostname === "ieeexplore.ieee.org" && url.pathname === "/Xplore/login.jsp";
+}
+
 function pdfStorageKey(paperId, sourceUrl, salt = "") {
   const digest = createHash("sha256")
     .update(`${paperId}\u0000${sourceUrl}\u0000${salt}`)
@@ -149,20 +167,105 @@ function createPdfValidationTransform(maxBytes) {
   };
 }
 
-function failureDetails(error) {
+function isRetryableNetworkError(error) {
+  let candidate = error;
+  for (let depth = 0; candidate && depth < 5; depth += 1) {
+    if (RETRYABLE_NETWORK_CODES.has(candidate.code)) return true;
+    candidate = candidate.cause;
+  }
+  return false;
+}
+
+function failureDetails(error, context = {}) {
+  const candidate = { ...context, ...error?.details };
+  const details = {
+    ...(Number.isInteger(candidate.status) && candidate.status >= 100 && candidate.status <= 599
+      ? { status: candidate.status }
+      : {}),
+    retryable: typeof candidate.retryable === "boolean"
+      ? candidate.retryable
+      : isRetryableNetworkError(error) || error?.name === "AbortError" || error?.name === "TimeoutError",
+    ...(Number.isInteger(candidate.attempts) && candidate.attempts >= 1 && candidate.attempts <= MAX_FETCH_ATTEMPTS
+      ? { attempts: candidate.attempts }
+      : {}),
+  };
   if (error instanceof PdfArchiveError) {
-    return { code: error.code, message: error.message };
+    return { code: error.code, message: error.message, details };
   }
   if (error?.name === "AbortError" || error?.name === "TimeoutError") {
     return {
       code: "PDF_TIMEOUT",
-      message: "下载 PDF 超时，请稍后重试。",
+      message: "下载 PDF 超时，请稍后重试，或在浏览器下载后导入本地 PDF。",
+      details,
+    };
+  }
+  if (error?.code === "REMOTE_ADDRESS_NOT_ALLOWED") {
+    return {
+      code: "PDF_SOURCE_NOT_ALLOWED",
+      message: "PDF 来源指向了本机、局域网或保留网络，请检查来源链接。",
+      details,
     };
   }
   return {
     code: "PDF_DOWNLOAD_FAILED",
-    message: "无法下载 PDF，请检查链接或网络。",
+    message: "无法下载 PDF，请检查链接或网络，或在浏览器下载后导入本地 PDF。",
+    details,
   };
+}
+
+async function cancelResponseBody(response) {
+  if (!response?.body) return;
+  try {
+    if (typeof response.body.cancel === "function") {
+      await response.body.cancel();
+    } else if (typeof response.body.destroy === "function") {
+      response.body.destroy();
+    }
+  } catch {
+    // A consumed or aborted body no longer needs cancellation.
+  }
+}
+
+function awaitFetchUntilAborted(request, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(request).then((response) => {
+      if (settled) {
+        void cancelResponseBody(response);
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      resolve(response);
+    }, (error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      reject(error);
+    });
+    if (signal.aborted) abort();
+  });
+}
+
+function retryDelay(response, attempt, baseDelayMs) {
+  const value = response?.headers.get("retry-after");
+  if (value) {
+    const seconds = /^\d+(?:\.\d+)?$/u.test(value.trim()) ? Number(value) : NaN;
+    const requested = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(value) - Date.now();
+    if (Number.isFinite(requested)) return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, requested));
+  }
+  return Math.min(MAX_RETRY_DELAY_MS, baseDelayMs * attempt);
+}
+
+function waitForRetry(delayMs, signal) {
+  return sleep(delayMs, undefined, { signal });
 }
 
 function sourceReadable(value) {
@@ -184,13 +287,18 @@ export class PdfArchiveService {
     allowPrivateNetwork = false,
     maxBytes = MAX_PDF_BYTES,
     timeoutMs = FETCH_TIMEOUT_MS,
+    retryDelayMs = RETRY_DELAY_MS,
+    retryWait = waitForRetry,
     resolveHost,
   } = {}) {
     if (!repository) throw new Error("PdfArchiveService 需要 repository。");
     this.repository = repository;
     this.pdfDirectory = resolve(pdfDirectory);
     this.temporaryDirectory = resolve(this.pdfDirectory, ".tmp");
-    this.fetchImpl = createPublicNetworkFetch(fetchImpl, {
+    this.fetchImpl = createPublicNetworkFetch((url, init) => {
+      init.signal?.throwIfAborted();
+      return fetchImpl(url, init);
+    }, {
       ...(allowPrivateNetwork
         ? { lookupImpl: null }
         : resolveHost !== undefined
@@ -200,6 +308,10 @@ export class PdfArchiveService {
     this.allowPrivateNetwork = allowPrivateNetwork;
     this.maxBytes = maxBytes;
     this.timeoutMs = timeoutMs;
+    this.retryDelayMs = Number.isFinite(retryDelayMs)
+      ? Math.min(MAX_RETRY_DELAY_MS, Math.max(0, retryDelayMs))
+      : RETRY_DELAY_MS;
+    this.retryWait = retryWait;
     this.inFlight = new Map();
   }
 
@@ -284,6 +396,15 @@ export class PdfArchiveService {
         code: "NOT_FOUND",
       });
     }
+    const existing = await this.getLocalPdf(paperId);
+    const record = this.repository.getPdfArchiveRecord(paperId);
+    if (!force && existing && record?.status === "ready" && !record.sourceUrl) {
+      return {
+        paper: this.repository.getPaper(paperId),
+        backup: undefined,
+        alreadyArchived: true,
+      };
+    }
     if (!paper.pdfUrl) {
       throw new PdfArchiveError("该论文没有可自动下载的 PDF 来源链接。", {
         code: "PDF_SOURCE_UNAVAILABLE",
@@ -293,8 +414,6 @@ export class PdfArchiveService {
     const sourceUrl = assertSafePdfUrl(paper.pdfUrl, {
       allowPrivateNetwork: this.allowPrivateNetwork,
     }).href;
-    const existing = await this.getLocalPdf(paperId);
-    const record = this.repository.getPdfArchiveRecord(paperId);
     if (
       !force &&
       existing &&
@@ -330,22 +449,25 @@ export class PdfArchiveService {
         sourceUrl,
         input: sourceReadable(response.body),
         storageKey: pdfStorageKey(paperId, sourceUrl, randomUUID()),
+        signal: fetched.signal,
       });
     } catch (error) {
-      const failure = failureDetails(error);
+      const failure = failureDetails(error, {
+        attempts: fetched?.attempts,
+        status: fetched?.response.status,
+      });
       await this.repository.recordPdfArchiveFailure(paperId, {
         sourceUrl,
         errorCode: failure.code,
         errorMessage: failure.message,
       });
-      throw error instanceof PdfArchiveError
-        ? error
-        : new PdfArchiveError(failure.message, {
-            statusCode: 502,
-            code: failure.code,
-          });
+      throw new PdfArchiveError(failure.message, {
+        statusCode: error instanceof PdfArchiveError ? error.statusCode : 502,
+        code: failure.code,
+        details: failure.details,
+      });
     } finally {
-      fetched?.cancel();
+      await fetched?.cancel();
     }
   }
 
@@ -374,62 +496,112 @@ export class PdfArchiveService {
   }
 
   async #fetchPdf(sourceUrl) {
-    let url = assertSafePdfUrl(sourceUrl, {
-      allowPrivateNetwork: this.allowPrivateNetwork,
-    });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let attempts = 0;
+    let lastStatus;
     try {
-      for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
-        const response = await this.fetchImpl(url, {
-          redirect: "manual",
-          signal: controller.signal,
-          headers: {
-            Accept: "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
-            "User-Agent": "PersonalLiteratureLibrary/1.0 (local desktop app)",
-          },
-        });
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-          const location = response.headers.get("location");
-          if (!location || redirect === MAX_REDIRECTS) {
-            throw new PdfArchiveError("PDF 链接重定向次数过多。", {
-              statusCode: 502,
-              code: "PDF_REDIRECT_LIMIT",
-            });
-          }
-          url = assertSafePdfUrl(new URL(location, url).href, {
+      for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt += 1) {
+        attempts = attempt;
+        let response;
+        try {
+          let url = assertSafePdfUrl(sourceUrl, {
             allowPrivateNetwork: this.allowPrivateNetwork,
           });
-          continue;
+          for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
+            controller.signal.throwIfAborted();
+            response = await awaitFetchUntilAborted(this.fetchImpl(url, {
+              redirect: "manual",
+              signal: controller.signal,
+              headers: {
+                Accept: "application/pdf,application/octet-stream;q=0.9,*/*;q=0.1",
+                "User-Agent": "PersonalLiteratureLibrary/1.0 (local desktop app)",
+              },
+            }), controller.signal);
+            lastStatus = response.status;
+            if ([301, 302, 303, 307, 308].includes(response.status)) {
+              const location = response.headers.get("location");
+              await cancelResponseBody(response);
+              if (!location || redirect === MAX_REDIRECTS) {
+                throw new PdfArchiveError("PDF 链接重定向次数过多，请检查来源链接或导入本地 PDF。", {
+                  statusCode: 502,
+                  code: "PDF_REDIRECT_LIMIT",
+                  details: { status: response.status, retryable: false, attempts: attempt },
+                });
+              }
+              url = assertSafePdfUrl(new URL(location, url).href, {
+                allowPrivateNetwork: this.allowPrivateNetwork,
+              });
+              if (isKnownLoginRedirect(url)) {
+                throw new PdfArchiveError("该 PDF 来源跳转到了 IEEE 登录页，请在浏览器登录并下载后导入本地 PDF。", {
+                  statusCode: 422,
+                  code: "PDF_AUTH_REQUIRED",
+                  details: { status: response.status, retryable: false, attempts: attempt },
+                });
+              }
+              response = undefined;
+              continue;
+            }
+            if (response.status === 401 || response.status === 403) {
+              throw new PdfArchiveError("该 PDF 需要登录，请在浏览器下载后导入本地 PDF。", {
+                statusCode: 422,
+                code: "PDF_AUTH_REQUIRED",
+                details: { status: response.status, retryable: false, attempts: attempt },
+              });
+            }
+            if (response.status === 404) {
+              throw new PdfArchiveError("未找到远程 PDF，请检查来源链接或导入本地 PDF。", {
+                statusCode: 404,
+                code: "PDF_NOT_FOUND",
+                details: { status: response.status, retryable: false, attempts: attempt },
+              });
+            }
+            if (!response.ok) {
+              const retryable = RETRYABLE_HTTP_STATUSES.has(response.status);
+              throw new PdfArchiveError(
+                retryable
+                  ? `PDF 来源暂时不可用（HTTP ${response.status}），请稍后重试，或在浏览器下载后导入本地 PDF。`
+                  : `PDF 来源服务返回了 HTTP ${response.status}，请检查来源链接，或在浏览器下载后导入本地 PDF。`,
+                {
+                  statusCode: 502,
+                  code: "PDF_DOWNLOAD_FAILED",
+                  details: { status: response.status, retryable, attempts: attempt },
+                },
+              );
+            }
+            return {
+              response,
+              attempts: attempt,
+              signal: controller.signal,
+              async cancel() {
+                clearTimeout(timer);
+                await cancelResponseBody(response);
+              },
+            };
+          }
+        } catch (error) {
+          const delayMs = retryDelay(response, attempt, this.retryDelayMs);
+          await cancelResponseBody(response);
+          if (controller.signal.aborted) throw controller.signal.reason;
+          const retryable = error instanceof PdfArchiveError
+            ? error.details?.retryable === true
+            : isRetryableNetworkError(error);
+          if (!retryable || attempt === MAX_FETCH_ATTEMPTS) throw error;
+          await this.retryWait(delayMs, controller.signal);
+          controller.signal.throwIfAborted();
         }
-        if (response.status === 401 || response.status === 403) {
-          throw new PdfArchiveError("该 PDF 需要登录，请手动导入。", {
-            statusCode: 422,
-            code: "PDF_AUTH_REQUIRED",
-          });
-        }
-        if (response.status === 404) {
-          throw new PdfArchiveError("未找到远程 PDF，请检查来源链接。", {
-            statusCode: 404,
-            code: "PDF_NOT_FOUND",
-          });
-        }
-        if (!response.ok) {
-          throw new PdfArchiveError(
-            `PDF 来源服务返回了 ${response.status}。`,
-            { statusCode: 502, code: "PDF_DOWNLOAD_FAILED" },
-          );
-        }
-        return {
-          response,
-          cancel() {
-            clearTimeout(timer);
-          },
-        };
       }
     } catch (error) {
       clearTimeout(timer);
-      throw error;
+      const failure = failureDetails(error, {
+        ...(lastStatus === undefined ? {} : { status: lastStatus }),
+        attempts,
+      });
+      throw new PdfArchiveError(failure.message, {
+        statusCode: error instanceof PdfArchiveError ? error.statusCode : 502,
+        code: failure.code,
+        details: failure.details,
+      });
     }
     throw new PdfArchiveError("PDF 链接重定向次数过多。", {
       statusCode: 502,
@@ -437,7 +609,7 @@ export class PdfArchiveService {
     });
   }
 
-  async #saveStream({ paperId, sourceUrl, input, storageKey }) {
+  async #saveStream({ paperId, sourceUrl, input, storageKey, signal }) {
     const paper = this.repository.getPaper(paperId);
     if (!paper) {
       throw new PdfArchiveError("未找到论文。", {
@@ -461,6 +633,7 @@ export class PdfArchiveService {
         sourceReadable(input),
         validator.transform,
         createWriteStream(temporaryPath, { flags: "wx", mode: 0o600 }),
+        ...(signal ? [{ signal }] : []),
       );
       const current = this.repository.getPaper(paperId);
       if (sourceUrl && current?.pdfUrl && current.pdfUrl !== sourceUrl) {

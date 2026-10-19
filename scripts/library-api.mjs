@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { createLibraryRepository } from "./library-repository.mjs";
 import { createAiService } from "./ai/ai-service.mjs";
@@ -9,6 +10,7 @@ import { createAiProviders } from "./ai/providers.mjs";
 import { createPaperIntakeService } from "./paper-intake.mjs";
 import { createPdfArchiveService } from "./pdf-archive-service.mjs";
 import { createLiteratureRadarService } from "./literature-radar.mjs";
+import { createReadingStateService } from "./reading-state.mjs";
 import {
   assertMutationRequestOrigin,
   errorPayload,
@@ -19,6 +21,8 @@ import { handleAiRoutes } from "./library-api-routes/ai.mjs";
 import { handleCategoryRoutes } from "./library-api-routes/categories.mjs";
 import { handlePaperRoutes } from "./library-api-routes/papers.mjs";
 import { handleRadarRoutes } from "./library-api-routes/radar.mjs";
+import { handleReadingRoutes } from "./library-api-routes/reading.mjs";
+import { handleKnowledgeRoutes } from "./library-api-routes/knowledge.mjs";
 
 export const DEFAULT_API_PORT = 4317;
 export const API_HOST = "127.0.0.1";
@@ -29,9 +33,21 @@ function createRequestHandler(
   paperIntakeService,
   pdfArchiveService,
   literatureRadarService,
+  { requestToken, readingStateService, allowKnowledgeNotes } = {},
 ) {
   return async (request, response) => {
     try {
+      if (requestToken) {
+        const supplied = request.headers.authorization;
+        const expected = Buffer.from(`Bearer ${requestToken}`);
+        const actual = Buffer.from(typeof supplied === "string" ? supplied : "");
+        if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+          sendJson(response, request, 401, {
+            error: { code: "LOCAL_AUTH_REQUIRED", message: "本地文献服务连接已失效，请重新连接。" },
+          });
+          return;
+        }
+      }
       if (request.method === "OPTIONS") {
         sendNoContent(response, request);
         return;
@@ -47,6 +63,16 @@ function createRequestHandler(
         assertMutationRequestOrigin(request);
       }
 
+      if (
+        await handleKnowledgeRoutes({ request, response, pathname, repository, allowKnowledgeNotes })
+      ) {
+        return;
+      }
+      if (
+        await handleReadingRoutes({ request, response, pathname, readingStateService })
+      ) {
+        return;
+      }
       if (
         await handleRadarRoutes({
           request,
@@ -154,7 +180,12 @@ export async function createLibraryApi({
   pdfDirectory,
   pdfFetch,
   allowPrivatePdfNetwork,
+  requestToken,
+  allowKnowledgeNotes = true,
 } = {}) {
+  if (requestToken !== undefined && (typeof requestToken !== "string" || requestToken.length < 24)) {
+    throw new Error("本地服务凭据必须至少包含 24 个字符。");
+  }
   const ownsRepository = !repository;
   const libraryRepository =
     repository ??
@@ -192,6 +223,8 @@ export async function createLibraryApi({
       repository: libraryRepository,
       aiService: localAiService,
     });
+  const readingStateService = createReadingStateService({ repository: libraryRepository });
+  await readingStateService.ready;
   const server = createServer(
     createRequestHandler(
       libraryRepository,
@@ -199,6 +232,7 @@ export async function createLibraryApi({
       paperIntakeService,
       localPdfArchiveService,
       localLiteratureRadarService,
+      { requestToken, readingStateService, allowKnowledgeNotes },
     ),
   );
   let started = false;
@@ -210,6 +244,7 @@ export async function createLibraryApi({
     paperIntakeService,
     pdfArchiveService: localPdfArchiveService,
     literatureRadarService: localLiteratureRadarService,
+    readingStateService,
     server,
 
     async listen(overridePort = port) {

@@ -15,6 +15,10 @@ import {
 } from "./ai/reasoning-effort.mjs";
 import { normalizePublicationSource } from "../lib/publication-source.mjs";
 import {
+  DEFAULT_PAPER_INTAKE_PROMPT_TEMPLATE,
+  MAX_PAPER_INTAKE_PROMPT_LENGTH,
+} from "./paper-intake-prompt.mjs";
+import {
   createSqliteBackup,
   readSqliteBackupStatus,
 } from "./sqlite-backup.mjs";
@@ -988,6 +992,15 @@ export class LibraryRepository {
         )
         .get(),
     );
+    const hadPaperIntakeSettingsTable = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1
+           FROM sqlite_master
+           WHERE type = 'table' AND name = 'paper_intake_settings'`,
+        )
+        .get(),
+    );
     const hadRadarItemsTable = Boolean(
       this.db
         .prepare(
@@ -1169,6 +1182,13 @@ export class LibraryRepository {
         updated_at TEXT NOT NULL
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS paper_intake_settings (
+        id TEXT PRIMARY KEY CHECK (id = 'default'),
+        prompt_template TEXT NOT NULL DEFAULT ''
+          CHECK (length(prompt_template) <= 40000),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS radar_ai_trace (
         id TEXT PRIMARY KEY CHECK (id = 'latest'),
         status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
@@ -1308,7 +1328,9 @@ export class LibraryRepository {
            WHERE id = 'default' AND prompt_template = ''`,
         )
         .run(DEFAULT_RADAR_PROMPT_TEMPLATE);
-      if (alterations.length) this.schemaMigrated = true;
+      if (alterations.length || !hadPaperIntakeSettingsTable) {
+        this.schemaMigrated = true;
+      }
       if (removedKeywords) {
         this.db
           .prepare(
@@ -2147,6 +2169,55 @@ export class LibraryRepository {
     };
   }
 
+  getPaperIntakePromptTemplate() {
+    this.#assertOpen();
+    const row = this.db
+      .prepare(
+        `SELECT prompt_template AS promptTemplate
+         FROM paper_intake_settings WHERE id = 'default'`,
+      )
+      .get();
+    return {
+      promptTemplate:
+        row?.promptTemplate || DEFAULT_PAPER_INTAKE_PROMPT_TEMPLATE,
+      defaultPromptTemplate: DEFAULT_PAPER_INTAKE_PROMPT_TEMPLATE,
+      usingDefault: !row?.promptTemplate,
+    };
+  }
+
+  async savePaperIntakePromptTemplate(value) {
+    return this.#queueMutation(async () => {
+      if (typeof value !== "string" || !value.trim()) {
+        throw new ValidationError("添加论文提示词必须是非空字符串。", {
+          field: "promptTemplate",
+        });
+      }
+      if (value.length > MAX_PAPER_INTAKE_PROMPT_LENGTH) {
+        throw new ValidationError("添加论文提示词不能超过 40000 个字符。", {
+          field: "promptTemplate",
+        });
+      }
+      this.db
+        .prepare(
+          `INSERT INTO paper_intake_settings (id, prompt_template, updated_at)
+           VALUES ('default', ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             prompt_template = excluded.prompt_template,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          value === DEFAULT_PAPER_INTAKE_PROMPT_TEMPLATE ? "" : value,
+          this.now().toISOString(),
+        );
+      const backup = await this.#createBackup();
+      return { ...this.getPaperIntakePromptTemplate(), backup };
+    });
+  }
+
+  async resetPaperIntakePromptTemplate() {
+    return this.savePaperIntakePromptTemplate(DEFAULT_PAPER_INTAKE_PROMPT_TEMPLATE);
+  }
+
   getRadarAiTrace() {
     this.#assertOpen();
     const row = this.db
@@ -2823,6 +2894,9 @@ export class LibraryRepository {
             ? "stale"
             : "failed",
       );
+      const failureSourceUrl = status === "ready"
+        ? existing.sourceUrl || ""
+        : normalizedSourceUrl || current.pdfUrl || existing?.sourceUrl || "";
       const now = this.now().toISOString();
 
       this.db.exec("BEGIN IMMEDIATE");
@@ -2830,9 +2904,10 @@ export class LibraryRepository {
         this.db
           .prepare(
             `INSERT INTO paper_pdf_archives (
-               paper_id, status, source_url, last_error_code,
+               paper_id, status, source_url, storage_key, sha256,
+               size_bytes, downloaded_at, last_error_code,
                last_error_message, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(paper_id) DO UPDATE SET
                status = excluded.status,
                source_url = excluded.source_url,
@@ -2843,7 +2918,11 @@ export class LibraryRepository {
           .run(
             id,
             status,
-            normalizedSourceUrl || current.pdfUrl || existing?.sourceUrl || "",
+            failureSourceUrl,
+            existing?.storageKey ?? null,
+            existing?.sha256 ?? null,
+            existing?.sizeBytes ?? null,
+            existing?.downloadedAt ?? null,
             normalizedErrorCode,
             normalizedErrorMessage,
             now,

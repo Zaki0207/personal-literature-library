@@ -95,8 +95,14 @@ const PUBLIC_ERRORS = {
   },
   WEB_SEARCH_UNSUPPORTED: {
     message: "当前 AI 服务或模型不支持联网检索。",
-    action: "请在 AI 设置中切换到支持 Responses API Web Search 的模型后重试。",
+    action: "添加论文时可提供项目、DOI 或 arXiv 链接，由应用读取后整理；文献雷达和题目搜索请切换到支持 Responses API Web Search 的服务。",
     statusCode: 400,
+    retryable: false,
+  },
+  AI_TOOL_NOT_EXECUTED: {
+    message: "AI 服务返回了尚未执行的工具调用，没有提供最终资料。",
+    action: "应用不会执行 AI 答复中的任意工具指令。请提供项目、DOI 或 arXiv 链接，或切换到支持实际联网检索的服务。",
+    statusCode: 502,
     retryable: false,
   },
   KEYCHAIN_UNAVAILABLE: {

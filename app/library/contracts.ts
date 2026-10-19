@@ -84,6 +84,7 @@ export type PaperIntakeDraft = {
   source: string;
   date: string;
   aiSummary: string;
+  note: string;
   categoryIds: string[];
   originalUrl: string;
   pdfUrl: string;

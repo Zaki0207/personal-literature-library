@@ -1,0 +1,22 @@
+.pdf-reader-navigation { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--reader-border); background: var(--card, #fff); }
+.pdf-navigation-tabs { display: flex; gap: 4px; flex-shrink: 0; padding: 12px 10px; border-bottom: 1px solid var(--reader-border); }
+.pdf-reader .pdf-navigation-tabs button { flex: 1; min-width: 0; padding: 7px 4px; font-size: 12px; }
+.pdf-navigation-tabs button[aria-selected="true"] { background: var(--ink-soft, #e8f1eb); border-color: var(--line-strong, #a0b7a8); }
+.pdf-navigation-content { position: relative; min-height: 0; overflow: auto; overscroll-behavior: contain; flex: 1; padding: 12px 8px; }
+.pdf-navigation-message { margin: 0 6px 12px; color: var(--muted, #62756a); font-size: 12px; line-height: 1.7; }
+.pdf-outline-list { list-style: none; margin: 0; padding: 0; }
+.pdf-outline-list li { margin-bottom: 4px; min-width: 0; }
+.pdf-reader .pdf-outline-link { display: block; width: 100%; border: 0; padding: 8px; line-height: 1.6; text-align: left; overflow-wrap: anywhere; border-radius: 5px; font-size: 12px; }
+.pdf-outline-group { position: relative; }
+.pdf-outline-group > .pdf-outline-link { padding-left: 26px; }
+.pdf-outline-group > details > summary { position: absolute; top: 7px; left: 0; width: 24px; height: 24px; display: grid; place-items: center; cursor: pointer; border-radius: 4px; list-style: none; }
+.pdf-outline-group > details > summary::-webkit-details-marker { display: none; }
+.pdf-outline-group > details > summary:hover { background: var(--ink-soft, #e8f1eb); }
+.pdf-outline-group > details:not([open]) > summary span { transform: rotate(-90deg); }
+.pdf-outline-group > details > .pdf-outline-list { padding-left: 12px; border-left: 1px solid var(--reader-border); margin-left: 11px; }
+.pdf-thumbnails { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+.pdf-reader .pdf-thumbnail { display: flex; flex-direction: column; align-items: center; gap: 7px; width: 100%; flex-shrink: 0; background: transparent; border-color: transparent; font-size: 11px; color: var(--muted, #62756a); }
+.pdf-reader .pdf-thumbnail.is-current { background: var(--ink-soft, #e8f1eb); border-color: var(--line-strong, #a0b7a8); color: var(--ink, #285b49); }
+.pdf-thumbnail-image { position: relative; display: block; width: 124px; max-width: 100%; background: #fff; box-shadow: 0 1px 5px #25312e22; }
+.pdf-thumbnail-image canvas { display: block; width: 100%; height: 100%; }
+.pdf-thumbnail-placeholder { position: absolute; inset: 0; display: grid; place-items: center; font-size: 12px; color: #788277; }

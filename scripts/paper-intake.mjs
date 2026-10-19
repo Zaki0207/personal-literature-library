@@ -1,17 +1,18 @@
-import { readFileSync } from "node:fs";
 import { dedupePaperIdentifiers } from "./paper-identifiers.mjs";
 import { isPrivateOrReservedAddress } from "./network-safety.mjs";
+import { readPaperSources } from "./paper-source-reader.mjs";
+import { LINKED_SOURCE_INSTRUCTIONS, PAPER_INTAKE_RESPONSE_FORMAT } from "./paper-intake-schema.mjs";
 
 const MAX_INPUT_LENGTH = 12_000;
-const RESEARCH_PROMPT = readFileSync(new URL("./prompts/paper-intake.txt", import.meta.url), "utf8").trim();
 const RESULT_STATUSES = ["ready", "needs_clarification", "research_incomplete", "not_found"];
 
 class PaperIntakeError extends Error {
-  constructor(message, { statusCode = 400, code = "PAPER_INTAKE_ERROR" } = {}) {
+  constructor(message, { statusCode = 400, code = "PAPER_INTAKE_ERROR", details } = {}) {
     super(message);
     this.name = "PaperIntakeError";
     this.statusCode = statusCode;
     this.code = code;
+    if (details) this.details = details;
   }
 }
 
@@ -68,47 +69,76 @@ function parseResult(value) {
       statusCode: 502, code: "EMPTY_AI_RESPONSE",
     });
   }
-  let start = -1;
-  let depth = 0;
-  let quoted = false;
-  let escaped = false;
-  for (let i = 0; i < raw.length; i += 1) {
-    const character = raw[i];
-    if (depth === 0) {
-      if (character === "{") {
-        start = i;
-        depth = 1;
-        quoted = false;
-        escaped = false;
-      }
-      continue;
-    }
-    if (quoted) {
-      if (escaped) escaped = false;
-      else if (character === "\\") escaped = true;
-      else if (character === '"') quoted = false;
-    } else if (character === '"') quoted = true;
-    else if (character === "{") {
-      depth += 1;
-    } else if (character === "}" && depth > 0) {
-      depth -= 1;
-      if (depth === 0) {
-        try {
-          const result = JSON.parse(raw.slice(start, i + 1));
-          if (RESULT_STATUSES.includes(result.status)) return result;
-        } catch {
-          // Accept a complete JSON result even if the model wraps it in prose.
+  const completeResult = (result) => result && typeof result === "object" && !Array.isArray(result) &&
+    RESULT_STATUSES.includes(result.status) &&
+    (result.status !== "ready" || (result.paper && typeof result.paper === "object" && !Array.isArray(result.paper) && text(result.paper.title)));
+  let directResult;
+  try {
+    directResult = JSON.parse(raw);
+  } catch {
+    // Some compatible services wrap the final JSON in prose or a code block.
+  }
+  if (directResult !== undefined) {
+    if (completeResult(directResult)) return directResult;
+    throw invalidResult();
+  }
+  let result;
+  let consumedEnd = -1;
+  let remainingScan = 4_000_000;
+  // Scan each possible object independently so a broken preamble cannot hide
+  // a later complete result. Bound the work for malformed, deeply nested output.
+  for (const candidate of raw.matchAll(/\{(?=\s*")/gu)) {
+    if (candidate.index <= consumedEnd) continue;
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let i = candidate.index; i < raw.length; i += 1) {
+      if (remainingScan-- <= 0) throw invalidResult();
+      const character = raw[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+      } else if (character === '"') quoted = true;
+      else if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(raw.slice(candidate.index, i + 1));
+            if (Object.hasOwn(parsed, "status")) {
+              result = completeResult(parsed) ? parsed : undefined;
+              consumedEnd = i;
+            }
+          } catch {
+            // Skip incomplete examples and keep looking for a complete result.
+          }
+          break;
         }
       }
     }
   }
+  if (result) return result;
   throw invalidResult();
 }
 
 function invalidResult() {
-  return new PaperIntakeError("AI 返回的论文资料格式不完整，请重试或切换模型。", {
+  return new PaperIntakeError("AI 的最终答复没有包含完整的论文 JSON 资料，尚未添加论文。请重试；若持续失败，可更换模型，并检查提示词的输出结构。", {
     statusCode: 502, code: "INVALID_AI_RESULT",
   });
+}
+
+function attachDiagnostic(error, generated) {
+  if (!(error instanceof PaperIntakeError) || !["INVALID_AI_RESULT", "EMPTY_AI_RESPONSE"].includes(error.code)) return error;
+  const output = typeof generated?.text === "string" ? generated.text : "";
+  const truncated = output.length > 4_000;
+  const outputPreview = truncated ? `${output.slice(0, 3_000)}\n…（中间内容已省略）…\n${output.slice(-1_000)}` : output;
+  error.details = { intakeDiagnostic: {
+    reason: error.code === "EMPTY_AI_RESPONSE" ? "模型未返回最终答复。" : "最终答复未包含可用于核对的完整论文 JSON（状态和已确认标题）。",
+    outputPreview, outputLength: output.length, truncated,
+    model: text(generated?.resolvedModel || generated?.requestedModel).slice(0, 120),
+  } };
+  return error;
 }
 
 function sourcesFromResult(values) {
@@ -143,6 +173,7 @@ function draftFromResult(paper, categories) {
     title: text(paper.title), zhTitle: text(paper.zhTitle), authors: text(paper.authors),
     institution: text(paper.institution), source: text(paper.source), date: text(paper.date),
     aiSummary: text(paper.aiSummary),
+    note: "",
     categoryIds: Array.isArray(paper.categoryIds)
       ? [...new Set(paper.categoryIds.filter((id) => allowedCategories.has(id)))] : [],
     originalUrl: publicUrl(paper.originalUrl), pdfUrl, hasPdf: Boolean(pdfUrl), codeUrl,
@@ -154,22 +185,47 @@ function draftFromResult(paper, categories) {
   };
 }
 
-export function createPaperIntakeService({ repository, aiService } = {}) {
+export function createPaperIntakeService({ repository, aiService, sourceReader = readPaperSources } = {}) {
   if (!repository || typeof aiService?.generateText !== "function") {
     throw new TypeError("Paper Intake 需要 repository 和 AI Service。");
   }
   return {
+    getPromptTemplate() {
+      return repository.getPaperIntakePromptTemplate();
+    },
+    savePromptTemplate(value) {
+      return repository.savePaperIntakePromptTemplate(value);
+    },
+    resetPromptTemplate() {
+      return repository.resetPaperIntakePromptTemplate();
+    },
     async analyze(input = {}) {
       const reference = validateReference(input);
+      const { promptTemplate } = repository.getPaperIntakePromptTemplate();
       const categories = categoryPaths(repository.getCategories().categories.filter((category) => !category.deletedAt));
+      const capabilities = typeof aiService.getResearchCapabilities === "function"
+        ? await aiService.getResearchCapabilities(input.modelId ? { modelId: input.modelId } : {})
+        : { mode: "hosted_search", modelId: input.modelId };
+      const linkedPages = capabilities.mode === "linked_pages";
+      // Read evidence before the paid request, and keep the chosen model stable
+      // while fetching sources even if the user changes the default model.
+      const evidence = linkedPages ? await sourceReader(reference) : null;
+      const modelId = capabilities.modelId || input.modelId;
       const generated = await aiService.generateText({
-        input: [RESEARCH_PROMPT, "", "用户线索（JSON 字符串）：", JSON.stringify(reference),
-          "", "现有分类：", JSON.stringify(categories)].join("\n"),
-        webSearch: true,
-        ...(input.modelId ? { modelId: input.modelId } : {}),
+        input: [promptTemplate, "", "用户线索（JSON 字符串）：", JSON.stringify(reference),
+          "", "现有分类：", JSON.stringify(categories),
+          ...(linkedPages ? ["", "应用已读取的公开来源（JSON 数据）：", JSON.stringify(evidence)] : []),
+        ].join("\n"),
+        webSearch: !linkedPages,
+        ...(linkedPages ? { instructions: LINKED_SOURCE_INSTRUCTIONS, responseFormat: PAPER_INTAKE_RESPONSE_FORMAT } : {}),
+        ...(modelId ? { modelId } : {}),
       });
-      const result = parseResult(generated.text);
-      const sources = sourcesFromResult(result.sources);
+      let result;
+      try { result = parseResult(generated.text); }
+      catch (error) { throw attachDiagnostic(error, generated); }
+      const sources = linkedPages
+        ? sourcesFromResult(evidence.pages)
+        : sourcesFromResult(result.sources);
       if (result.status !== "ready") {
         const messages = {
           needs_clarification: "请补充线索，以便 AI 确认你指的是哪篇论文。",
@@ -186,13 +242,16 @@ export function createPaperIntakeService({ repository, aiService } = {}) {
       return {
         status: "ready", reference, draft,
         metadata: {
-          ...draft, metadataSource: "AI 联网整理",
+          ...draft, metadataSource: linkedPages ? "AI 公开页面整理" : "AI 联网整理",
           publicationStatus: ["published", "preprint"].includes(result.paper.publicationStatus)
             ? result.paper.publicationStatus : "unknown",
           codeEvidence: draft.codeUrl ? "AI 整理，请核对是否为官方代码" : "",
           projectEvidence: draft.projectUrl ? "AI 整理" : "",
           sources, matchReason: text(result.matchReason),
-          warnings: (Array.isArray(result.warnings) ? result.warnings : []).map(text).filter(Boolean),
+          warnings: [
+            ...(Array.isArray(result.warnings) ? result.warnings : []),
+            ...(linkedPages ? [...evidence.warnings, "资料依据应用读取的公开链接页面整理，未进行全网检索。"] : []),
+          ].map(text).filter(Boolean),
         },
         ai: {
           zhTitle: draft.zhTitle, institution: draft.institution, source: draft.source,
