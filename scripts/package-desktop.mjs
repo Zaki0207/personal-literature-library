@@ -18,7 +18,10 @@ const output = resolve(root, "release");
 await rm(stage, { recursive: true, force: true });
 await mkdir(stage, { recursive: true });
 for (const path of ["desktop", "scripts", "lib", "LICENSE", "dist-desktop/renderer", "node_modules/undici"]) {
-  await cp(resolve(root, path), resolve(stage, path), { recursive: true });
+  await cp(resolve(root, path), resolve(stage, path), {
+    recursive: true,
+    filter: (source) => source !== resolve(root, "scripts/enrich-literature.mjs"),
+  });
 }
 await writeFile(resolve(stage, "package.json"), JSON.stringify({ name: metadata.name, version: metadata.version, type: "module", main: "desktop/main/index.mjs", description: "本地优先的个人文献工作台", dependencies: { undici: metadata.dependencies.undici } }, null, 2));
 const paths = await packager({
@@ -42,7 +45,8 @@ await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", applicationPat
 const dmgRoot = resolve(root, "dist-desktop/dmg");
 await rm(dmgRoot, { recursive: true, force: true });
 await mkdir(dmgRoot, { recursive: true });
-await cp(applicationPath, resolve(dmgRoot, "我的文献库.app"), { recursive: true });
+await run("/usr/bin/ditto", [applicationPath, resolve(dmgRoot, "我的文献库.app")]);
+await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", resolve(dmgRoot, "我的文献库.app")]);
 await symlink("/Applications", resolve(dmgRoot, "Applications"));
 const dmgPath = resolve(output, `我的文献库-${metadata.version}-arm64.dmg`);
 await rm(dmgPath, { force: true });
