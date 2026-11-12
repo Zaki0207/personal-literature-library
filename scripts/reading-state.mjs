@@ -1,4 +1,21 @@
 import { ConflictError, NotFoundError, ValidationError } from "./library-repository.mjs";
+import { MIN_PDF_SCALE, MAX_PDF_SCALE } from "../lib/pdf-zoom.mjs";
+
+const READING_POSITION_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS paper_reading_positions (
+    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    pdf_version TEXT NOT NULL,
+    page_number INTEGER NOT NULL CHECK (page_number > 0),
+    page_count INTEGER NOT NULL CHECK (page_count > 0),
+    scale REAL NOT NULL CHECK (scale >= ${MIN_PDF_SCALE} AND scale <= ${MAX_PDF_SCALE}),
+    zoom_mode TEXT NOT NULL CHECK (zoom_mode IN ('fit-width', 'custom')),
+    scroll_offset REAL NOT NULL CHECK (scroll_offset >= 0 AND scroll_offset <= 1),
+    notes_visible INTEGER NOT NULL CHECK (notes_visible IN (0, 1)),
+    layout_mode TEXT NOT NULL DEFAULT 'single-page' CHECK (layout_mode IN ('single-page', 'continuous')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (paper_id, pdf_version)
+  ) STRICT;
+`;
 
 const POSITION_FIELDS = new Set([
   "pdfVersion", "pageNumber", "pageCount", "scale", "zoomMode",
@@ -31,8 +48,8 @@ export function validateReadingPosition(input) {
   if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > pageCount) {
     throw new ValidationError("页码超出 PDF 范围。", { field: "pageNumber" });
   }
-  if (!Number.isFinite(scale) || scale < 0.25 || scale > 4) {
-    throw new ValidationError("缩放比例必须在 25% 到 400% 之间。", { field: "scale" });
+  if (!Number.isFinite(scale) || scale < MIN_PDF_SCALE || scale > MAX_PDF_SCALE) {
+    throw new ValidationError(`缩放比例必须在 ${MIN_PDF_SCALE * 100}% 到 ${MAX_PDF_SCALE * 100}% 之间。`, { field: "scale" });
   }
   if (zoomMode !== "fit-width" && zoomMode !== "custom") {
     throw new ValidationError("缩放模式无效。", { field: "zoomMode" });
@@ -59,21 +76,7 @@ export class ReadingStateService {
     }
     this.repository = repository;
     this.ready = this.#enqueue(() => {
-      repository.db.exec(`
-        CREATE TABLE IF NOT EXISTS paper_reading_positions (
-          paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-          pdf_version TEXT NOT NULL,
-          page_number INTEGER NOT NULL CHECK (page_number > 0),
-          page_count INTEGER NOT NULL CHECK (page_count > 0),
-          scale REAL NOT NULL CHECK (scale >= 0.25 AND scale <= 4),
-          zoom_mode TEXT NOT NULL CHECK (zoom_mode IN ('fit-width', 'custom')),
-          scroll_offset REAL NOT NULL CHECK (scroll_offset >= 0 AND scroll_offset <= 1),
-          notes_visible INTEGER NOT NULL CHECK (notes_visible IN (0, 1)),
-          layout_mode TEXT NOT NULL DEFAULT 'single-page' CHECK (layout_mode IN ('single-page', 'continuous')),
-          updated_at TEXT NOT NULL,
-          PRIMARY KEY (paper_id, pdf_version)
-        ) STRICT;
-      `);
+      repository.db.exec(READING_POSITION_SCHEMA);
       const columns = repository.db.prepare("PRAGMA table_info(paper_reading_positions)").all();
       if (!columns.some((column) => column.name === "layout_mode")) {
         repository.db.exec(`
@@ -81,6 +84,24 @@ export class ReadingStateService {
           ADD COLUMN layout_mode TEXT NOT NULL DEFAULT 'single-page'
           CHECK (layout_mode IN ('single-page', 'continuous'))
         `);
+      }
+      const schema = repository.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'paper_reading_positions'").get().sql;
+      if (/\bscale\s*<=\s*4\s*\)/iu.test(schema)) {
+        // SQLite cannot alter a CHECK in place. Rebuild atomically, retaining
+        // every PDF version, layout coordinate and original update timestamp.
+        repository.db.exec("BEGIN IMMEDIATE");
+        try {
+          repository.db.exec(`
+            ALTER TABLE paper_reading_positions RENAME TO paper_reading_positions_legacy_zoom;
+            ${READING_POSITION_SCHEMA}
+            INSERT INTO paper_reading_positions
+              (paper_id, pdf_version, page_number, page_count, scale, zoom_mode, scroll_offset, notes_visible, layout_mode, updated_at)
+            SELECT paper_id, pdf_version, page_number, page_count, scale, zoom_mode, scroll_offset, notes_visible, layout_mode, updated_at
+              FROM paper_reading_positions_legacy_zoom;
+            DROP TABLE paper_reading_positions_legacy_zoom;
+            COMMIT;
+          `);
+        } catch (error) { repository.db.exec("ROLLBACK"); throw error; }
       }
     });
   }

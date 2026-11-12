@@ -224,8 +224,9 @@ export function sameCategorySelection(left: string[], right: string[]) {
   return left.every((id) => rightIds.has(id));
 }
 
-export function formatPdfSize(sizeBytes?: number) {
-  if (!sizeBytes || sizeBytes < 1_024) return sizeBytes ? `${sizeBytes} B` : "";
+export function formatFileSize(sizeBytes?: number) {
+  if (sizeBytes === undefined) return "";
+  if (sizeBytes < 1_024) return `${sizeBytes} B`;
   if (sizeBytes < 1_024 * 1_024) {
     return `${(sizeBytes / 1_024).toFixed(1)} KB`;
   }

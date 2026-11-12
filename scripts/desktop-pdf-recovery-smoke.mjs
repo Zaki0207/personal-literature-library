@@ -37,7 +37,7 @@ async function recoveryStep({ stage, id, title }) {
   };
   const marker = (name) => document.querySelector(`[data-pdf-${name}]`);
   const settle = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  const note = () => document.querySelector(".pdf-reader-notes textarea");
+  const note = () => document.querySelector(".pdf-reader-notes [data-note-input]");
   const library = async () => {
     const result = await window.literatureDesktop.request({ path: "/library" });
     if (result.status !== 200) throw new Error("无法检查临时论文库。");
@@ -50,7 +50,7 @@ async function recoveryStep({ stage, id, title }) {
     await waitFor(() => marker("load-error") && marker("retry") && marker("import"), "502 错误恢复操作");
     if (!marker("load-error").textContent.includes("502")) throw new Error("阅读器没有显示具体来源 502 错误。");
     if (!marker("load-error").textContent.includes("本地 PDF")) throw new Error("阅读器缺少本地 PDF 恢复说明。");
-    if (!note() || note().value !== "Synthetic recovery note retained before downloading a PDF.") throw new Error("PDF 打不开时无法读取原有笔记。");
+    if (!note() || note().textContent !== "Synthetic recovery note retained before downloading a PDF.") throw new Error("PDF 打不开时无法读取原有笔记。");
   };
   const leave = async () => {
     document.querySelector(".pdf-reader-back").click();
@@ -71,7 +71,7 @@ async function recoveryStep({ stage, id, title }) {
   if (stage === "retry") {
     marker("retry").click();
     await waitFor(rendered, "重试后真实 PDF worker 与画布");
-    if (marker("load-error") || note().value !== "Synthetic recovery note retained before downloading a PDF.") throw new Error("重试成功没有移除错误或保留笔记。");
+    if (marker("load-error") || note().textContent !== "Synthetic recovery note retained before downloading a PDF.") throw new Error("重试成功没有移除错误或保留笔记。");
     const current = await paper();
     if (current.pdfArchive?.status !== "ready") throw new Error("重试成功没有更新本地 PDF 状态。");
     await leave();
@@ -95,14 +95,14 @@ async function recoveryStep({ stage, id, title }) {
   if (stage === "invalid") {
     marker("import").click();
     await waitFor(() => marker("recovery-error")?.textContent.includes("不是有效 PDF") && !marker("import").disabled, "无效文件拒绝并恢复操作");
-    if ((await paper()).pdfArchive?.status !== "failed" || note().value !== "Synthetic recovery note retained before downloading a PDF.") throw new Error("无效导入改变失败状态或丢失笔记。");
+    if ((await paper()).pdfArchive?.status !== "failed" || note().textContent !== "Synthetic recovery note retained before downloading a PDF.") throw new Error("无效导入改变失败状态或丢失笔记。");
     return { invalidPdfRejected: true, invalidImportNotePreserved: true };
   }
   if (stage === "prepare-note-failure") {
     const deleted = await window.literatureDesktop.request({ path: `/papers/${id}`, method: "DELETE" });
     if (deleted.status !== 200) throw new Error("无法准备临时笔记保存失败。");
     const draft = "Synthetic recovery draft retained after note-save failure.";
-    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(note(), draft);
+    note().textContent = draft;
     note().dispatchEvent(new Event("input", { bubbles: true }));
     await waitFor(() => document.querySelector(".pdf-reader-notes-heading .is-failed"), "笔记保存失败");
     return { draft };
@@ -110,7 +110,7 @@ async function recoveryStep({ stage, id, title }) {
   if (stage === "note-failure") {
     marker("import").click();
     await waitFor(() => marker("recovery-error")?.textContent.includes("笔记尚未保存") && !marker("import").disabled, "保存失败保护导入");
-    if (note().value !== "Synthetic recovery draft retained after note-save failure." || localStorage.getItem(`literature:reading-note:${id}`) !== note().value) throw new Error("导入前保存失败丢失笔记草稿。");
+    if (note().textContent !== "Synthetic recovery draft retained after note-save failure." || localStorage.getItem(`literature:reading-note:${id}`) !== note().textContent) throw new Error("导入前保存失败丢失笔记草稿。");
     const restored = await window.literatureDesktop.request({ path: `/papers/${id}/restore`, method: "POST" });
     if (restored.status !== 200) throw new Error("无法恢复临时论文。");
     [...document.querySelectorAll(".pdf-reader-note-error button")].find((button) => button.textContent.includes("重试保存笔记")).click();
@@ -127,9 +127,9 @@ async function recoveryStep({ stage, id, title }) {
   }
   if (stage === "imported") {
     await waitFor(rendered, "本地 PDF 导入后重新载入阅读器");
-    if (marker("load-error") || note().value !== "Synthetic recovery draft retained after note-save failure.") throw new Error("导入完成丢失笔记草稿或仍显示来源错误。");
+    if (marker("load-error") || note().textContent !== "Synthetic recovery draft retained after note-save failure.") throw new Error("导入完成丢失笔记草稿或仍显示来源错误。");
     const current = await paper();
-    if (current.pdfArchive?.status !== "ready" || current.note !== note().value) throw new Error("本地 PDF 没有绑定现有论文与笔记。");
+    if (current.pdfArchive?.status !== "ready" || current.note !== note().textContent) throw new Error("本地 PDF 没有绑定现有论文与笔记。");
     if (document.querySelector(".paper-intake-modal")) throw new Error("阅读器导入重新打开了论文录入。");
     await leave();
     return { localImportRenderedRealPdf: true, localImportPreservedPaperAndNote: true, localImportReadyPersisted: true };

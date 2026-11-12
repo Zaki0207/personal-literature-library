@@ -38,7 +38,7 @@ async function documentImportStep({ stage, title, count, field, value, metadata 
   };
   const assertDraft = () => {
     for (const name of ["source", "institution", "note"]) {
-      if (input(name)?.value !== (metadata[name] ?? "")) throw new Error(`录入草稿丢失 ${name}。`);
+      if ((input(name)?.isContentEditable ? input(name)?.innerText : input(name)?.value) !== (metadata[name] ?? "")) throw new Error(`录入草稿丢失 ${name}。`);
     }
   };
   if (stage === "field-position") {
@@ -56,7 +56,7 @@ async function documentImportStep({ stage, title, count, field, value, metadata 
     return true;
   }
   if (stage === "field-entered") {
-    await waitFor(() => input(field)?.value === value, `实际键盘输入 ${field}`);
+    await waitFor(() => (input(field)?.isContentEditable ? input(field)?.innerText : input(field)?.value) === value, `实际键盘输入 ${field}`);
     if (document.activeElement !== input(field)) throw new Error(`输入 ${field} 后焦点被抢走。`);
     return true;
   }
@@ -101,7 +101,7 @@ async function documentImportStep({ stage, title, count, field, value, metadata 
     assertMetadata(paper);
     const open = await waitFor(() => [...document.querySelectorAll(".paper-detail-title")].find((element) => element.textContent.trim() === title), "首次资料阅读入口");
     open.click();
-    await waitFor(() => document.querySelector(".pdf-reader-notes textarea")?.value === metadata.note, "首次入库备注可在阅读器直接读取");
+    await waitFor(() => document.querySelector(".pdf-reader-notes [data-note-input]")?.textContent === metadata.note, "首次入库备注可在阅读器直接读取");
     document.querySelector(".pdf-reader-back").click();
     await waitFor(() => !document.querySelector(".pdf-reader"), "返回资料库");
     return { initialNoteReadable: true };

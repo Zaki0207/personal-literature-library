@@ -6,6 +6,8 @@ const routes = [
   [new RegExp(`^/api/papers/${entity}/restore$`), ["POST"]],
   [new RegExp(`^/api/papers/${entity}/pdf/archive$`), ["POST", "DELETE"]],
   [new RegExp(`^/api/papers/${entity}/reading-position$`), ["GET", "PUT"]],
+  [new RegExp(`^/api/papers/${entity}/pdf-(?:notes|highlights)$`), ["GET"]],
+  [new RegExp(`^/api/papers/${entity}/pdf-(?:notes|highlights)/${entity}$`), ["PUT", "DELETE"]],
   [/^\/api\/paper-intake\/analyze$/, ["POST"]],
   [/^\/api\/paper-intake\/prompt-template$/, ["GET", "PUT"]],
   [/^\/api\/paper-intake\/prompt-template\/reset$/, ["POST"]],
@@ -54,7 +56,7 @@ export function validateApiRequest(input) {
   if (pathname.includes("%") || path.split("?").length > 2) throw new Error("桌面 API 路径无效。");
   if (query !== undefined) {
     const params = new URLSearchParams(query);
-    if (method !== "GET" || !new RegExp(`^/api/papers/${entity}/reading-position$`).test(pathname)
+    if (method !== "GET" || !new RegExp(`^/api/papers/${entity}/(?:reading-position|pdf-(?:notes|highlights))$`).test(pathname)
       || [...params.keys()].length !== 1 || !params.has("pdfVersion") || !/^[A-Za-z0-9:_-]{1,128}$/u.test(params.get("pdfVersion"))) {
       throw new Error("桌面 API 查询参数无效。");
     }

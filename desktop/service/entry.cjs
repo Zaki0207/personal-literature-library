@@ -53,6 +53,9 @@ parent.on("message", async ({ data }) => {
     let result;
     if (operation === "pdf-file") result = await getPdfFile(payload.paperId);
     else if (operation === "import-pdf") result = await api.pdfArchiveService.importPdf(payload.paperId, createReadStream(payload.filePath));
+    else if (operation === "import-supplement") result = await api.paperSupplementsService.importLocalFile(payload.paperId, payload.filePath);
+    else if (operation === "supplement-file") result = await api.paperSupplementsService.getLocalFile(payload.paperId, payload.id);
+    else if (operation === "remove-supplement") result = await api.paperSupplementsService.remove(payload.paperId, payload.id);
     else throw new Error("未知文献服务操作。");
     parent.postMessage({ id, result });
   } catch (error) {

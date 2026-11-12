@@ -157,6 +157,20 @@ export function sendPdfFile(response, request, file, title) {
   stream.pipe(response);
 }
 
+export function sendSupplementFile(response, request, { path, name, sizeBytes }) {
+  const filename = encodeURIComponent(name).replace(/['()*]/gu, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  response.writeHead(200, responseHeaders(request, {
+    "Content-Type": "application/octet-stream",
+    "Content-Length": String(sizeBytes),
+    "Content-Disposition": `attachment; filename="supplement"; filename*=UTF-8''${filename}`,
+    "X-Content-Type-Options": "nosniff",
+  }));
+  const stream = createReadStream(path);
+  stream.once("error", () => response.destroy());
+  response.once("close", () => stream.destroy());
+  stream.pipe(response);
+}
+
 function assertLocalRequestOrigin(request, message) {
   const origin = request.headers.origin;
   if (origin && !allowedOrigin(origin)) {

@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 
 // Production UI checks against the isolated PDFs created by smoke-desktop.mjs.
-async function readerStep({ stage, title, expectedAnchor }) {
+async function readerStep({ stage, title, expectedAnchor, selectionScale }) {
   const trace = [];
   const waitFor = async (predicate, label) => {
     const deadline = Date.now() + 15_000;
@@ -12,7 +12,7 @@ async function readerStep({ stage, title, expectedAnchor }) {
       if (error) throw new Error(`${label}: ${error.textContent}`);
       await new Promise((resolve) => setTimeout(resolve, 60));
     }
-    throw new Error(`连续阅读验证超时：${label}；${JSON.stringify({ currentPage: document.querySelector(".pdf-reader-page-controls input")?.value, scrollTop: document.querySelector(".pdf-reader-viewport")?.scrollTop, scrollHeight: document.querySelector(".pdf-reader-viewport")?.scrollHeight, viewportHeight: document.querySelector(".pdf-reader-viewport")?.clientHeight, zoom: document.querySelector(".pdf-reader-zoom-controls span")?.textContent, navigation: { tab: document.querySelector('.pdf-navigation-tabs [aria-selected="true"]')?.textContent, bounds: document.querySelector(".pdf-reader-navigation")?.getBoundingClientRect().toJSON(), text: document.querySelector(".pdf-reader-navigation")?.textContent, thumbnails: [...document.querySelectorAll("[data-thumbnail-page]")].map((element) => ({ page: element.dataset.thumbnailPage, canvasWidth: element.querySelector("canvas")?.width, bounds: element.getBoundingClientRect().toJSON() })) }, pages: [...document.querySelectorAll(".pdf-reader-page-surface")].map((element) => ({ page: element.dataset.pageNumber, height: element.getBoundingClientRect().height, canvas: Boolean(element.querySelector("canvas")), text: element.querySelector(".pdf-reader-text-layer")?.textContent })) })}`);
+    throw new Error(`连续阅读验证超时：${label}；${JSON.stringify({ currentPage: document.querySelector(".pdf-reader-page-controls input")?.value, scrollTop: document.querySelector(".pdf-reader-viewport")?.scrollTop, scrollHeight: document.querySelector(".pdf-reader-viewport")?.scrollHeight, viewportHeight: document.querySelector(".pdf-reader-viewport")?.clientHeight, zoom: document.querySelector(".pdf-reader-zoom-controls input")?.value, navigation: { tab: document.querySelector('.pdf-navigation-tabs [aria-selected="true"]')?.textContent, bounds: document.querySelector(".pdf-reader-navigation")?.getBoundingClientRect().toJSON(), text: document.querySelector(".pdf-reader-navigation")?.textContent, thumbnails: [...document.querySelectorAll("[data-thumbnail-page]")].map((element) => ({ page: element.dataset.thumbnailPage, canvasWidth: element.querySelector("canvas")?.width, bounds: element.getBoundingClientRect().toJSON() })) }, pages: [...document.querySelectorAll(".pdf-reader-page-surface")].map((element) => ({ page: element.dataset.pageNumber, height: element.getBoundingClientRect().height, canvas: Boolean(element.querySelector("canvas")), text: element.querySelector(".pdf-reader-text-layer")?.textContent })) })}`);
   };
   const input = (element, value) => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(element, String(value));
@@ -37,9 +37,9 @@ async function readerStep({ stage, title, expectedAnchor }) {
   };
   const checkAnchor = async (expected, label) => {
     let stable = 0;
-    trace.push({ label, anchor: anchor(), width: viewport().clientWidth, pageHeight: surface().getBoundingClientRect().height, scale: document.querySelector(".pdf-reader-zoom-controls span")?.textContent });
+    trace.push({ label, anchor: anchor(), width: viewport().clientWidth, pageHeight: surface().getBoundingClientRect().height, scale: document.querySelector(".pdf-reader-zoom-controls input")?.value });
     try { await waitFor(() => { stable = currentPage() === expected.pageNumber && Math.abs(anchor().ratio - expected.ratio) < 0.035 ? stable + 1 : 0; return stable >= 3; }, label); }
-    catch (error) { throw new Error(`${error.message}；${JSON.stringify({ expected, actual: anchor(), scrollTop: viewport().scrollTop, viewportHeight: viewport().clientHeight, pageTop: pageTop(currentPage()), pageHeight: surface().getBoundingClientRect().height, scale: document.querySelector(".pdf-reader-zoom-controls span")?.textContent, trace })}`); }
+    catch (error) { throw new Error(`${error.message}；${JSON.stringify({ expected, actual: anchor(), scrollTop: viewport().scrollTop, viewportHeight: viewport().clientHeight, pageTop: pageTop(currentPage()), pageHeight: surface().getBoundingClientRect().height, scale: document.querySelector(".pdf-reader-zoom-controls input")?.value, trace })}`); }
     return anchor();
   };
   const navigationToggle = () => document.querySelector("[data-reader-navigation-toggle]");
@@ -60,6 +60,115 @@ async function readerStep({ stage, title, expectedAnchor }) {
     document.querySelector(".pdf-reader-back").click();
     await waitFor(() => !document.querySelector(".pdf-reader"), "保存阅读位置并返回");
   };
+
+  if (stage === "prepare-selection") {
+    const zoom = document.querySelector(".pdf-reader-zoom-controls input");
+    if (selectionScale === "fit-width") [...document.querySelectorAll(".pdf-reader-zoom-controls button")].find((button) => button.textContent === "适应宽度").click();
+    else {
+      input(zoom, selectionScale);
+      zoom.closest("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    }
+    await waitFor(() => document.querySelector(".pdf-reader-zoom-controls input")?.value === (selectionScale === "fit-width" ? "适应宽度" : selectionScale), "选择测试缩放提交");
+    await goToPage(1);
+    await waitFor(() => renderedPage(1) && !surface(1).querySelector(".pdf-reader-page-placeholder") && [...surface(1).querySelectorAll("canvas")].every((canvas) => canvas.dataset.pdfTileReady === "true"), "选择测试页面绘制完成");
+    const initialBox = surface(1).getBoundingClientRect();
+    const initialView = viewport().getBoundingClientRect();
+    viewport().scrollLeft += initialBox.left + (50 + 345.936 / 2) * initialBox.width / 612 - (initialView.left + viewport().clientWidth / 2);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const box = surface(1).getBoundingClientRect();
+    const scale = box.width / 612;
+    const text = "Gaussian reconstruction reader smoke page one";
+    const span = [...surface(1).querySelectorAll(".pdf-reader-text-layer span")].find((span) => span.textContent === text);
+    const marker = document.createElement("i");
+    marker.style.cssText = "display:inline-block;width:0;height:0;vertical-align:baseline";
+    span.append(marker);
+    const baselineError = marker.getBoundingClientRect().top - (box.top + 52 * scale);
+    marker.remove();
+    // Independent PDF geometry: Helvetica 16pt at (50, 740), on a 612x792 page.
+    const widthError = span.getBoundingClientRect().width - 345.936 * scale;
+    if (Math.abs(baselineError) > 0.25 || Math.abs(widthError) > 0.25) throw new Error(`PDF选择层没有对齐原文：${JSON.stringify({ selectionScale, baselineError, widthError })}`);
+    window.getSelection().removeAllRanges();
+    const start = { x: Math.ceil(box.left + 50 * scale) + 1, y: Math.round(box.top + 46 * scale) };
+    const end = { x: Math.floor(box.left + (50 + 345.936) * scale) - 1, y: start.y };
+    const view = viewport().getBoundingClientRect();
+    if (start.x < view.left || end.x > view.right || start.y < view.top || start.y > view.bottom) throw new Error(`PDF拖选测试坐标超出阅读视口：${JSON.stringify({ start, end, view: view.toJSON() })}`);
+    const hit = (point) => {
+      const caret = document.caretRangeFromPoint(point.x, point.y);
+      return { text: caret?.startContainer.textContent, offset: caret?.startOffset, element: document.elementFromPoint(point.x, point.y)?.tagName };
+    };
+    window.__pdfSelectionAbort?.abort();
+    window.__pdfSelectionObserver?.disconnect();
+    window.__pdfSelectionEvents = [];
+    window.__pdfSelectionAbort = new AbortController();
+    for (const type of ["mousedown", "mousemove", "mouseup", "blur", "selectionchange"]) document.addEventListener(type, (event) => {
+      if (window.__pdfSelectionEvents.length < 40) window.__pdfSelectionEvents.push({ type, x: event.clientX, y: event.clientY, buttons: event.buttons, target: event.target.tagName, selected: window.getSelection()?.toString() });
+    }, { capture: true, signal: window.__pdfSelectionAbort.signal });
+    window.__pdfSelectionObserver = new MutationObserver(() => window.__pdfSelectionEvents.push({ type: "text-layer-mutation" }));
+    window.__pdfSelectionObserver.observe(span.parentElement, { subtree: true, childList: true, characterData: true });
+    return { start, end, text, baselineError, widthError, scale, hitStart: hit(start), hitEnd: hit(end), focused: document.hasFocus() };
+  }
+  if (stage === "check-selection") {
+    try {
+      let held = false;
+      let interrupted = false;
+      for (const event of window.__pdfSelectionEvents) {
+        if (event.type === "mousedown") held = true;
+        if (event.type === "mouseup") held = false;
+        if (held && event.type === "mousemove" && event.buttons === 0) interrupted = true;
+      }
+      if (interrupted && window.getSelection()?.toString() !== expectedAnchor.text) throw new Error("桌面指针输入中断了测试拖选。");
+      await waitFor(() => window.getSelection()?.toString() === expectedAnchor.text, `鼠标拖选应复制完整原文；当前选中：${window.getSelection()?.toString()}；${JSON.stringify(expectedAnchor)}`);
+    } catch (error) { throw new Error(`${error.message}；输入事件：${JSON.stringify(window.__pdfSelectionEvents)}`); }
+    finally { window.__pdfSelectionAbort?.abort(); window.__pdfSelectionObserver?.disconnect(); }
+    if (selectionScale !== "fit-width") window.getSelection().removeAllRanges();
+    return { browserMouseDrag: true, selectedText: expectedAnchor.text, scale: expectedAnchor.scale, baselineError: expectedAnchor.baselineError, widthError: expectedAnchor.widthError };
+  }
+
+  if (stage === "highlight-action") {
+    const action = await waitFor(() => document.querySelector(".pdf-reader-toolbar [data-pdf-highlight-add]:enabled"), "选中文本后可点击工具栏高亮");
+    const { x, y, width, height } = action.getBoundingClientRect();
+    return { x: Math.round(x + width / 2), y: Math.round(y + height / 2), text: window.getSelection().toString() };
+  }
+
+  if (stage === "highlight-persisted") {
+    const mark = () => surface(1)?.querySelector("[data-pdf-highlight]");
+    const text = () => [...(surface(1)?.querySelectorAll(".pdf-reader-text-layer span") ?? [])].find((span) => span.textContent === expectedAnchor.text);
+    const aligned = () => {
+      const overlay = mark();
+      const span = text();
+      if (!overlay || !span) return false;
+      const range = document.createRange();
+      range.selectNodeContents(span);
+      const selected = range.getBoundingClientRect();
+      const actual = overlay.getBoundingClientRect();
+      return ["left", "top", "right", "bottom"].every((key) => Math.abs(actual[key] - selected[key]) < 2);
+    };
+    await waitFor(aligned, "保存的高亮与拖选文字对齐");
+    const id = mark().dataset.pdfHighlight;
+    const zoom = document.querySelector(".pdf-reader-zoom-controls input");
+    input(zoom, "125%");
+    zoom.closest("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await waitFor(() => surface(1)?.getBoundingClientRect().width === 765 && aligned(), "缩放后高亮仍与文字对齐");
+    await leave();
+    const close = document.querySelector('[data-reading-close="desktop-smoke"]');
+    close.click();
+    await waitFor(() => !close.isConnected, "关闭论文标签");
+    await open();
+    await waitFor(() => mark()?.dataset.pdfHighlight === id && aligned(), "重新打开 PDF 恢复高亮");
+    const list = document.querySelector(".pdf-highlight-list");
+    list.open = true;
+    if (list.querySelector(".pdf-highlight-jump span")?.textContent !== expectedAnchor.text) throw new Error("高亮列表没有显示选中的原文。");
+    const range = document.createRange();
+    range.selectNodeContents(text());
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    const remove = await waitFor(() => document.querySelector(".pdf-reader-toolbar [data-pdf-highlight-remove]:enabled"), "已高亮文字可从工具栏取消");
+    if (!document.querySelector("[data-pdf-highlight-add]").disabled) throw new Error("重复选中的文字仍可再次高亮。");
+    remove.click();
+    await waitFor(() => !mark() && !document.querySelector(".pdf-highlight-list"), "工具栏取消高亮");
+    [...document.querySelectorAll(".pdf-reader-zoom-controls button")].find((button) => button.textContent === "适应宽度").click();
+    return { savedFromSelection: true, alignedAfterZoom: true, restoredAfterClose: true, duplicateDisabled: true, removedFromToolbar: true };
+  }
 
   if (stage === "legacy") {
     const button = await waitFor(() => [...document.querySelectorAll(".paper-detail-title")].find((candidate) => candidate.textContent.trim() === title), "准备旧版阅读进度");
@@ -82,7 +191,7 @@ async function readerStep({ stage, title, expectedAnchor }) {
     return { pagePreserved: true, offsetConverted: true, firstSaveContinuous: true, converted };
   }
   if (stage === "prepare-wheel") {
-    await open();
+    if (!document.querySelector(".pdf-reader")) await open();
     await setNavigation(false);
     await goToPage(1);
     const frames = [...viewport().querySelectorAll(".pdf-reader-page-frame[data-page-number]")];
@@ -219,6 +328,69 @@ async function readerStep({ stage, title, expectedAnchor }) {
     await leave();
     return { pageAndOffsetRestored: true, restored };
   }
+  if (stage === "high-zoom") {
+    const setZoom = async (value, expectedScale) => {
+      const control = document.querySelector('.pdf-reader-zoom-controls input');
+      input(control, value);
+      control.closest("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await waitFor(() => Math.abs(surface(2).getBoundingClientRect().width - 612 * expectedScale) < 1, `输入倍率${value}`);
+    };
+    const tilesReady = () => {
+      const canvases = [...surface(2).querySelectorAll("canvas")];
+      return canvases.length > 0 && canvases.every((canvas) => canvas.dataset.pdfTileReady === "true");
+    };
+    const checkCoverage = async () => {
+      await waitFor(() => {
+        if (!tilesReady()) return false;
+        const view = viewport().getBoundingClientRect();
+        const boxes = [...surface(2).querySelectorAll("canvas")].map((canvas) => canvas.getBoundingClientRect());
+        for (const dx of [20, viewport().clientWidth / 2, viewport().clientWidth - 20]) {
+          for (const dy of [20, viewport().clientHeight / 2, viewport().clientHeight - 20]) {
+            if (!boxes.some((box) => view.left + dx >= box.left && view.left + dx < box.right && view.top + dy >= box.top && view.top + dy < box.bottom)) return false;
+          }
+        }
+        return true;
+      }, "高倍率滚动后可见区域全部清晰渲染");
+      const canvases = [...surface(2).querySelectorAll("canvas")];
+      const pixels = canvases.reduce((sum, canvas) => sum + canvas.width * canvas.height, 0);
+      if (pixels > 24_000_000 || canvases.some((canvas) => canvas.width > 1024 || canvas.height > 1024)) throw new Error(`高倍率画布分配超限：${pixels}`);
+      return { tiles: canvases.length, pixels };
+    };
+    await goToPage(2);
+    await setZoom("6400%", 64);
+    if (!document.querySelector('.pdf-reader-zoom-controls button[aria-label="放大"]').disabled) throw new Error("6400%仍可继续越界放大。");
+    const pageLeft = surface(2).getBoundingClientRect().left - viewport().getBoundingClientRect().left + viewport().scrollLeft - viewport().clientLeft;
+    viewport().scrollTo({ left: pageLeft + 50 * 64, top: pageTop(2) + 400 * 64, behavior: "instant" });
+    const initial = await checkCoverage();
+    const hasInk = [...surface(2).querySelectorAll("canvas")].some((canvas) => {
+      const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+      for (let index = 0; index < data.length; index += 4 * 16) if (data[index + 3] > 0 && data[index] < 100) return true;
+      return false;
+    });
+    if (!hasInk) throw new Error("高倍率分块画布未绘制测试PDF的真实文字。");
+    viewport().scrollBy({ left: 1600, top: 1800, behavior: "instant" });
+    const scrolled = await checkCoverage();
+    const before = anchor();
+    await leave();
+    await open();
+    await checkAnchor(before, "6400%重新打开恢复页码及页内偏移");
+    if (document.querySelector('.pdf-reader-zoom-controls input').value !== "6400%") throw new Error("重新打开未恢复6400%倍率。");
+    await setZoom("800%", 8);
+    const beforeWidth = surface(2).getBoundingClientRect().width;
+    const view = viewport().getBoundingClientRect();
+    viewport().dispatchEvent(new WheelEvent("wheel", { ctrlKey: true, clientX: view.left + 100, clientY: view.top + 100, deltaY: -20, bubbles: true, cancelable: true }));
+    await waitFor(() => surface(2).getBoundingClientRect().width > beforeWidth, "触控板可继续放大超过400%");
+    document.activeElement?.blur();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "0", metaKey: true, bubbles: true, cancelable: true }));
+    await waitFor(() => surface(2).getBoundingClientRect().width === 612, "⌘0恢复实际大小");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "+", metaKey: true, bubbles: true, cancelable: true }));
+    await waitFor(() => surface(2).getBoundingClientRect().width === 765, "⌘＋放大PDF");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "-", metaKey: true, bubbles: true, cancelable: true }));
+    await waitFor(() => surface(2).getBoundingClientRect().width === 612, "⌘−缩小PDF");
+    await setZoom("6401%", 1);
+    await waitFor(() => document.querySelector('.pdf-reader-zoom-controls input').value === "100%", "越界倍率输入恢复原值");
+    return { maximumPercent: 6400, initial, scrolled, realPdfInk: true, savedAndRestored: true, pinchBeyond400: true, keyboardZoom: true, invalidInputRejected: true };
+  }
   if (stage === "long-open") {
     await open();
     await goToPage(1);
@@ -244,7 +416,7 @@ async function readerStep({ stage, title, expectedAnchor }) {
       reduce.click();
       await new Promise((resolve) => setTimeout(resolve, 40));
     }
-    await waitFor(() => document.querySelector(".pdf-reader-zoom-controls span")?.textContent === "25%", "长文档缩小到25%");
+    await waitFor(() => document.querySelector(".pdf-reader-zoom-controls input")?.value === "25%", "长文档缩小到25%");
     await new Promise((resolve) => setTimeout(resolve, 300));
     const smallCanvases = viewport().querySelectorAll(".pdf-reader-page-surface canvas").length;
     if (smallCanvases > 16 || smallCanvases < 1) throw new Error(`25%缩放渲染了过多长文档页面：${smallCanvases}`);
@@ -268,13 +440,71 @@ export async function verifyContinuousDesktopReader(window, { title, longTitle }
   const visible = window.isVisible();
   try {
     const legacy = await step(window, { stage: "legacy", title });
-    const wheel = await step(window, { stage: "prepare-wheel", title });
+    await step(window, { stage: "prepare-wheel", title });
     // Electron requires a focused BrowserWindow for native input. Only this
     // isolated test window is shown, never the user's actual library window.
     window.show(); window.focus(); window.webContents.focus();
+    const textSelection = [];
+    let highlights;
+    // Dispatch real Chromium input directly to this isolated test window.
+    // OS focus changes must not release the button halfway through a drag.
+    const inputDebugger = window.webContents.debugger;
+    const wasAttached = inputDebugger.isAttached();
+    if (!wasAttached) inputDebugger.attach("1.3");
+    try {
+      // CDP still reaches the renderer directly; physical desktop pointer
+      // movement must not release the test's held button between CDP calls.
+      window.setIgnoreMouseEvents(true);
+      await inputDebugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+      for (const selectionScale of ["100%", "196%", "fit-width"]) {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const selection = await step(window, { stage: "prepare-selection", selectionScale });
+          await inputDebugger.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", ...selection.start });
+          // Enqueue one native drag without yielding between its input events.
+          // Only a verified physical-input interruption permits a retry below.
+          await Promise.all([
+            inputDebugger.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, ...selection.start }),
+            inputDebugger.sendCommand("Input.dispatchMouseEvent", { type: "mouseMoved", button: "left", buttons: 1, ...selection.end }),
+            inputDebugger.sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, ...selection.end }),
+          ]);
+          try {
+            textSelection.push(await step(window, { stage: "check-selection", expectedAnchor: selection, selectionScale }));
+            break;
+          } catch (error) {
+            const interrupted = await window.webContents.executeJavaScript(`(() => {
+              let held = false;
+              return window.__pdfSelectionEvents.some(event => {
+                if (event.type === 'mousedown') held = true;
+                if (event.type === 'mouseup') held = false;
+                return held && event.type === 'mousemove' && event.buttons === 0;
+              });
+            })()`);
+            if (!interrupted || attempt === 2) throw error;
+            console.log(`[desktop-smoke] retry interrupted native selection: ${selectionScale}`);
+          }
+        }
+      }
+      const action = await step(window, { stage: "highlight-action" });
+      await Promise.all([
+        inputDebugger.sendCommand("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", buttons: 1, clickCount: 1, x: action.x, y: action.y }),
+        inputDebugger.sendCommand("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", buttons: 0, clickCount: 1, x: action.x, y: action.y }),
+      ]);
+      highlights = await step(window, { stage: "highlight-persisted", title, expectedAnchor: action });
+    } finally {
+      if (!wasAttached) window.setIgnoreMouseEvents(false);
+      if (inputDebugger.isAttached()) {
+        if (!wasAttached) {
+          await inputDebugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: false });
+          inputDebugger.detach();
+        }
+      }
+    }
+    const wheel = await step(window, { stage: "prepare-wheel", title });
     window.webContents.sendInputEvent({ type: "mouseMove", x: wheel.x, y: wheel.y });
     window.webContents.sendInputEvent({ type: "mouseWheel", x: wheel.x, y: wheel.y, deltaY: wheel.deltaY, deltaX: 0, canScroll: true, hasPreciseScrollingDeltas: true });
     const report = await step(window, { stage: "functional" });
+    report.textSelection = textSelection;
+    report.highlights = highlights;
     report.legacy = legacy;
     const browserZoom = window.webContents.getZoomFactor();
     const pinch = await step(window, { stage: "prepare-pinch" });
@@ -300,6 +530,8 @@ export async function verifyContinuousDesktopReader(window, { title, longTitle }
     window.webContents.sendInputEvent({ type: "mouseWheel", modifiers: ["control"], x: mixedPinch.x, y: mixedPinch.y, deltaY: 80, deltaX: 0, canScroll: true, hasPreciseScrollingDeltas: true });
     report.mixedPagePinch = await step(window, { stage: "pinch", expectedAnchor: mixedPinch });
     if (window.webContents.getZoomFactor() !== browserZoom) throw new Error("混合页面捏合改变了浏览器缩放。");
+    report.highZoom = await step(window, { stage: "high-zoom", title });
+    if (window.webContents.getZoomFactor() !== browserZoom) throw new Error("高倍率缩放改变了整个应用的浏览器缩放。");
     await step(window, { stage: "leave" });
     await step(window, { stage: "screenshot-boundary", title });
     await writeFile("/tmp/literature-reader-0.1.3.png", (await window.webContents.capturePage()).toPNG());

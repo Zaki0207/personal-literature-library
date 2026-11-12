@@ -7,6 +7,7 @@ import {
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   ReactNode,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -59,12 +60,17 @@ import type {
   RadarItem,
   RadarPromptTemplateResponse,
   RadarStateResponse,
+  SupplementMutationResponse,
 } from "./library/contracts";
 import { ApiRequestError, libraryRequest, pdfOpenUrl, type PaperIntakeDiagnostic as IntakeDiagnostic } from "./library/api-client";
 import { RadarSurface } from "./library/components/radar-surface";
 import { PaperIntakeSources } from "./library/components/paper-intake-sources";
 import { PaperIntakePromptEditor } from "./library/components/paper-intake-prompt-editor";
 import { PaperIntakeDiagnostic } from "./library/components/paper-intake-diagnostic";
+import { NoteEditor, NoteText } from "./library/components/note-editor";
+import { PaperSupplements } from "./library/components/paper-supplements";
+import { ReadingTabs } from "./library/components/reading-tabs";
+import type { PdfReaderHandle } from "./library/components/pdf-reader";
 import {
   AI_REASONING_EFFORT_LABELS,
   cardTextSizeLabels,
@@ -74,7 +80,7 @@ import {
   formatAiVerifiedTime,
   formatBackupTime,
   formatPdfArchiveTime,
-  formatPdfSize,
+  formatFileSize,
   formatRadarAiTraceTime,
   normalizeAiBaseUrlForComparison,
   normalizeCategoryRecords,
@@ -101,6 +107,12 @@ function emptyIntakeDraft(title = ""): PaperIntakeDraft {
 
 export default function Home() {
   const [readingPaperId, setReadingPaperId] = useState<string | null>(null);
+  const [openReadingPaperIds, setOpenReadingPaperIds] = useState<string[]>([]);
+  const [readingTabBusy, setReadingTabBusy] = useState(false);
+  const [readerSaveFailures, setReaderSaveFailures] = useState(new Set<string>());
+  const readerHandlesRef = useRef(new Map<string, PdfReaderHandle>());
+  const readingTabBusyRef = useRef(false);
+  const readingTabHistoryRef = useRef<(string | null)[]>([]);
   const [pendingPdfGrants, setPendingPdfGrants] = useState<DesktopPdfGrant[]>([]);
   const [desktopDataOpen, setDesktopDataOpen] = useState(false);
   const [desktopDropBusy, setDesktopDropBusy] = useState(false);
@@ -227,10 +239,22 @@ export default function Home() {
   const [titlePreviewPaperId, setTitlePreviewPaperId] = useState<string | null>(
     null,
   );
+  const [supplementPaperId, setSupplementPaperId] = useState<string | null>(null);
+  const [supplementsBusy, setSupplementsBusy] = useState(false);
   const [editDraft, setEditDraft] = useState<PaperEditDraft | null>(null);
   const [editBaseline, setEditBaseline] = useState("");
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const [savingPaper, setSavingPaper] = useState(false);
+  const [cardNoteEditor, setCardNoteEditor] = useState<{
+    paperId: string;
+    value: string;
+    baseline: string;
+  } | null>(null);
+  const [savingCardNote, setSavingCardNote] = useState(false);
+  const [cardNoteError, setCardNoteError] = useState("");
+  const cardNoteSavingRef = useRef(false);
+  const cardNoteTriggerRef = useRef<HTMLElement | null>(null);
+  const cardNoteDirty = Boolean(cardNoteEditor && cardNoteEditor.value !== cardNoteEditor.baseline);
   const [pdfActionBusyId, setPdfActionBusyId] = useState<string | null>(
     null,
   );
@@ -272,6 +296,7 @@ export default function Home() {
     radarAiTraceOpen ||
     radarPromptEditorOpen ||
     editingPaperId !== null ||
+    supplementPaperId !== null ||
     titlePreviewPaperId !== null;
   const radarPromptTemplateDirty = Boolean(
     radarState &&
@@ -288,7 +313,17 @@ export default function Home() {
   const titlePreviewPaper = titlePreviewPaperId
     ? papers.find((paper) => paper.id === titlePreviewPaperId) ?? null
     : null;
+  const supplementPaper = papers.find((paper) => paper.id === supplementPaperId);
   const readingPaper = readingPaperId ? papers.find((paper) => paper.id === readingPaperId) ?? null : null;
+  const openReadingPapers = openReadingPaperIds.map((id) => papers.find((paper) => paper.id === id)).filter((paper): paper is Paper => Boolean(paper));
+  const onReaderSaveStateChanged = useCallback((paperId: string, failed: boolean) => {
+    setReaderSaveFailures((current) => {
+      if (current.has(paperId) === failed) return current;
+      const next = new Set(current);
+      if (failed) next.add(paperId); else next.delete(paperId);
+      return next;
+    });
+  }, []);
 
   useLayoutEffect(() => {
     const paperId = libraryReturnPaperRef.current;
@@ -962,6 +997,13 @@ export default function Home() {
         paper.id === updatedPaper.id ? updatedPaper : paper,
       ),
     );
+  };
+
+  const applySupplementChange = ({ paper: updated, backup }: SupplementMutationResponse) => {
+    setPapers((current) => current.map((paper) => paper.id === updated.id
+      ? { ...paper, supplements: updated.supplements }
+      : paper));
+    applyBackupStatus(backup);
   };
 
   const patchPaper = async (
@@ -2219,7 +2261,82 @@ export default function Home() {
     }
   };
 
+  const focusCardNote = () => {
+    window.requestAnimationFrame(() => {
+      const input = document.querySelector<HTMLElement>("[data-card-note-input]");
+      input?.closest(".note-row")?.scrollIntoView({ block: "center" });
+      input?.focus({ preventScroll: true });
+    });
+  };
+
+  const returnCardNoteFocus = (paperId: string) => {
+    window.requestAnimationFrame(() => {
+      const trigger = cardNoteTriggerRef.current?.isConnected
+        ? cardNoteTriggerRef.current
+        : document.querySelector<HTMLElement>(`[data-card-note-edit="${paperId}"]`);
+      trigger?.focus({ preventScroll: true });
+    });
+  };
+
+  const closeCardNote = () => {
+    if (!cardNoteEditor || cardNoteSavingRef.current) return;
+    if (cardNoteDirty && !window.confirm("放弃尚未保存的笔记修改？")) return;
+    setCardNoteEditor(null);
+    setCardNoteError("");
+    returnCardNoteFocus(cardNoteEditor.paperId);
+  };
+
+  const openCardNote = (paper: Paper, trigger: HTMLElement) => {
+    if (cardNoteSavingRef.current) return;
+    if (cardNoteEditor?.paperId === paper.id) { focusCardNote(); return; }
+    if (cardNoteDirty && !window.confirm("放弃当前笔记修改，编辑另一篇论文的笔记？")) return;
+    cardNoteTriggerRef.current = trigger;
+    setCardNoteEditor({ paperId: paper.id, value: paper.note ?? "", baseline: paper.note ?? "" });
+    setCardNoteError("");
+    setOpenMenu(null);
+    focusCardNote();
+  };
+
+  const saveCardNote = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!cardNoteEditor || cardNoteSavingRef.current) return;
+    if (libraryConnection !== "ready") {
+      setCardNoteError("本机数据库未连接，笔记尚未保存。请稍后重试。");
+      return;
+    }
+    cardNoteSavingRef.current = true;
+    setSavingCardNote(true);
+    setCardNoteError("");
+    try {
+      const response = await libraryRequest<PaperMutationResponse>(
+        `/papers/${encodeURIComponent(cardNoteEditor.paperId)}`,
+        { method: "PATCH", body: JSON.stringify({ note: cardNoteEditor.value, noteCount: cardNoteEditor.value.trim() ? 1 : 0 }) },
+      );
+      replacePaper(response.paper);
+      applyBackupStatus(response.backup);
+      setCardNoteEditor(null);
+      setToast(savedMessage("笔记已保存", response.backup));
+      returnCardNoteFocus(cardNoteEditor.paperId);
+    } catch (error) {
+      setCardNoteError(error instanceof Error ? error.message : "笔记保存失败，请重试。");
+    } finally {
+      cardNoteSavingRef.current = false;
+      setSavingCardNote(false);
+    }
+  };
+
+  const finishCardNoteBeforeOpening = () => {
+    if (cardNoteDirty || cardNoteSavingRef.current) {
+      setToast("请先保存或取消卡片中的笔记修改。");
+      focusCardNote();
+      return false;
+    }
+    setCardNoteEditor(null);
+    return true;
+  };
+
   const openEditPaper = (paper: Paper) => {
+    if (!finishCardNoteBeforeOpening()) return;
     const draft = draftFromPaper(paper);
     draft.selectedCategoryIds = ensureCategoryAncestors(
       draft.selectedCategoryIds,
@@ -2250,7 +2367,7 @@ export default function Home() {
   };
 
   const requestCloseEditor = () => {
-    if (savingPaper) return;
+    if (savingPaper || supplementsBusy) return;
     if (editDirty) {
       discardReturnFocusRef.current =
         document.activeElement instanceof HTMLElement
@@ -2294,6 +2411,7 @@ export default function Home() {
 
   const saveEditedPaper = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (supplementsBusy) return;
     if (!editingPaper || !editDraft || libraryConnection !== "ready") {
       setToast("本机数据库未连接，修改尚未保存");
       return;
@@ -2383,6 +2501,7 @@ export default function Home() {
   };
 
   const deletePaper = async (paper: Paper) => {
+    if (cardNoteEditor?.paperId === paper.id && !finishCardNoteBeforeOpening()) return;
     setOpenMenu(null);
     if (
       !window.confirm(
@@ -2397,6 +2516,10 @@ export default function Home() {
     }
 
     try {
+      if (readerHandlesRef.current.has(paper.id) && !(await readerHandlesRef.current.get(paper.id)!.prepareToLeave())) {
+        setToast("论文的笔记尚未保存，请先切回该标签重试保存。");
+        return;
+      }
       const response = await libraryRequest<PaperMutationResponse>(
         `/papers/${encodeURIComponent(paper.id)}`,
         { method: "DELETE" },
@@ -2405,6 +2528,7 @@ export default function Home() {
       setPapers((current) =>
         current.filter((item) => item.id !== paper.id),
       );
+      setOpenReadingPaperIds((current) => current.filter((id) => id !== paper.id));
       setTitlePreviewPaperId((current) =>
         current === paper.id ? null : current,
       );
@@ -2483,6 +2607,18 @@ export default function Home() {
     setOpenMenu(null);
   };
 
+  const openSupplements = (paper: Paper, trigger: HTMLElement) => {
+    if ((modalOpen && titlePreviewPaperId !== paper.id) || readingTabBusyRef.current || !finishCardNoteBeforeOpening()) return;
+    if (!titlePreviewPaperId) modalTriggerRef.current = trigger;
+    setTitlePreviewPaperId(null);
+    setOpenMenu(null);
+    setSupplementPaperId(paper.id);
+  };
+
+  const closeSupplements = () => {
+    if (!supplementsBusy) setSupplementPaperId(null);
+  };
+
   const applyAiSettings = (
     nextSettings: AiSettingsResponse,
     preferredConnectionId?: string | null,
@@ -2538,6 +2674,7 @@ export default function Home() {
   };
 
   const hasPendingChanges = Boolean(
+    cardNoteDirty || savingCardNote || supplementsBusy ||
     (editingPaper && editDirty) ||
     (categoryManagerOpen && categoryManagerDirty) ||
     (aiSettingsOpen && hasUnsavedAiSettings()) ||
@@ -2868,15 +3005,89 @@ export default function Home() {
   };
 
   const readPaper = (paper: Paper, trigger?: HTMLElement) => {
-    libraryScrollRef.current = window.scrollY;
+    if (!finishCardNoteBeforeOpening()) return;
     libraryReaderTriggerRef.current = trigger ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     setTitlePreviewPaperId(null);
     setOpenMenu(null);
     setFiltersOpen(false);
     setTextSizeOpen(false);
-    setReadingPaperId(paper.id);
-    window.scrollTo({ top: 0 });
+    void activateReadingTab(paper.id, true);
   };
+
+  const commitReadingTab = (paperId: string | null) => {
+    if (readingPaperId === paperId) return;
+    readingTabHistoryRef.current = [...readingTabHistoryRef.current.filter((id) => id !== readingPaperId), readingPaperId];
+    if (!readingPaperId && paperId) libraryScrollRef.current = window.scrollY;
+    if (readingPaperId && !paperId) libraryReturnPaperRef.current = readingPaperId;
+    if (paperId) setOpenReadingPaperIds((current) => current.includes(paperId) ? current : [...current, paperId]);
+    setReadingPaperId(paperId);
+    if (paperId) window.scrollTo({ top: 0 });
+  };
+
+  const activateReadingTab = async (paperId: string | null, fromLibrary = false) => {
+    if (readingTabBusyRef.current || readingPaperId === paperId) return;
+    if (modalOpen && !fromLibrary) { setToast("请先完成或关闭当前编辑。"); return; }
+    if (!readingPaperId && !finishCardNoteBeforeOpening()) return;
+    readingTabBusyRef.current = true;
+    setReadingTabBusy(true);
+    try {
+      const reader = readingPaperId ? readerHandlesRef.current.get(readingPaperId) : null;
+      if (reader && !(await reader.prepareToLeave())) {
+        setToast("当前论文尚未保存，已保留在原标签，请重试保存。");
+        return;
+      }
+      if (paperId) await readerHandlesRef.current.get(paperId)?.prepareToActivate();
+      commitReadingTab(paperId);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "暂时无法切换论文，请重试。");
+    } finally { readingTabBusyRef.current = false; setReadingTabBusy(false); }
+  };
+
+  const closeReadingTab = async (paperId: string) => {
+    if (readingTabBusyRef.current || modalOpen) return;
+    readingTabBusyRef.current = true;
+    setReadingTabBusy(true);
+    try {
+      const reader = readerHandlesRef.current.get(paperId);
+      if (reader && !(await reader.prepareToLeave())) {
+        commitReadingTab(paperId);
+        setToast("这篇论文尚未保存，标签已保留，请重试保存。");
+        return;
+      }
+      if (readingPaperId === paperId) {
+        const previous = [...readingTabHistoryRef.current].reverse().find((id) => id === null || (id !== paperId && openReadingPaperIds.includes(id)));
+        if (previous) await readerHandlesRef.current.get(previous)?.prepareToActivate();
+        commitReadingTab(previous ?? null);
+      }
+      setOpenReadingPaperIds((current) => current.filter((id) => id !== paperId));
+      readingTabHistoryRef.current = readingTabHistoryRef.current.filter((id) => id !== paperId);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "暂时无法关闭论文，请重试。");
+    } finally { readingTabBusyRef.current = false; setReadingTabBusy(false); }
+  };
+
+  useEffect(() => {
+    const beforeQuit = (event: Event) => {
+      const complete = (event as CustomEvent<{ complete: (allow?: boolean) => void }>).detail?.complete;
+      if (hasPendingChanges || readingTabBusyRef.current) {
+        setToast("请先保存或关闭当前编辑，再退出应用。");
+        complete?.(false);
+        return;
+      }
+      readingTabBusyRef.current = true;
+      setReadingTabBusy(true);
+      void Promise.all([...readerHandlesRef.current].map(async ([paperId, reader]) => ({ paperId, saved: await reader.prepareToLeave() }))).then((results) => {
+        const failed = results.find((result) => !result.saved);
+        if (failed) {
+          commitReadingTab(failed.paperId);
+          setToast("论文的笔记或阅读位置尚未保存，已保留应用，请重试保存。");
+        }
+        complete?.(!failed);
+      }).catch(() => complete?.(false)).finally(() => { readingTabBusyRef.current = false; setReadingTabBusy(false); });
+    };
+    window.addEventListener("literature-save-before-quit", beforeQuit);
+    return () => window.removeEventListener("literature-save-before-quit", beforeQuit);
+  });
 
   const openPaperFromLibrary = (paper: Paper, trigger: HTMLButtonElement) => {
     if (!window.literatureDesktop) {
@@ -2898,12 +3109,7 @@ export default function Home() {
   useEffect(() => {
     desktopCommandRef.current = (command) => {
       if (command.type === "save-before-quit") {
-        if (readingPaper) {
-          window.dispatchEvent(new CustomEvent("literature-save-before-quit", { detail: { complete: (allow = true) => window.literatureDesktop?.acknowledgeQuit(allow, command.requestId) } }));
-        } else if (hasPendingChanges) {
-          setToast("请先保存或关闭当前编辑，再退出应用。");
-          window.literatureDesktop?.acknowledgeQuit(false, command.requestId);
-        } else window.literatureDesktop?.acknowledgeQuit(true, command.requestId);
+        window.dispatchEvent(new CustomEvent("literature-save-before-quit", { detail: { complete: (allow = true) => window.literatureDesktop?.acknowledgeQuit(allow, command.requestId) } }));
         return;
       }
       if (command.type === "import-pdf") { void acceptPdfGrants(command.files); return; }
@@ -2942,7 +3148,7 @@ export default function Home() {
 
     const focusable = Array.from(
       modal.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], summary',
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [contenteditable="true"], a[href], summary',
       ),
     ).filter(
       (element) =>
@@ -3836,12 +4042,62 @@ export default function Home() {
           </div>
         )}
 
-        {paper.note && (
+        {(paper.note || cardNoteEditor?.paperId === paper.id) && (
           <div className="note-row">
-            <span className="content-label note-label">
-              我的笔记{paper.noteCount ? ` · ${paper.noteCount}` : ""}
-            </span>
-            <p>{paper.note}</p>
+            <span className="content-label note-label">我的笔记</span>
+            {cardNoteEditor?.paperId === paper.id ? (
+              <form
+                className="card-note-editor"
+                data-card-note-editor={paper.id}
+                onSubmit={saveCardNote}
+                onKeyDown={(event) => {
+                  if (event.nativeEvent.isComposing) return;
+                  if ((event.metaKey || event.ctrlKey) && (event.key === "Enter" || event.key.toLowerCase() === "s")) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.currentTarget.requestSubmit();
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeCardNote();
+                  }
+                }}
+                aria-busy={savingCardNote}
+              >
+                <NoteEditor
+                  label="我的笔记"
+                  inputProps={{ id: `card-note-${paper.id}`, "data-card-note-input": true, "aria-describedby": cardNoteError ? `card-note-error-${paper.id}` : undefined }}
+                  value={cardNoteEditor.value}
+                  onChange={(value) => {
+                    setCardNoteEditor((current) => current ? { ...current, value } : current);
+                    setCardNoteError("");
+                  }}
+                  placeholder="记录阅读要点、实验想法或后续事项…"
+                  disabled={savingCardNote}
+                />
+                {cardNoteError && <p className="card-note-error" id={`card-note-error-${paper.id}`} role="alert">{cardNoteError}</p>}
+                <div className="card-note-toolbar">
+                  <small>Enter 换行 · ⌘ / Ctrl + Enter 保存</small>
+                  <div className="card-note-actions">
+                    <button type="button" className="secondary-button" onClick={closeCardNote} disabled={savingCardNote}>取消</button>
+                    <button type="submit" className="primary-button" disabled={savingCardNote || !cardNoteDirty} aria-keyshortcuts="Meta+Enter Control+Enter Meta+S Control+S">{savingCardNote ? "保存中…" : "保存笔记"}</button>
+                  </div>
+                </div>
+              </form>
+            ) : (
+              <>
+                <p className="card-note-content"><NoteText value={paper.note ?? ""} /></p>
+                <button
+                  type="button"
+                  className="card-note-edit-button"
+                  data-card-note-edit={paper.id}
+                  onClick={(event) => openCardNote(paper, event.currentTarget)}
+                  aria-label={`编辑《${paper.title}》的笔记`}
+                >
+                  编辑
+                </button>
+              </>
+            )}
           </div>
         )}
 
@@ -3953,26 +4209,51 @@ export default function Home() {
                 <span>项目主页</span>
               </div>
             )}
+            <button
+              type="button"
+              className={`resource-slot ${paper.supplements?.length ? "is-available" : "supplement-resource"}`}
+              onClick={(event) => openSupplements(paper, event.currentTarget)}
+              aria-label={`《${paper.title}》的补充材料${paper.supplements?.length ? `，${paper.supplements.length} 份` : ""}`}
+              aria-haspopup="dialog"
+              data-paper-supplements={paper.id}
+            >
+              <span className="resource-state" aria-hidden="true">{paper.supplements?.length ? "✓" : "+"}</span>
+              <span>补充材料</span>
+              {paper.supplements?.length ? <small>{paper.supplements.length} 份</small> : null}
+            </button>
           </div>
 
-          {originalUrl ? (
-            <a
-              className="citation-button"
-              href={originalUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label={`打开《${paper.title}》的原文页面`}
-            >
-              原文
-            </a>
-          ) : (
-            <button
-              className="citation-button"
-              onClick={() => setToast(`查看《${paper.title}》的引用信息`)}
-            >
-              引用
-            </button>
-          )}
+          <div className="paper-footer-actions">
+            {!paper.note && cardNoteEditor?.paperId !== paper.id && (
+              <button
+                type="button"
+                className="card-note-edit-button"
+                data-card-note-edit={paper.id}
+                onClick={(event) => openCardNote(paper, event.currentTarget)}
+                aria-label={`添加《${paper.title}》的笔记`}
+              >
+                + 添加笔记
+              </button>
+            )}
+            {originalUrl ? (
+              <a
+                className="citation-button"
+                href={originalUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={`打开《${paper.title}》的原文页面`}
+              >
+                原文
+              </a>
+            ) : (
+              <button
+                className="citation-button"
+                onClick={() => setToast(`查看《${paper.title}》的引用信息`)}
+              >
+                引用
+              </button>
+            )}
+          </div>
         </footer>
       </article>
     );
@@ -3987,7 +4268,7 @@ export default function Home() {
         const bridge = window.literatureDesktop;
         if (!bridge || !event.dataTransfer.files.length) return;
         event.preventDefault();
-        if (desktopDropBusy || readingPaper) return;
+        if (desktopDropBusy || readingPaper || supplementPaperId) return;
         const files = Array.from(event.dataTransfer.files).filter((file) => /\.pdf$/i.test(file.name));
         if (!files.length) { setToast("请拖入 PDF 文件。"); return; }
         setDesktopDropBusy(true);
@@ -3997,19 +4278,19 @@ export default function Home() {
           .finally(() => setDesktopDropBusy(false));
       }}
     >
-      {readingPaper && (
-        <Suspense fallback={<div className="reader-loading" role="status">正在打开阅读器…</div>}>
-          <PdfReader paper={readingPaper} onPaperUpdated={replacePaper} onBack={() => {
-            libraryReturnPaperRef.current = readingPaper.id;
-            setReadingPaperId(null);
-          }} />
-        </Suspense>
-      )}
+      <ReadingTabs papers={openReadingPapers} activePaperId={readingPaperId} busy={readingTabBusy || supplementPaperId !== null}
+        failedPaperIds={readerSaveFailures} onSelect={(paperId) => { void activateReadingTab(paperId); }} onClose={(paperId) => { void closeReadingTab(paperId); }} />
+      {openReadingPapers.length > 0 && <Suspense fallback={readingPaper ? <div className="reader-loading" role="status">正在打开阅读器…</div> : null}>
+        {openReadingPapers.map((paper) => <PdfReader key={paper.id} paper={paper} active={readingPaperId === paper.id}
+          ref={(handle) => { if (handle) readerHandlesRef.current.set(paper.id, handle); else readerHandlesRef.current.delete(paper.id); }}
+          onPaperUpdated={replacePaper} onSaveStateChanged={onReaderSaveStateChanged} onBack={() => { void activateReadingTab(null); }}
+          supplementsOpen={supplementPaperId !== null} onOpenSupplements={(trigger) => openSupplements(paper, trigger)} />)}
+      </Suspense>}
       {desktopDataOpen && (
         <div className="modal-layer">
           <section ref={modalRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="desktop-data-title" onKeyDown={handleModalKeyDown}>
             <div className="modal-heading"><h2 id="desktop-data-title">数据与 Codex 连接</h2><button className="modal-close" aria-label="关闭数据设置" onClick={() => setDesktopDataOpen(false)}>×</button></div>
-            <p>文献、分类和笔记保存在本机。数据库备份与 PDF 归档分别保存；数据库快照不包含 PDF。</p>
+            <p>数据库快照保存文献、分类、笔记和补充材料记录。PDF 和补充材料文件各自保存在本机归档目录。</p>
             <div className="modal-actions">
               {([['database', '数据库'], ['pdf', 'PDF 归档'], ['backups', '数据库备份']] as const).map(([kind, label]) => <button key={kind} className="secondary-button" onClick={() => { void window.literatureDesktop?.showDataInFinder(kind).catch(() => setToast("该目录暂时无法打开")); }}>{label} · Finder</button>)}
             </div>
@@ -4155,6 +4436,7 @@ export default function Home() {
       </aside>
 
       <main
+        id="reading-panel-library" role="tabpanel" aria-labelledby="reading-tab-library"
         className={`main-content ${
           !isMobile && sidebarCollapsed ? "is-sidebar-collapsed" : ""
         }`}
@@ -4586,6 +4868,31 @@ export default function Home() {
           document.body,
         )}
 
+      {supplementPaper && (
+        <div className="modal-layer" onMouseDown={(event) => {
+          if (event.currentTarget === event.target) closeSupplements();
+        }}>
+          <section ref={modalRef} className="modal supplement-dialog" role="dialog" aria-modal="true"
+            aria-labelledby="supplement-dialog-title" aria-describedby="supplement-paper-title"
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === "Escape") closeSupplements();
+              else handleModalKeyDown(event);
+            }}>
+            <div className="modal-heading">
+              <div>
+                <h2 id="supplement-dialog-title">补充材料</h2>
+                <p id="supplement-paper-title">{supplementPaper.title}</p>
+              </div>
+              <button type="button" className="modal-close" aria-label="关闭补充材料" aria-disabled={supplementsBusy}
+                onClick={closeSupplements} autoFocus>×</button>
+            </div>
+            <PaperSupplements key={supplementPaper.id} paper={supplementPaper} disabled={libraryConnection !== "ready"}
+              onSaved={applySupplementChange} onBusyChange={setSupplementsBusy} />
+          </section>
+        </div>
+      )}
+
       {categoryManagerOpen && (
         <div
           className="drawer-layer"
@@ -4947,7 +5254,7 @@ export default function Home() {
             aria-modal="true"
             aria-labelledby="edit-paper-title"
             aria-describedby="edit-paper-description"
-            aria-busy={savingPaper}
+            aria-busy={savingPaper || supplementsBusy}
             onKeyDown={(event) => {
               if (event.key === "Escape") {
                 event.preventDefault();
@@ -4985,6 +5292,7 @@ export default function Home() {
                   type="button"
                   className="drawer-close"
                   onClick={requestCloseEditor}
+                  disabled={savingPaper || supplementsBusy}
                   aria-label="关闭论文编辑"
                 >
                   ×
@@ -5124,17 +5432,16 @@ export default function Home() {
                       placeholder="暂未生成，可手动填写"
                     />
                   </label>
-                  <label className="edit-field edit-field-wide">
+                  <div className="edit-field edit-field-wide">
                     <span>我的笔记</span>
-                    <textarea
+                    <NoteEditor label="我的笔记"
                       value={editDraft.note}
-                      onChange={(event) =>
-                        updateEditDraft("note", event.target.value)
+                      onChange={(value) =>
+                        updateEditDraft("note", value)
                       }
-                      rows={6}
                       placeholder="记录判断、实验想法或后续事项"
                     />
-                  </label>
+                  </div>
                 </fieldset>
 
                 <fieldset className="edit-section">
@@ -5209,8 +5516,8 @@ export default function Home() {
                     ) : editingPaper.pdfArchive?.status === "ready" ? (
                       <p>
                         已保存到本机
-                        {formatPdfSize(editingPaper.pdfArchive.sizeBytes)
-                          ? ` · ${formatPdfSize(editingPaper.pdfArchive.sizeBytes)}`
+                        {formatFileSize(editingPaper.pdfArchive.sizeBytes)
+                          ? ` · ${formatFileSize(editingPaper.pdfArchive.sizeBytes)}`
                           : ""}
                         {formatPdfArchiveTime(editingPaper.pdfArchive.downloadedAt)
                           ? ` · ${formatPdfArchiveTime(editingPaper.pdfArchive.downloadedAt)}`
@@ -5373,6 +5680,12 @@ export default function Home() {
                   </div>
                 </fieldset>
 
+                <fieldset className="edit-section">
+                  <legend>补充材料</legend>
+                  <PaperSupplements key={editingPaper.id} paper={editingPaper} disabled={savingPaper || libraryConnection !== "ready"}
+                    onSaved={applySupplementChange} onBusyChange={setSupplementsBusy} />
+                </fieldset>
+
                 {editingPaper.zoteroKey && (
                   <div className="paper-origin-meta">
                     <span>一次性导入自 Zotero</span>
@@ -5390,14 +5703,14 @@ export default function Home() {
                     type="button"
                     className="secondary-button"
                     onClick={requestCloseEditor}
-                    disabled={savingPaper}
+                    disabled={savingPaper || supplementsBusy}
                   >
                     取消
                   </button>
                   <button
                     type="submit"
                     className="primary-button"
-                    disabled={savingPaper || !editDraft.title.trim()}
+                    disabled={savingPaper || supplementsBusy || !editDraft.title.trim()}
                     aria-keyshortcuts="Control+S Meta+S Control+Enter Meta+Enter"
                   >
                     {savingPaper ? "保存中…" : "保存修改"}
@@ -6466,18 +6779,17 @@ export default function Home() {
 
                 <fieldset className="paper-intake-section">
                   <legend>笔记 / 备注（选填）</legend>
-                  <label className="paper-intake-field">
+                  <div className="paper-intake-field">
                     <span>我的笔记</span>
-                    <textarea
-                      data-intake-field="note"
+                    <NoteEditor label="我的笔记"
+                      inputProps={{ "data-intake-field": "note" }}
                       value={paperIntakeDraft.note}
-                      onChange={(event) =>
-                        updatePaperIntakeDraft("note", event.target.value)
+                      onChange={(value) =>
+                        updatePaperIntakeDraft("note", value)
                       }
-                      rows={4}
                       placeholder="记录阅读目的、要点或个人备注，随资料一起保存。"
                     />
-                  </label>
+                  </div>
                 </fieldset>
 
                 {!localPdfDraft && <fieldset className="paper-intake-section is-ai-section">

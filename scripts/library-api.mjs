@@ -11,6 +11,10 @@ import { createPaperIntakeService } from "./paper-intake.mjs";
 import { createPdfArchiveService } from "./pdf-archive-service.mjs";
 import { createLiteratureRadarService } from "./literature-radar.mjs";
 import { createReadingStateService } from "./reading-state.mjs";
+import { PdfNotesService } from "./pdf-notes.mjs";
+import { PaperSupplementsService } from "./paper-supplements.mjs";
+import { handlePdfNoteRoutes } from "./library-api-routes/pdf-notes.mjs";
+import { handleSupplementRoutes } from "./library-api-routes/supplements.mjs";
 import {
   assertMutationRequestOrigin,
   errorPayload,
@@ -33,7 +37,7 @@ function createRequestHandler(
   paperIntakeService,
   pdfArchiveService,
   literatureRadarService,
-  { requestToken, readingStateService, allowKnowledgeNotes } = {},
+  { requestToken, readingStateService, pdfNotesService, paperSupplementsService, allowKnowledgeNotes } = {},
 ) {
   return async (request, response) => {
     try {
@@ -68,6 +72,10 @@ function createRequestHandler(
       ) {
         return;
       }
+      if (
+        await handlePdfNoteRoutes({ request, response, pathname, pdfNotesService })
+      ) return;
+      if (await handleSupplementRoutes({ request, response, pathname, searchParams: url.searchParams, paperSupplementsService })) return;
       if (
         await handleReadingRoutes({ request, response, pathname, readingStateService })
       ) {
@@ -225,6 +233,9 @@ export async function createLibraryApi({
     });
   const readingStateService = createReadingStateService({ repository: libraryRepository });
   await readingStateService.ready;
+  const pdfNotesService = new PdfNotesService({ repository: libraryRepository });
+  await pdfNotesService.ready;
+  const paperSupplementsService = new PaperSupplementsService(libraryRepository);
   const server = createServer(
     createRequestHandler(
       libraryRepository,
@@ -232,7 +243,7 @@ export async function createLibraryApi({
       paperIntakeService,
       localPdfArchiveService,
       localLiteratureRadarService,
-      { requestToken, readingStateService, allowKnowledgeNotes },
+      { requestToken, readingStateService, pdfNotesService, paperSupplementsService, allowKnowledgeNotes },
     ),
   );
   let started = false;
@@ -245,6 +256,8 @@ export async function createLibraryApi({
     pdfArchiveService: localPdfArchiveService,
     literatureRadarService: localLiteratureRadarService,
     readingStateService,
+    pdfNotesService,
+    paperSupplementsService,
     server,
 
     async listen(overridePort = port) {

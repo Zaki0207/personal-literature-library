@@ -11,9 +11,13 @@ contextBridge.exposeInMainWorld("literatureDesktop", Object.freeze({
     return `literature-pdf://paper/${encodeURIComponent(paperId)}`;
   },
   openExternal: (url) => ipcRenderer.invoke("literature:open-external", url),
+  openPdfInPreview: (paperId) => ipcRenderer.invoke("literature:open-pdf-preview", paperId),
   selectPdf: () => ipcRenderer.invoke("literature:select-pdf"),
   grantDroppedPdf: (file) => ipcRenderer.invoke("literature:grant-dropped-pdf", webUtils.getPathForFile(file)),
   importPdf: (paperId, grantId) => ipcRenderer.invoke("literature:import-pdf", paperId, grantId),
+  importSupplement: (paperId, file) => ipcRenderer.invoke("literature:import-supplement", paperId, webUtils.getPathForFile(file)),
+  openSupplement: (paperId, id) => ipcRenderer.invoke("literature:open-supplement", paperId, id),
+  removeSupplement: (paperId, id) => ipcRenderer.invoke("literature:remove-supplement", paperId, id),
   showPdfInFinder: (paperId) => ipcRenderer.invoke("literature:show-pdf", paperId),
   showDataInFinder: (kind) => ipcRenderer.invoke("literature:show-data", kind),
   openSettings: (section) => ipcRenderer.invoke("literature:settings", section),

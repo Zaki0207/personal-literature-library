@@ -153,6 +153,14 @@ are confirmed one at a time. Optional paper recognition remains available for
 academic material. Saving checks normalized titles and recorded identifiers;
 the stored PDF SHA-256 is not used for cross-record file deduplication.
 
+The PDF reader supports 25%–6400% zoom through trackpad pinching, proportional
+zoom buttons, or direct percentage input. Use **⌘+ / ⌘−** to zoom and **⌘0** for
+actual size. Large pages render only visible tiles at full display resolution;
+zoom, page number, and the vertical reading position are saved automatically.
+On macOS, **用预览打开** in the reader opens the archived PDF in Apple's Preview
+app. The button becomes available once a local PDF is ready, and launch failures
+show an error with a retry action.
+
 PDF and publisher ePDF links can be passed directly to the AI as research clues.
 The model looks for a matching paper page or accessible copy; successful identification
 is not guaranteed for inaccessible files. Intake does not itself download or parse a

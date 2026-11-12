@@ -93,3 +93,34 @@ export function createLongSmokePdf({ pageCount = 40 } = {}) {
   objects[0] = "<< /Type /Catalog /Pages 2 0 R >>";
   return documentBytes(objects);
 }
+
+/** Embedded citation links, precise destinations, backlinks and a rotated page. */
+export function createLinkedSmokePdf() {
+  const { objects, pages } = pageObjects([
+    [{ text: "Citation [1]", y: 700 }, { text: "Same page section", y: 650 }, { text: "Rotated target [2]", y: 600 },
+      { text: "External DOI", y: 550 }, { text: "Broken citation [9]", y: 500 }, { text: "Unsafe script link", y: 450 }, { text: "Section target", y: 300 }],
+    [{ text: "Bibliography", y: 740 }, { text: "Reference [1] (back)", y: 380 }],
+    [{ text: "Rotated page", y: 740 }, { text: "Rotated backlink", y: 650 }, { text: "Rotated target", y: 350 }],
+    [{ text: "Last page after references", y: 740 }],
+  ]);
+  objects[pages[2] - 1] = objects[pages[2] - 1].replace("/Type /Page ", "/Type /Page /Rotate 90 ");
+  const addLink = (pageIndex, label, rect, action) => {
+    const id = objects.length + 1;
+    objects.push(`<< /Type /Annot /Subtype /Link /Rect [${rect}] /Border [0 0 0] /Contents ${pdfString(label)} ${action} >>`);
+    const index = pages[pageIndex] - 1;
+    if (objects[index].includes("/Annots")) objects[index] = objects[index].replace(/\/Annots \[([^\]]*)\]/u, (_, refs) => `/Annots [${refs} ${id} 0 R]`);
+    else objects[index] = objects[index].replace("/Contents", `/Annots [${id} 0 R] /Contents`);
+  };
+  addLink(0, "Citation [1]", "50 694 150 716", `/A << /S /GoTo /D ${pdfString("reference.one")} >>`);
+  addLink(0, "Same page section", "50 644 205 666", `/Dest [${pages[0]} 0 R /XYZ 50 315 null]`);
+  addLink(0, "Rotated target [2]", "50 594 205 616", `/Dest [${pages[2]} 0 R /XYZ 280 350 null]`);
+  addLink(0, "External DOI", "50 544 170 566", `/A << /S /URI /URI ${pdfString("https://doi.org/10.0000/test")} >>`);
+  addLink(0, "Broken citation [9]", "50 494 205 516", `/Dest ${pdfString("missing.reference")}`);
+  addLink(0, "Unsafe script link", "50 444 205 466", `/A << /S /URI /URI ${pdfString("javascript:alert(1)")} >>`);
+  addLink(1, "Reference [1] (back)", "50 374 225 396", `/Dest [${pages[0]} 0 R /XYZ 50 710 null]`);
+  addLink(2, "Rotated backlink", "50 644 205 666", `/Dest [${pages[0]} 0 R /FitH 710]`);
+  const destinations = objects.length + 1;
+  objects.push(`<< /Names [${pdfString("reference.one")} [${pages[1]} 0 R /XYZ 50 395 null]] >>`);
+  objects[0] = `<< /Type /Catalog /Pages 2 0 R /Names << /Dests ${destinations} 0 R >> >>`;
+  return documentBytes(objects);
+}

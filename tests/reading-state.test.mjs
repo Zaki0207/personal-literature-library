@@ -13,7 +13,7 @@ const position = (pdfVersion, overrides = {}) => ({
   zoomMode: "custom", scrollOffset: 0.42, notesVisible: false, ...overrides,
 });
 
-async function fixture(t, name, { legacyPosition } = {}) {
+async function fixture(t, name, { legacyPosition, legacyLayout = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), `reading-${name}-`));
   const seedPath = join(directory, "seed.json");
   await writeFile(seedPath, JSON.stringify({ categoryRecords: [], papers: [{
@@ -49,6 +49,10 @@ async function fixture(t, name, { legacyPosition } = {}) {
       `).run(PAPER_ID, legacyPosition.pdfVersion, legacyPosition.pageNumber, legacyPosition.pageCount,
         legacyPosition.scale, legacyPosition.zoomMode, legacyPosition.scrollOffset,
         Number(legacyPosition.notesVisible), "2026-10-11T08:00:00.000Z");
+      if (legacyLayout) {
+        repository.db.exec("ALTER TABLE paper_reading_positions ADD COLUMN layout_mode TEXT NOT NULL DEFAULT 'single-page' CHECK (layout_mode IN ('single-page', 'continuous'))");
+        repository.db.prepare("UPDATE paper_reading_positions SET layout_mode = ?").run(legacyPosition.layoutMode);
+      }
     } finally { await repository.close(); }
   }
   let api;
@@ -157,7 +161,7 @@ test("远程 PDF 用 fingerprint 区分版本，移除本地副本后拒绝旧 s
 test("非法进度与已删除论文不写数据库；跨来源写入受既有 API 限制", async (t) => {
   const f = await fixture(t, "invalid");
   const version = "fingerprint:test";
-  const patches = [{ pageNumber: 21 }, { pageNumber: 0 }, { pageCount: 0 }, { scale: 5 }, { scrollOffset: -0.1 }, { notesVisible: "true" }, { zoomMode: "invalid" }, { pdfVersion: "../../file" }, { layoutMode: "invalid" }, { layoutMode: null }, { layoutMode: 1 }, { unknown: true }];
+  const patches = [{ pageNumber: 21 }, { pageNumber: 0 }, { pageCount: 0 }, { scale: 64.01 }, { scale: 0.24 }, { scrollOffset: -0.1 }, { notesVisible: "true" }, { zoomMode: "invalid" }, { pdfVersion: "../../file" }, { layoutMode: "invalid" }, { layoutMode: null }, { layoutMode: 1 }, { unknown: true }];
   for (const patch of patches) {
     const invalid = await f.request(readingPath, { method: "PUT", body: JSON.stringify(position(version, patch)) });
     assert.equal(invalid.response.status, 400, JSON.stringify(patch));
@@ -204,6 +208,32 @@ test("已有旧表的阅读位置无损标记 single-page，重复重启迁移�
     assert.equal(layoutColumns[0].dflt_value, "'single-page'");
     assert.deepEqual(f.api.repository.integrityCheck(), ["ok"]);
     if (restart < 2) await f.restart();
+  }
+});
+
+test("400%旧表原子迁移保留阅读位置，6400%可保存并在重启后恢复", async (t) => {
+  for (const legacyLayout of [false, true]) {
+    const legacy = position("fingerprint:legacy-zoom", { scale: 4, layoutMode: legacyLayout ? "continuous" : "single-page" });
+    const f = await fixture(t, `expanded-zoom-${legacyLayout}`, { legacyPosition: legacy, legacyLayout });
+    const path = `${readingPath}?pdfVersion=${legacy.pdfVersion}`;
+    const before = (await f.request(path)).body.position;
+    const expected = { ...legacy };
+    delete expected.pdfVersion;
+    assert.deepEqual(before, { ...expected, updatedAt: "2026-10-11T08:00:00.000Z" });
+    for (const scale of [8, 32, 64]) {
+      const result = await f.request(readingPath, { method: "PUT", body: JSON.stringify({ ...legacy, scale }) });
+      assert.equal(result.response.status, 200, JSON.stringify(result.body));
+      assert.equal(result.body.position.scale, scale);
+    }
+    await f.restart();
+    assert.equal((await f.request(path)).body.position.scale, 64);
+    assert.equal((await f.request(path)).body.position.layoutMode, legacy.layoutMode);
+    assert.deepEqual(f.api.repository.integrityCheck(), ["ok"]);
+    assert.deepEqual(f.api.repository.db.prepare("PRAGMA foreign_key_check").all(), []);
+    assert.throws(() => f.api.repository.db.prepare("UPDATE paper_reading_positions SET scale = 64.01").run(), /CHECK/u);
+    await f.request(`/api/papers/${PAPER_ID}`, { method: "DELETE" });
+    f.api.repository.db.prepare("DELETE FROM papers WHERE id = ?").run(PAPER_ID);
+    assert.equal(f.api.repository.db.prepare("SELECT count(*) AS count FROM paper_reading_positions").get().count, 0);
   }
 });
 

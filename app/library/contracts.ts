@@ -45,6 +45,8 @@ export type PdfArchive = {
   errorMessage?: string;
 };
 
+export type PaperSupplement = { id: string; name: string; sizeBytes: number };
+
 export type Paper = {
   id: string;
   zoteroKey?: string;
@@ -67,6 +69,7 @@ export type Paper = {
   pdfAttachmentKey?: string;
   pdfUrl?: string;
   pdfArchive?: PdfArchive;
+  supplements?: PaperSupplement[];
   originalUrl?: string;
   codeProvider?: string;
   codeUrl?: string;
@@ -199,6 +202,10 @@ export type PaperMutationResponse = {
 export type PdfArchiveMutationResponse = PaperMutationResponse & {
   alreadyArchived?: boolean;
   committed?: boolean;
+};
+
+export type SupplementMutationResponse = PaperMutationResponse & {
+  alreadyImported?: boolean;
 };
 
 export type CategoryMutationResponse = {

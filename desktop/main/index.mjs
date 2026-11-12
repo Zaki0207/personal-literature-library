@@ -1,9 +1,11 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, net, protocol, shell, utilityProcess } from "electron";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createReadStream, mkdirSync } from "node:fs";
 import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { assertPaperId, parsePdfUrl, safeExternalUrl, validateApiRequest } from "../shared/security.mjs";
@@ -15,6 +17,12 @@ import { verifyDesktopIntakePrompt } from "../../scripts/desktop-intake-prompt-s
 import { INTAKE_DIAGNOSTIC_PREVIEW, verifyDesktopIntakeDiagnostic } from "../../scripts/desktop-intake-diagnostic-smoke.mjs";
 import { PDF_RECOVERY_IMPORT_ID, PDF_RECOVERY_RETRY_ID, verifyDesktopPdfRecovery } from "../../scripts/desktop-pdf-recovery-smoke.mjs";
 import { verifyDesktopDocumentImport } from "../../scripts/desktop-document-import-smoke.mjs";
+import { verifyDesktopPreviewOpen } from "../../scripts/desktop-preview-open-smoke.mjs";
+import { verifyDesktopCardNotes } from "../../scripts/desktop-card-notes-smoke.mjs";
+import { verifyDesktopPdfLinks } from "../../scripts/desktop-pdf-links-smoke.mjs";
+import { verifyDesktopRichNotes } from "../../scripts/desktop-rich-notes-smoke.mjs";
+import { verifyDesktopReadingTabs } from "../../scripts/desktop-reading-tabs-smoke.mjs";
+import { verifyDesktopSupplements } from "../../scripts/desktop-supplements-smoke.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const rendererRoot = join(root, "dist-desktop/renderer");
@@ -29,6 +37,11 @@ const token = randomUUID();
 const pending = new Map();
 const requests = new Map();
 const grants = new Map();
+const supplementDocumentTypes = new Set([
+  ".pdf", ".doc", ".docx", ".odt", ".rtf", ".pages", ".txt", ".md", ".tex",
+  ".csv", ".tsv", ".xls", ".xlsx", ".ods", ".numbers", ".ppt", ".pptx", ".odp", ".key",
+  ".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".webp", ".mp4", ".mov", ".mp3", ".wav",
+]);
 const readyWindows = new Set();
 const commandQueues = new Map();
 let service;
@@ -46,7 +59,10 @@ let smokeIntakePromptFailNextSave = false;
 let smokeIntakeDiagnostic;
 let smokePdfRecovery;
 let smokeDocumentImportRequests;
+let smokeSupplementOpenCalls;
 const openingFiles = [];
+const execute = promisify(execFile);
+let smokePreviewOpen;
 
 app.setName("我的文献库");
 const userDataPath = process.env.LIBRARY_DESKTOP_USER_DATA || join(dataRoot, "desktop");
@@ -84,7 +100,8 @@ function rpc(operation, payload = {}) {
   return new Promise((resolveResult, reject) => {
     if (!service || !service.pid) return reject(new Error("文献服务未运行。"));
     const id = randomUUID();
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error("本地文献服务响应超时。")); }, operation === "import-pdf" ? 180_000 : 15_000);
+    const timeout = operation === "import-pdf" || operation === "import-supplement" ? 180_000 : 15_000;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error("本地文献服务响应超时。")); }, timeout);
     pending.set(id, {
       resolve: (value) => { clearTimeout(timer); resolveResult(value); },
       reject: (error) => { clearTimeout(timer); reject(error); },
@@ -370,7 +387,40 @@ function installIpc() {
     const result = await rpc("import-pdf", { paperId, filePath: grant.path });
     grants.delete(grantId); return result;
   });
+  handle("literature:import-supplement", (_event, paperId, filePath) => {
+    if (typeof filePath !== "string" || !isAbsolute(filePath)) throw new Error("无法读取所选文件，请重新选择。");
+    return rpc("import-supplement", { paperId, filePath });
+  });
+  handle("literature:open-supplement", async (_event, paperId, id) => {
+    const file = await rpc("supplement-file", { paperId, id });
+    if (smoke && smokeSupplementOpenCalls) {
+      smokeSupplementOpenCalls.push({ paperId, ...file });
+      return "opened";
+    }
+    if (!supplementDocumentTypes.has(extname(file.name).toLowerCase())) {
+      shell.showItemInFolder(file.path);
+      return "revealed";
+    }
+    const error = await shell.openPath(file.path);
+    if (error) throw new Error(`无法打开补充材料。${error}`);
+    return "opened";
+  });
+  handle("literature:remove-supplement", (_event, paperId, id) => rpc("remove-supplement", { paperId, id }));
   handle("literature:show-pdf", async (_event, paperId) => { const file = await rpc("pdf-file", { paperId: assertPaperId(paperId) }); shell.showItemInFolder(file.path); });
+  handle("literature:open-pdf-preview", async (_event, paperId) => {
+    const file = await rpc("pdf-file", { paperId: assertPaperId(paperId) });
+    // Resolve the archived file in the service; renderers only supply a paper ID.
+    // The bundle ID selects Preview even when another app is the default viewer.
+    const args = ["-b", "com.apple.Preview", file.path];
+    try {
+      if (smoke && smokePreviewOpen) {
+        smokePreviewOpen.calls.push({ paperId, executable: "/usr/bin/open", args });
+        if (smokePreviewOpen.failNext) { smokePreviewOpen.failNext = false; throw new Error("模拟预览启动失败"); }
+        return;
+      }
+      await execute("/usr/bin/open", args, { timeout: 10_000 });
+    } catch (error) { throw new Error(`无法用“预览”打开 PDF：${error.message}`); }
+  });
   handle("literature:show-data", async (_event, kind) => {
     const locations = { database: databasePath, pdf: pdfRoot, backups: backupRoot };
     if (!Object.hasOwn(locations, kind)) throw new Error("数据类型无效。");
@@ -444,12 +494,19 @@ async function runSmoke() {
   }
   const longCreated = await performRequest({ path: "/api/papers", method: "POST", body: { id: "desktop-long-smoke", title: "Desktop long document runtime verification", authors: "Synthetic Test", institution: "Test", categoryIds: [], aiSummary: "40页离线合成PDF用于连续阅读懒渲染与无目录回退验收。", note: "", date: "2026", source: "Test" } });
   if (longCreated.status >= 400) throw new Error(JSON.stringify(longCreated.body));
+  const linkedCreated = await performRequest({ path: "/api/papers", method: "POST", body: { id: "desktop-links-smoke", title: "Desktop PDF citation links verification", authors: "Synthetic Test", categoryIds: [], note: "Citation test note retained.", date: "2026", source: "Test" } });
+  if (linkedCreated.status >= 400) throw new Error(JSON.stringify(linkedCreated.body));
   const window = mainWindow;
   if (window.webContents.isLoading()) await new Promise((resolveLoaded) => window.webContents.once("did-finish-load", resolveLoaded));
   // Real UI checks need an active compositor: a hidden macOS window pauses
   // requestAnimationFrame and can strand scroll-position and focus assertions.
   // This runner only operates on the isolated temporary library above.
   window.show(); window.focus(); window.webContents.focus();
+  // Native desktop activity must not steal focus or interrupt synthetic
+  // pointer sequences in this isolated verification window.
+  window.webContents.debugger.attach("1.3");
+  await window.webContents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+  window.setIgnoreMouseEvents(true);
   const windowBounds = window.getBounds();
   const contentBounds = window.getContentBounds();
   const nativeWindow = { movable: window.isMovable(), resizable: window.isResizable(), titleBarHeight: contentBounds.y - windowBounds.y };
@@ -463,6 +520,8 @@ async function runSmoke() {
   await window.webContents.executeJavaScript(`window.literatureDesktop.importPdf('desktop-smoke', ${JSON.stringify(grant.id)})`);
   const longGrant = await grantPdf(process.env.LIBRARY_DESKTOP_SMOKE_LONG_PDF, window.webContents.id);
   await window.webContents.executeJavaScript(`window.literatureDesktop.importPdf('desktop-long-smoke', ${JSON.stringify(longGrant.id)})`);
+  const linkedGrant = await grantPdf(process.env.LIBRARY_DESKTOP_SMOKE_LINKED_PDF, window.webContents.id);
+  await window.webContents.executeJavaScript(`window.literatureDesktop.importPdf('desktop-links-smoke', ${JSON.stringify(linkedGrant.id)})`);
   const renderer = await window.webContents.executeJavaScript(`(async () => {
     const bridge = window.literatureDesktop;
     const health = await bridge.request({path:'/api/health'});
@@ -481,8 +540,24 @@ async function runSmoke() {
   console.log("[desktop-smoke] fixtures imported; renderer refresh");
   await window.webContents.reload();
   await new Promise((resolveLoaded) => window.webContents.once("did-finish-load", resolveLoaded));
-  console.log("[desktop-smoke] renderer ready; reader notes and save");
+  console.log("[desktop-smoke] renderer ready; inline card notes");
+  const cardNotes = await verifyDesktopCardNotes(window);
+  console.log("[desktop-smoke] card notes complete; bold notes and page sticky notes");
+  const richNotes = await verifyDesktopRichNotes(window);
+  console.log("[desktop-smoke] card notes complete; embedded PDF citation links");
+  const pdfLinks = await verifyDesktopPdfLinks(window);
+  console.log("[desktop-smoke] card notes complete; reader notes and save");
   const reader = await window.webContents.executeJavaScript(readerSmokeScript("Desktop runtime verification"));
+  smokePreviewOpen = { calls: [], failNext: false };
+  let previewOpen;
+  try {
+    previewOpen = await verifyDesktopPreviewOpen(window, {
+      title: "Desktop runtime verification",
+      failNext: () => { smokePreviewOpen.failNext = true; },
+      calls: () => smokePreviewOpen.calls,
+      expectedPath: (await rpc("pdf-file", { paperId: "desktop-smoke" })).path,
+    });
+  } finally { smokePreviewOpen = undefined; }
   console.log("[desktop-smoke] reader save complete; continuous reading");
   const continuousReader = await verifyContinuousDesktopReader(window, { title: "Desktop runtime verification", longTitle: "Desktop long document runtime verification" });
   console.log("[desktop-smoke] continuous reader complete; library navigation");
@@ -583,14 +658,28 @@ async function runSmoke() {
     documentImport.requestPaths = documentImportRequests;
   } finally { smokeDocumentImportRequests = undefined; }
   const layout = await verifyDesktopLayout(window, { command, showSettings: (section) => { showSettings(section); settingsWindow.show(); settingsWindow.focus(); return settingsWindow; } });
+  console.log("[desktop-smoke] layout complete; independent reading tabs");
+  const readingTabs = await verifyDesktopReadingTabs(window);
+  console.log("[desktop-smoke] reading tabs complete; paper supplements");
+  let supplements;
+  smokeSupplementOpenCalls = [];
+  try {
+    supplements = await verifyDesktopSupplements(window, {
+      files: [process.env.LIBRARY_DESKTOP_SMOKE_DOCUMENT_PDF, process.env.LIBRARY_DESKTOP_SMOKE_SUPPLEMENT_CSV],
+      openCalls: smokeSupplementOpenCalls,
+    });
+  } finally { smokeSupplementOpenCalls = undefined; }
   console.log("[desktop-smoke] library layout complete; keychain and quit");
   const { MacOsKeychainCredentialStore } = await import("../../scripts/ai/credential-store.mjs");
   const credentialStore = new MacOsKeychainCredentialStore({ serviceName: "com.personal-literature-library.runtime-smoke", helperBinaryPath: app.isPackaged ? join(process.resourcesPath, "keychain-helper-v1") : join(root, "dist-desktop/keychain-helper-v1"), compileHelper: false });
   const missingCredential = await credentialStore.has(`smoke-${randomUUID()}`);
   if (missingCredential) throw new Error("临时钥匙串账户意外存在。");
+  window.setIgnoreMouseEvents(false);
+  await window.webContents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: false });
+  window.webContents.debugger.detach();
   window.close();
   if (window.isDestroyed()) throw new Error("关闭窗口丢失了保留的界面状态。");
-  await writeFile(process.env.LIBRARY_DESKTOP_SMOKE_REPORT, JSON.stringify({ ok: true, electron: process.versions.electron, serviceVersions, nativeWindow, renderer, reader, continuousReader, navigation, noPdfNavigation, intakePrompt, intakeDiagnostic, pdfRecovery, documentImport, layout, keychainHelper: true, closePreservedWindow: true, packaged: app.isPackaged }, null, 2));
+  await writeFile(process.env.LIBRARY_DESKTOP_SMOKE_REPORT, JSON.stringify({ ok: true, electron: process.versions.electron, serviceVersions, nativeWindow, renderer, cardNotes, richNotes, pdfLinks, reader, previewOpen, continuousReader, navigation, noPdfNavigation, intakePrompt, intakeDiagnostic, pdfRecovery, documentImport, layout, readingTabs, supplements, keychainHelper: true, closePreservedWindow: true, packaged: app.isPackaged }, null, 2));
   console.log("桌面运行验证通过：SQLite、utility process、受限 IPC、renderer 隔离与 PDF 范围读取。");
   if (process.env.LIBRARY_DESKTOP_SMOKE_KEEP_OPEN === "1") {
     mainWindow.show(); mainWindow.focus();

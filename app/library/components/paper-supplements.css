@@ -1,0 +1,82 @@
+.supplement-dialog .modal-heading {
+  margin-bottom: 18px;
+}
+
+.supplement-dialog .modal-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.paper-supplements {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.supplement-file-list {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.supplement-file-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--card);
+}
+
+.supplement-file-list li > div {
+  display: grid;
+  justify-items: start;
+  gap: 3px;
+  min-width: 0;
+}
+
+.supplement-file-name {
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.supplement-file-name:hover {
+  text-decoration: underline;
+}
+
+.supplement-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.paper-supplements small,
+.supplement-empty,
+.supplement-status,
+.supplement-error {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.supplement-error {
+  color: var(--accent);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}

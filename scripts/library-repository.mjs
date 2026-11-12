@@ -1128,6 +1128,15 @@ export class LibraryRepository {
       CREATE INDEX IF NOT EXISTS paper_pdf_archives_status_idx
         ON paper_pdf_archives(status, updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS paper_supplements (
+        id TEXT PRIMARY KEY,
+        paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+        sha256 TEXT NOT NULL,
+        UNIQUE (paper_id, name, sha256)
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS repository_migrations (
         id TEXT PRIMARY KEY,
         applied_at TEXT NOT NULL,
@@ -1914,12 +1923,29 @@ export class LibraryRepository {
     return new Map(rows.map((row) => [row.paperId, pdfArchiveForClient(row)]));
   }
 
+  #supplementsByPaper(id) {
+    const rows = this.db.prepare(`
+      SELECT paper_id AS paperId, id, name, size_bytes AS sizeBytes
+      FROM paper_supplements
+      ${id === undefined ? "" : "WHERE paper_id = ?"}
+      ORDER BY rowid
+    `).all(...(id === undefined ? [] : [id]));
+    const byPaper = new Map();
+    for (const { paperId, ...file } of rows) {
+      const files = byPaper.get(paperId) ?? [];
+      files.push(file);
+      byPaper.set(paperId, files);
+    }
+    return byPaper;
+  }
+
   #paperFromRow(
     row,
     directCategories,
     categoryModel,
     identifiers = [],
     pdfArchive,
+    supplements,
   ) {
     const tags = directCategories.map((category) => ({
       label: category.name,
@@ -1960,6 +1986,7 @@ export class LibraryRepository {
       watchLater: Boolean(row.watchLater),
       hasPdf: Boolean(row.hasPdf),
       ...(pdfArchive ? { pdfArchive } : {}),
+      ...(supplements ? { supplements } : {}),
       ...(row.pdfAttachmentKey
         ? { pdfAttachmentKey: row.pdfAttachmentKey }
         : {}),
@@ -2027,6 +2054,7 @@ export class LibraryRepository {
     const directByPaper = this.#directCategoriesByPaper();
     const identifiersByPaper = this.#identifiersByPaper();
     const pdfArchivesByPaper = this.#pdfArchivesByPaper();
+    const supplementsByPaper = this.#supplementsByPaper(id);
     return this.#paperRows({ includeDeleted, id }).map((row) =>
       this.#paperFromRow(
         row,
@@ -2034,6 +2062,7 @@ export class LibraryRepository {
         categoryModel,
         identifiersByPaper.get(row.id) ?? [],
         pdfArchivesByPaper.get(row.id),
+        supplementsByPaper.get(row.id),
       ),
     );
   }
@@ -2768,6 +2797,47 @@ export class LibraryRepository {
   getPaper(id, { includeDeleted = false } = {}) {
     this.#assertOpen();
     return this.#papers({ includeDeleted, id })[0] ?? null;
+  }
+
+  getPaperSupplement(paperId, id) {
+    this.#assertOpen();
+    validatePaperId(paperId);
+    return this.db.prepare(`
+      SELECT s.id, s.name
+      FROM paper_supplements s JOIN papers p ON p.id = s.paper_id
+      WHERE s.paper_id = ? AND s.id = ? AND p.deleted_at IS NULL
+    `).get(paperId, id) ?? null;
+  }
+
+  async recordPaperSupplement(paperId, { id, name, sizeBytes, sha256 }) {
+    return this.#queueMutation(async () => {
+      validatePaperId(paperId);
+      const { changes } = this.db.prepare(`
+        INSERT INTO paper_supplements (id, paper_id, name, size_bytes, sha256)
+        SELECT ?, id, ?, ?, ? FROM papers WHERE id = ? AND deleted_at IS NULL
+        ON CONFLICT (paper_id, name, sha256) DO NOTHING
+      `).run(id, name, sizeBytes, sha256, paperId);
+      const paper = this.getPaper(paperId);
+      if (!paper) throw new NotFoundError("未找到论文。");
+      const backup = changes ? await this.#createBackup() : { ...this.backupStatus };
+      return { paper, backup, alreadyImported: !changes };
+    });
+  }
+
+  async deletePaperSupplement(paperId, id) {
+    return this.#queueMutation(async () => {
+      validatePaperId(paperId);
+      const removed = this.db.prepare(`
+        DELETE FROM paper_supplements
+        WHERE paper_id = ? AND id = ?
+          AND EXISTS (SELECT 1 FROM papers WHERE id = ? AND deleted_at IS NULL)
+        RETURNING id
+      `).get(paperId, id, paperId);
+      const paper = this.getPaper(paperId);
+      if (!paper) throw new NotFoundError("未找到论文。");
+      const backup = removed ? await this.#createBackup() : { ...this.backupStatus };
+      return { paper, backup, removed };
+    });
   }
 
   getPdfArchiveRecord(id, { includeDeleted = false } = {}) {

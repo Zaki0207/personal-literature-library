@@ -32,8 +32,11 @@ async function verifyReader(title) {
     throw new Error(`阅读器验证超时：${stage}`);
   };
   const input = (element, value) => {
-    const prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(prototype, "value").set.call(element, value);
+    if (element.isContentEditable) element.textContent = value;
+    else {
+      const prototype = element.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(prototype, "value").set.call(element, value);
+    }
     element.dispatchEvent(new Event("input", { bubbles: true }));
   };
   const open = async () => {
@@ -81,7 +84,7 @@ async function verifyReader(title) {
   const paperId = document.querySelector(".pdf-reader-page-controls input").id.slice("pdf-page-".length);
   const removed = await window.literatureDesktop.request({ path: `/papers/${encodeURIComponent(paperId)}`, method: "DELETE" });
   if (removed.status !== 200) throw new Error("无法准备笔记保存失败的临时文献。");
-  input(document.querySelector(".pdf-reader-notes textarea"), note);
+  input(document.querySelector(".pdf-reader-notes [data-note-input]"), note);
   await waitFor(() => document.querySelector(".pdf-reader-notes-heading .is-failed"), "笔记保存失败反馈");
   report.noteFailureDraftRetained = localStorage.getItem(`literature:reading-note:${paperId}`) === note;
   if (!report.noteFailureDraftRetained) throw new Error("笔记保存失败没有保留本机草稿。");
@@ -90,7 +93,7 @@ async function verifyReader(title) {
   });
   if (failedQuitDecision) throw new Error("笔记未保存时阅读器允许退出。");
   report.failedSaveDeclinesQuit = true;
-  await waitFor(() => !document.querySelector(".pdf-reader-back").disabled && !document.querySelector(".pdf-reader-notes textarea").disabled, "保存失败取消退出后继续编辑");
+  await waitFor(() => !document.querySelector(".pdf-reader-back").disabled && document.querySelector(".pdf-reader-notes [data-note-input]").getAttribute("aria-disabled") !== "true", "保存失败取消退出后继续编辑");
   const restored = await window.literatureDesktop.request({ path: `/papers/${encodeURIComponent(paperId)}/restore`, method: "POST" });
   if (restored.status !== 200) throw new Error("无法恢复临时文献。");
   [...document.querySelectorAll(".pdf-reader-note-error button")].find((button) => button.textContent.includes("重试保存笔记")).click();
@@ -101,7 +104,7 @@ async function verifyReader(title) {
   });
   if (!quitDecision) throw new Error("已保存的阅读器拒绝了退出握手。");
   // The test keeps the window open, as if another window declined quitting.
-  await waitFor(() => !document.querySelector(".pdf-reader-back").disabled && !document.querySelector(".pdf-reader-notes textarea").disabled, "其他窗口取消退出后继续阅读");
+  await waitFor(() => !document.querySelector(".pdf-reader-back").disabled && document.querySelector(".pdf-reader-notes [data-note-input]").getAttribute("aria-disabled") !== "true", "其他窗口取消退出后继续阅读");
   report.cancelledQuitInteractive = true;
   [...document.querySelectorAll(".pdf-reader-heading button")].find((button) => button.textContent === "收起笔记").click();
   await waitFor(() => !document.querySelector(".pdf-reader-notes"), "收起笔记");
@@ -113,8 +116,8 @@ async function verifyReader(title) {
   report.notesCollapsedRestored = !document.querySelector(".pdf-reader-notes");
   if (!report.notesCollapsedRestored) throw new Error("笔记面板状态没有恢复。");
   [...document.querySelectorAll(".pdf-reader-heading button")].find((button) => button.textContent === "显示笔记").click();
-  const restoredNote = await waitFor(() => document.querySelector(".pdf-reader-notes textarea"), "展开恢复的笔记");
-  report.noteRestored = restoredNote.value === note;
+  const restoredNote = await waitFor(() => document.querySelector(".pdf-reader-notes [data-note-input]"), "展开恢复的笔记");
+  report.noteRestored = restoredNote.textContent === note;
   if (!report.noteRestored) throw new Error("阅读笔记没有恢复。");
   document.querySelector(".pdf-reader-back").click();
   await waitFor(() => !document.querySelector(".pdf-reader"), "验证结束后返回");

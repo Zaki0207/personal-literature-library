@@ -1,6 +1,6 @@
 {
   "name": "personal-literature-library",
-  "version": "0.1.10",
+  "version": "0.1.19",
   "private": true,
   "main": "desktop/main/index.mjs",
   "engines": {

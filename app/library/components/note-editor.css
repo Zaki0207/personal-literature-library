@@ -1,0 +1,11 @@
+.note-editor { min-width: 0; width: 100%; border: 1px solid var(--line, #d7c9a8); border-radius: 7px; background: var(--card, #fff); overflow: hidden; }
+.note-editor:focus-within { outline: 2px solid var(--note-strong, #7d6b42); outline-offset: 2px; }
+.note-editor-tools { display: flex; align-items: center; gap: 9px; padding: 5px 8px; border-bottom: 1px solid var(--line, #e9e5d9); }
+.note-editor .note-bold-button { min-width: 27px; min-height: 25px; padding: 2px 7px; border: 0; border-radius: 4px; background: transparent; color: var(--ink, #354438); cursor: pointer; font-size: 14px; }
+.note-editor .note-bold-button[aria-pressed="true"] { background: var(--note, #f5f0e3); }
+.note-editor-tools small { color: var(--faint, #81867d); font-size: 10px; font-weight: 400; }
+.note-editor-input { padding: 10px 12px; color: var(--ink, #354438); font-size: var(--paper-body-size, 13px); font-weight: 400; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; outline: none; cursor: text; }
+.note-editor-input:empty::before { content: attr(data-placeholder); color: #8b938a; pointer-events: none; }
+.note-editor-input strong, .note-editor-input b { font-weight: 750; }
+.note-editor.is-disabled { opacity: .65; }
+.note-editor.is-disabled .note-editor-input { cursor: default; }

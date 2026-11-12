@@ -1,3 +1,5 @@
+import type { SupplementMutationResponse } from "../../app/library/contracts";
+
 export type DesktopPdfGrant = { id: string; name: string; size: number };
 
 export type DesktopCommand =
@@ -20,9 +22,13 @@ export interface LiteratureDesktopBridge {
   cancelRequest(requestId: string): Promise<void>;
   pdfUrl(paperId: string): string;
   openExternal(url: string): Promise<void>;
+  openPdfInPreview(paperId: string): Promise<void>;
   selectPdf(): Promise<DesktopPdfGrant[]>;
   grantDroppedPdf(file: File): Promise<DesktopPdfGrant>;
   importPdf(paperId: string, grantId: string): Promise<unknown>;
+  importSupplement(paperId: string, file: File): Promise<SupplementMutationResponse>;
+  openSupplement(paperId: string, id: string): Promise<"opened" | "revealed">;
+  removeSupplement(paperId: string, id: string): Promise<SupplementMutationResponse>;
   showPdfInFinder(paperId: string): Promise<void>;
   showDataInFinder(kind: "database" | "pdf" | "backups"): Promise<void>;
   openSettings(section?: "general" | "ai" | "data"): Promise<void>;

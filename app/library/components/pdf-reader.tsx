@@ -1,12 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import type { Ref } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { libraryRequest, pdfOpenUrl } from "../api-client";
 import type { Paper, PaperMutationResponse, PdfArchiveMutationResponse } from "../contracts";
 import { ContinuousPdfDocument, type ContinuousPdfHandle, type PdfScrollAnchor } from "./continuous-pdf-document";
 import { PdfNavigation } from "./pdf-navigation";
+import { NoteEditor } from "./note-editor";
+import { PdfStickyList, usePdfStickyNotes } from "./pdf-sticky-notes";
+import { PdfHighlightList, PdfHighlightToolbar, usePdfHighlights } from "./pdf-highlights";
+import { formatPublicationForDisplay } from "../../../lib/paper-display.mjs";
+import { MIN_PDF_SCALE, MAX_PDF_SCALE, stepPdfScale, parsePdfScale } from "../../../lib/pdf-zoom.mjs";
 import "./pdf-reader.css";
 
 type ZoomMode = "fit-width" | "custom";
@@ -25,10 +31,17 @@ type PositionDraft = ReadingPosition & { pdfVersion: string };
 type SearchMatch = { page: number; excerpt: string };
 type SaveStatus = "saved" | "pending" | "saving" | "failed";
 
+export type PdfReaderHandle = { prepareToLeave: () => Promise<boolean>; prepareToActivate: () => Promise<void> };
+
 export type PdfReaderProps = {
   paper: Paper;
+  active?: boolean;
+  ref?: Ref<PdfReaderHandle>;
   onBack: () => void;
+  onOpenSupplements: (trigger: HTMLButtonElement) => void;
+  supplementsOpen?: boolean;
   onPaperUpdated?: (paper: Paper) => void;
+  onSaveStateChanged?: (paperId: string, failed: boolean) => void;
 };
 
 function readNoteDraft(key: string) {
@@ -66,7 +79,7 @@ export function PdfReader(props: PdfReaderProps) {
   return <PdfReaderSession key={props.paper.id} {...props} />;
 }
 
-function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
+function PdfReaderSession({ paper, active = true, ref, onBack, onOpenSupplements, supplementsOpen, onPaperUpdated, onSaveStateChanged }: PdfReaderProps) {
   const noteDraftKey = `literature:reading-note:${paper.id}`;
   const [initialDraft] = useState(() => readNoteDraft(noteDraftKey));
   const [note, setNote] = useState(initialDraft ?? paper.note ?? "");
@@ -80,7 +93,12 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
   const [loadError, setLoadError] = useState("");
   const [recoveryError, setRecoveryError] = useState("");
   const [importing, setImporting] = useState(false);
+  const [localPdfReady, setLocalPdfReady] = useState(paper.pdfArchive?.status === "ready");
+  const [openingPreview, setOpeningPreview] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [linkError, setLinkError] = useState("");
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
+  const [pdfVersion, setPdfVersion] = useState<string | null>(null);
   const [attempt, setAttempt] = useState({ count: 0, archive: false });
   const [pageNumber, setPageNumber] = useState(1);
   const [pageInput, setPageInput] = useState("1");
@@ -89,6 +107,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
   const [notesVisible, setNotesVisible] = useState(true);
   const [navigationVisible, setNavigationVisible] = useState(false);
   const [initialAnchor, setInitialAnchor] = useState<PdfScrollAnchor>({ pageNumber: 1, scrollOffset: 0, layoutMode: "continuous" });
+  const [initialScrollLeft, setInitialScrollLeft] = useState<number | undefined>(undefined);
   const [containerWidth, setContainerWidth] = useState(800);
   const [leaving, setLeaving] = useState(false);
   const [query, setQuery] = useState("");
@@ -97,11 +116,14 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
   const [matches, setMatches] = useState<SearchMatch[]>([]);
   const [matchIndex, setMatchIndex] = useState(0);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const pendingReloadRef = useRef(false);
+  const activeRef = useRef(active);
   const continuousRef = useRef<ContinuousPdfHandle>(null);
   const pageNumberRef = useRef(1);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const importingRef = useRef(false);
+  const openingPreviewRef = useRef(false);
   const noteRef = useRef(note);
   const savedNoteRef = useRef(paper.note ?? "");
   const paperUpdatedRef = useRef(onPaperUpdated);
@@ -117,8 +139,35 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
   const textCacheRef = useRef(new Map<number, string>());
   const flushNoteRef = useRef<() => Promise<boolean>>(async () => true);
   const flushPositionRef = useRef<() => Promise<boolean>>(async () => true);
+  const sticky = usePdfStickyNotes({ paperId: paper.id, pdfVersion, pageCount: document?.numPages ?? 0, viewportRef, disabled: leaving || importing });
+  const highlights = usePdfHighlights(paper.id, pdfVersion, document?.numPages ?? 0);
+  const { flush: flushHighlights, hasPending: hasPendingHighlights } = highlights;
+  const flushStickyRef = useRef<() => Promise<boolean>>(async () => true);
+  const stickyDirtyRef = useRef(false);
+  useEffect(() => { flushStickyRef.current = sticky.flush; stickyDirtyRef.current = sticky.dirty || sticky.busy; }, [sticky.flush, sticky.dirty, sticky.busy]);
 
   useEffect(() => { paperUpdatedRef.current = onPaperUpdated; }, [onPaperUpdated]);
+  useEffect(() => { activeRef.current = active; }, [active]);
+
+  useEffect(() => {
+    const previous = currentPaperRef.current;
+    if (previous.pdfUrl !== paper.pdfUrl || JSON.stringify(previous.pdfArchive) !== JSON.stringify(paper.pdfArchive)) pendingReloadRef.current = true;
+    currentPaperRef.current = paper;
+    if (!noteSaveRef.current && noteRef.current === savedNoteRef.current && (paper.note ?? "") !== savedNoteRef.current) {
+      noteRef.current = paper.note ?? "";
+      savedNoteRef.current = noteRef.current;
+      setNote(noteRef.current);
+    }
+    if (active && pendingReloadRef.current) {
+      pendingReloadRef.current = false;
+      setLocalPdfReady(paper.pdfArchive?.status === "ready");
+      setAttempt((value) => ({ count: value.count + 1, archive: false }));
+    }
+  }, [active, paper]);
+
+  useEffect(() => {
+    onSaveStateChanged?.(paper.id, noteStatus === "failed" || positionStatus === "failed" || Boolean(sticky.error && sticky.dirty) || Boolean(highlights.saveError));
+  }, [noteStatus, positionStatus, sticky.error, sticky.dirty, highlights.saveError, paper.id, onSaveStateChanged]);
 
   const flushNote = useCallback((): Promise<boolean> => {
     if (noteTimerRef.current) clearTimeout(noteTimerRef.current);
@@ -197,37 +246,21 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
   useEffect(() => {
     mountedRef.current = true;
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (importingRef.current || noteRef.current !== savedNoteRef.current) { event.preventDefault(); event.returnValue = ""; }
+      if (importingRef.current || noteRef.current !== savedNoteRef.current || stickyDirtyRef.current || hasPendingHighlights()) { event.preventDefault(); event.returnValue = ""; }
     };
-    const beforeQuit = (event: Event) => {
-      const complete = (event as CustomEvent<{ complete: (allow?: boolean) => void }>).detail?.complete;
-      if (importingRef.current) {
-        setRecoveryError("正在导入 PDF，请完成后再退出。");
-        complete?.(false);
-        return;
-      }
-      setLeaving(true);
-      void Promise.all([flushNoteRef.current(), flushPositionRef.current()]).then(([noteSaved, positionSaved]) => {
-        // Another window may decline quitting after this window has saved.
-        setLeaving(false);
-        complete?.(noteSaved && positionSaved);
-      });
-    };
-    const find = () => { searchInputRef.current?.focus(); searchInputRef.current?.select(); };
+    const find = () => { if (activeRef.current) { searchInputRef.current?.focus(); searchInputRef.current?.select(); } };
     const keydown = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+      if (activeRef.current && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
         event.preventDefault(); searchInputRef.current?.focus(); searchInputRef.current?.select();
       }
     };
     window.addEventListener("beforeunload", beforeUnload);
-    window.addEventListener("literature-save-before-quit", beforeQuit);
     window.addEventListener("literature-reader-find", find);
     window.addEventListener("keydown", keydown);
     if (noteRef.current !== savedNoteRef.current) noteTimerRef.current = setTimeout(() => { void flushNoteRef.current(); }, 700);
     return () => {
       mountedRef.current = false;
       window.removeEventListener("beforeunload", beforeUnload);
-      window.removeEventListener("literature-save-before-quit", beforeQuit);
       window.removeEventListener("literature-reader-find", find);
       window.removeEventListener("keydown", keydown);
       if (noteTimerRef.current) clearTimeout(noteTimerRef.current);
@@ -235,7 +268,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
       if (noteRef.current !== savedNoteRef.current) cacheNoteDraft(noteDraftKey, noteRef.current);
       void flushPositionRef.current();
     };
-  }, [noteDraftKey]);
+  }, [noteDraftKey, hasPendingHighlights]);
 
   useEffect(() => {
     let cancelled = false;
@@ -246,7 +279,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
       // Start the external PDF lifecycle after this effect has subscribed.
       await Promise.resolve();
       if (cancelled) return;
-      setLoadError(""); setRecoveryError(""); setDocument(null); setMatches([]); textCacheRef.current.clear();
+      setLoadError(""); setRecoveryError(""); setLinkError(""); setDocument(null); setPdfVersion(null); setInitialScrollLeft(undefined); setMatches([]); textCacheRef.current.clear();
       positionRef.current = null;
       savedPositionRef.current = "";
       let activePaper = currentPaperRef.current;
@@ -261,6 +294,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
         paperUpdatedRef.current?.(activePaper);
       }
       if (cancelled) return;
+      setLocalPdfReady(activePaper.pdfArchive?.status === "ready");
       setLoadMessage("正在恢复阅读位置…");
       const metadata = await libraryRequest<ReadingResponse>(`/papers/${encodeURIComponent(paper.id)}/reading-position`, { signal: requestController.signal });
       if (cancelled) return;
@@ -301,6 +335,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
       setPageNumber(position.pageNumber); setPageInput(String(position.pageNumber));
       setScale(position.scale); setZoomMode(position.zoomMode); setNotesVisible(position.notesVisible);
       setPositionStatus("saved"); setPositionError(""); setPositionConflict(false); setDocument(loaded);
+      setPdfVersion(position.pdfVersion);
     };
     void openDocument().catch((error) => { if (!cancelled) setLoadError(errorText(error)); });
     return () => { cancelled = true; requestController.abort(); void destroyLoading?.().catch(() => undefined); };
@@ -315,7 +350,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
     });
     observer.observe(viewport);
     return () => observer.disconnect();
-  }, []);
+  }, [active]);
 
   useEffect(() => {
     if (!document || !query.trim()) return;
@@ -364,26 +399,80 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
     setMatchIndex(index); goToPage(matches[index].page);
   };
 
-  const changeScale = (delta: number) => {
+  const applyScale = useCallback((next: number) => {
     continuousRef.current?.prepareLayout();
-    const next = clamp((zoomMode === "fit-width" ? effectiveScaleRef.current : scale) + delta, 0.25, 4);
     setScale(next); setZoomMode("custom"); updatePosition({ scale: next, zoomMode: "custom" });
-  };
+  }, [updatePosition]);
 
-  const leave = async () => {
-    if (importingRef.current) return;
+  const changeScale = useCallback((direction: number) => {
+    applyScale(stepPdfScale(zoomMode === "fit-width" ? effectiveScaleRef.current : scale, direction));
+  }, [applyScale, scale, zoomMode]);
+
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (!activeRef.current || !document || !(event.metaKey || event.ctrlKey) || event.altKey) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (target.closest("input, textarea, select") || target.isContentEditable)) return;
+      if (["+", "=", "-", "0"].includes(event.key)) {
+        event.preventDefault();
+        if (event.key === "0") applyScale(1);
+        else changeScale(event.key === "-" ? -1 : 1);
+      }
+    };
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [applyScale, changeScale, document]);
+
+  const prepareToLeave = useCallback(async () => {
+    if (importingRef.current) { setRecoveryError("正在导入 PDF，请完成后再切换或退出。"); return false; }
+    continuousRef.current?.prepareLayout();
+    if (viewportRef.current) setInitialScrollLeft(viewportRef.current.scrollLeft);
     setLeaving(true);
-    const [noteSaved, positionSaved] = await Promise.all([flushNote(), flushPosition()]);
-    setLeaving(false);
-    if (noteSaved && positionSaved) onBack();
-  };
+    try {
+      const saved = await Promise.all([flushNoteRef.current(), flushPositionRef.current(), flushStickyRef.current(), flushHighlights()]);
+      if (positionRef.current) {
+        const { pageNumber, scrollOffset, layoutMode } = positionRef.current;
+        setInitialAnchor({ pageNumber, scrollOffset, layoutMode });
+      }
+      return saved.every(Boolean);
+    } finally { setLeaving(false); }
+  }, [flushHighlights]);
+
+  const prepareToActivate = useCallback(async () => {
+    if (!document || !pdfVersion || pendingReloadRef.current) return;
+    const metadata = await libraryRequest<ReadingResponse>(`/papers/${encodeURIComponent(paper.id)}/reading-position`);
+    if (metadata.pdfVersion !== pdfVersion) {
+      setDocument(null);
+      setAttempt((value) => ({ count: value.count + 1, archive: false }));
+      return;
+    }
+    const previous = metadata.position;
+    const position: PositionDraft = {
+      pdfVersion, pageNumber: clamp(previous?.pageNumber ?? 1, 1, document.numPages), pageCount: document.numPages,
+      scale: previous?.scale ?? 1, zoomMode: previous?.zoomMode ?? "fit-width", scrollOffset: previous?.scrollOffset ?? 0,
+      notesVisible: previous?.notesVisible ?? true, layoutMode: previous?.layoutMode ?? (previous ? "single-page" : "continuous"),
+    };
+    if (JSON.stringify(position) === savedPositionRef.current) return;
+    positionRef.current = position;
+    savedPositionRef.current = JSON.stringify(position);
+    pageNumberRef.current = position.pageNumber;
+    setPageNumber(position.pageNumber); setPageInput(String(position.pageNumber));
+    setInitialAnchor({ pageNumber: position.pageNumber, scrollOffset: position.scrollOffset, layoutMode: position.layoutMode });
+    setInitialScrollLeft(undefined);
+    setScale(position.scale); setZoomMode(position.zoomMode); setNotesVisible(position.notesVisible);
+    setPositionStatus("saved"); setPositionError(""); setPositionConflict(false);
+  }, [document, pdfVersion, paper.id]);
+
+  useImperativeHandle(ref, () => ({ prepareToLeave, prepareToActivate }), [prepareToLeave, prepareToActivate]);
+
+  const leave = () => onBack();
 
   const leaveChangedPdf = async () => {
     if (importingRef.current) return;
     setLeaving(true);
-    const noteSaved = await flushNote();
+    const saved = await Promise.all([flushNote(), sticky.flush(), flushHighlights()]);
     setLeaving(false);
-    if (noteSaved) {
+    if (saved.every(Boolean)) {
       // The old PDF's coordinates cannot apply to its replacement.
       positionRef.current = null;
       onBack();
@@ -392,6 +481,8 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
 
   const reloadPdf = () => {
     if (importingRef.current || leaving) return;
+    if (sticky.dirty || sticky.busy) { setRecoveryError("请先保存或关闭便签，再重新载入 PDF。"); return; }
+    if (hasPendingHighlights()) return;
     setAttempt((previous) => ({ count: previous.count + 1, archive: false }));
   };
 
@@ -415,8 +506,11 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
       // Cancelling the file picker does not change this paper or its notes.
       if (!grant && !file) return;
       if (!mountedRef.current) return;
-      if (!await flushNote()) {
-        setRecoveryError("笔记尚未保存，请先重试保存笔记，再导入 PDF。当前笔记草稿已保留。");
+      const [noteSaved, stickySaved, highlightsSaved] = await Promise.all([flushNote(), sticky.flush(), flushHighlights()]);
+      if (!noteSaved || !stickySaved || !highlightsSaved) {
+        setRecoveryError(!noteSaved || !stickySaved
+          ? "笔记尚未保存，请先重试保存笔记，再导入 PDF。当前笔记草稿已保留。"
+          : "高亮操作尚未保存，请先处理后再导入 PDF。");
         return;
       }
       if (!mountedRef.current) return;
@@ -444,15 +538,45 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
   const originalUrl = safePdfSourceUrl(paper.originalUrl);
   const noteStatusLabel = noteStatus === "saved" ? "已保存" : noteStatus === "saving" ? "正在保存…" : noteStatus === "failed" ? (draftCached ? "保存失败 · 本机草稿已保留" : "保存失败 · 当前输入已保留") : "等待保存…";
 
+  const openInPreview = async () => {
+    const bridge = window.literatureDesktop;
+    if (!bridge || openingPreviewRef.current || importingRef.current || leaving) return;
+    openingPreviewRef.current = true;
+    setOpeningPreview(true); setPreviewError("");
+    try { await bridge.openPdfInPreview(paper.id); }
+    catch (error) { if (mountedRef.current) setPreviewError(errorText(error)); }
+    finally { openingPreviewRef.current = false; if (mountedRef.current) setOpeningPreview(false); }
+  };
+
+  // Keep each tab's document and editor state, releasing its page canvases while inactive.
+  if (!active) return null;
+
+  const publication = formatPublicationForDisplay(paper.source, paper.date);
+  const subtitle = paper.zhTitle || paper.title;
   return (
-    <section className="pdf-reader" aria-label="论文阅读器">
+    <section className="pdf-reader" aria-label="论文阅读器" id={`reading-panel-${paper.id}`} role="tabpanel" aria-labelledby={`reading-tab-${paper.id}`} inert={supplementsOpen || undefined}>
       <header className="pdf-reader-heading">
         <button type="button" className="pdf-reader-back" onClick={() => void leave()} disabled={leaving || importing}>{leaving ? "保存中…" : "← 返回文献库"}</button>
         <button type="button" data-reader-navigation-toggle aria-pressed={navigationVisible} disabled={!document} onClick={() => { continuousRef.current?.prepareLayout(); setNavigationVisible(!navigationVisible); }}>{navigationVisible ? "收起目录" : "显示目录"}</button>
-        <div className="pdf-reader-title"><strong title={paper.title}>{paper.zhTitle || paper.title}</strong><span title={paper.title}>{paper.title}</span></div>
+        <div className="pdf-reader-title">
+          <strong title={paper.title}>{paper.title}</strong>
+          <div className="pdf-reader-subtitle">
+            {publication && <span className="pdf-reader-publication" title={publication}>{publication}</span>}
+            <span title={subtitle}>{subtitle}</span>
+          </div>
+        </div>
+        {typeof window !== "undefined" && window.literatureDesktop && <button type="button" data-pdf-open-preview aria-label="用预览打开 PDF"
+          title={localPdfReady ? "用 macOS 预览打开本地 PDF" : "PDF 保存到本机后可用"} disabled={!localPdfReady || openingPreview || importing || leaving}
+          onClick={() => void openInPreview()}>{openingPreview ? "正在打开…" : "用预览打开"}</button>}
+        <button type="button" aria-haspopup="dialog" data-reader-supplements disabled={leaving || importing}
+          onClick={(event) => onOpenSupplements(event.currentTarget)}>补充材料{paper.supplements?.length ? ` (${paper.supplements.length})` : ""}</button>
         <button type="button" aria-pressed={notesVisible} onClick={() => { continuousRef.current?.prepareLayout(); setNotesVisible(!notesVisible); updatePosition({ notesVisible: !notesVisible }); }}>{notesVisible ? "收起笔记" : "显示笔记"}</button>
       </header>
       <div className="pdf-reader-toolbar">
+        <button type="button" data-pdf-sticky-add aria-pressed={sticky.adding} disabled={!document || sticky.loading || sticky.busy || leaving || importing} onClick={sticky.toggleAdding}>{sticky.adding ? "取消放置便签" : "＋ 添加便签"}</button>
+        <PdfHighlightToolbar viewportRef={viewportRef} highlights={highlights.highlights}
+          disabled={!highlights.ready || highlights.busy || Boolean(highlights.saveError) || sticky.adding || leaving || importing}
+          onAdd={highlights.add} onRemove={highlights.removeSelection} />
         <div className="pdf-reader-page-controls">
           <button type="button" aria-label="上一页" disabled={!document || pageNumber <= 1} onClick={() => goToPage(pageNumber - 1)}>‹</button>
           <form onSubmit={(event) => { event.preventDefault(); const value = Number(pageInput); if (Number.isFinite(value)) goToPage(value); }}>
@@ -463,9 +587,9 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
           <button type="button" aria-label="下一页" disabled={!document || pageNumber >= document.numPages} onClick={() => goToPage(pageNumber + 1)}>›</button>
         </div>
         <div className="pdf-reader-zoom-controls">
-          <button type="button" aria-label="缩小" onClick={() => changeScale(-0.1)} disabled={!document || (zoomMode === "custom" && scale <= 0.25)}>−</button>
-          <span>{zoomMode === "fit-width" ? "适应宽度" : `${Math.round(scale * 100)}%`}</span>
-          <button type="button" aria-label="放大" onClick={() => changeScale(0.1)} disabled={!document || (zoomMode === "custom" && scale >= 4)}>＋</button>
+          <button type="button" aria-label="缩小" title="缩小 ⌘−" onClick={() => changeScale(-1)} disabled={!document || (zoomMode === "custom" && scale <= MIN_PDF_SCALE)}>−</button>
+          <PdfZoomInput key={`${zoomMode}:${scale}`} scale={scale} zoomMode={zoomMode} disabled={!document} onZoom={applyScale} />
+          <button type="button" aria-label="放大" title="放大 ⌘＋" onClick={() => changeScale(1)} disabled={!document || (zoomMode === "custom" && scale >= MAX_PDF_SCALE)}>＋</button>
           <button type="button" disabled={!document} aria-pressed={zoomMode === "fit-width"} onClick={() => { continuousRef.current?.prepareLayout(); setZoomMode("fit-width"); updatePosition({ zoomMode: "fit-width" }); }}>适应宽度</button>
         </div>
         <form className="pdf-reader-find" onSubmit={(event) => { event.preventDefault(); if (matches.length) goToPage(matches[matchIndex].page); }}>
@@ -474,6 +598,15 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
           <button type="button" aria-label="下一个匹配" disabled={!matches.length} onClick={() => moveMatch(1)}>↓</button>
         </form>
       </div>
+      {sticky.adding && <div className="pdf-reader-search-status" role="status">点击 PDF 页面，在该位置添加便签。</div>}
+      {sticky.error && !sticky.draft && <div className="pdf-reader-position-error" data-pdf-sticky-error role="alert"><span>{sticky.error}</span><button type="button" onClick={sticky.retry}>重新读取便签</button></div>}
+      {highlights.saveError && <div className="pdf-reader-position-error" role="alert"><span>高亮操作未完成：{highlights.saveError}</span><div>
+        <button type="button" disabled={highlights.busy || leaving} onClick={() => void flushHighlights()}>重试</button>
+        <button type="button" disabled={highlights.busy || leaving} onClick={highlights.discard}>放弃本次操作</button>
+      </div></div>}
+      {highlights.loadError && <div className="pdf-reader-position-error" role="alert"><span>无法读取高亮：{highlights.loadError}</span><button type="button" onClick={highlights.retryLoad}>重新读取高亮</button></div>}
+      {previewError && <div className="pdf-reader-position-error" data-pdf-preview-error role="alert"><span>{previewError}</span><button type="button" disabled={openingPreview || importing || leaving} onClick={() => void openInPreview()}>重试打开</button></div>}
+      {linkError && <div className="pdf-reader-position-error" data-pdf-link-error role="alert"><span>{linkError}</span><button type="button" onClick={() => setLinkError("")}>关闭</button></div>}
       {query.trim() && <div className="pdf-reader-search-status" role="status">
         <span>{searchError || (searching ? `正在检索全文 · 已找到 ${matches.length} 处` : matches.length ? `${matchIndex + 1} / ${matches.length} 处 · 第 ${matches[matchIndex]?.page} 页` : "未找到匹配文字；扫描版 PDF 需要先进行文字识别")}</span>
         {matches.length > 0 && <button type="button" onClick={() => goToPage(matches[matchIndex].page)}>{matches[matchIndex]?.excerpt}</button>}
@@ -481,7 +614,7 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
       {positionStatus === "failed" && <div className="pdf-reader-position-error" role="alert"><span>阅读位置未保存：{positionError}</span>{positionConflict ? <div><button type="button" onClick={reloadPdf} disabled={importing}>重新载入 PDF</button><button type="button" disabled={leaving || importing} onClick={() => void leaveChangedPdf()}>保存笔记并返回</button></div> : <button type="button" onClick={() => void flushPosition()}>重试保存</button>}</div>}
       <div className={`pdf-reader-body${notesVisible ? " has-notes" : ""}${navigationVisible && document ? " has-navigation" : ""}`}>
         {navigationVisible && document && <PdfNavigation document={document} currentPage={pageNumber} onNavigate={goToPage} />}
-        <div ref={viewportRef} className="pdf-reader-viewport">
+        <div ref={viewportRef} className="pdf-reader-viewport" tabIndex={-1}>
           {loadError ? <div className="pdf-reader-empty" data-pdf-load-error role="alert"><strong>暂时无法打开 PDF</strong><p>{loadError}</p>
             <p className="pdf-reader-recovery-hint">可以重试下载。来源网站需要登录时，请在浏览器中打开页面，下载后导入这篇论文。导入会替换当前 PDF，保留论文资料和笔记。</p>
             <div className="pdf-reader-recovery-actions">
@@ -498,8 +631,11 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
           </div>
             : !document ? <div className="pdf-reader-empty" role="status"><span className="pdf-reader-spinner" /><p>{loadMessage}</p></div>
             : <ContinuousPdfDocument ref={continuousRef} document={document} viewportRef={viewportRef}
-              containerWidth={containerWidth} scale={scale} zoomMode={zoomMode} initialAnchor={initialAnchor}
+              containerWidth={containerWidth} scale={scale} zoomMode={zoomMode} initialAnchor={initialAnchor} initialScrollLeft={initialScrollLeft}
               searchQuery={query} onScale={(value) => { effectiveScaleRef.current = value; }}
+              onLinkError={setLinkError}
+              addingSticky={sticky.adding} onStickyPoint={sticky.begin}
+              renderPageOverlay={(page) => <>{highlights.renderMarks(page)}{sticky.renderMarkers(page)}</>}
               onZoom={(value) => { setScale(value); setZoomMode("custom"); updatePosition({ scale: value, zoomMode: "custom" }); }}
               onAnchor={(anchor) => {
                 if (pageNumberRef.current !== anchor.pageNumber) {
@@ -512,16 +648,38 @@ function PdfReaderSession({ paper, onBack, onPaperUpdated }: PdfReaderProps) {
         {notesVisible && <aside className="pdf-reader-notes" aria-label="阅读笔记">
           <div className="pdf-reader-notes-heading"><strong>我的笔记</strong><span role="status" className={`is-${noteStatus}`}>{noteStatusLabel}</span></div>
           {initialDraft !== null && initialDraft !== (paper.note ?? "") && noteStatus !== "saved" && <p className="pdf-reader-draft-message">已恢复上次未保存的本机草稿。</p>}
-          <textarea aria-label="我的阅读笔记" placeholder="记录你的想法、疑问和方法。笔记会自动保存。" value={note} disabled={leaving} onChange={(event) => {
-            const value = event.target.value; noteRef.current = value; setNote(value); setNoteStatus("pending"); setNoteError("");
+          <NoteEditor label="我的阅读笔记" placeholder="记录你的想法、疑问和方法。笔记会自动保存。" value={note} disabled={leaving} minHeight={180} onChange={(value) => {
+            noteRef.current = value; setNote(value); setNoteStatus("pending"); setNoteError("");
             setDraftCached(cacheNoteDraft(noteDraftKey, value));
             if (noteTimerRef.current) clearTimeout(noteTimerRef.current);
             noteTimerRef.current = setTimeout(() => { void flushNoteRef.current(); }, 700);
           }} />
           {noteStatus === "failed" && <div className="pdf-reader-note-error" role="alert"><p>{noteError}</p><button type="button" onClick={() => void flushNote()}>重试保存笔记</button></div>}
           <details className="pdf-reader-summary"><summary>AI 总结</summary><p>{paper.aiSummary || "这篇论文尚未生成 AI 总结。"}</p></details>
+          <PdfStickyList notes={sticky.notes} previousNotes={sticky.previousNotes} onSelect={(item) => { continuousRef.current?.navigate(item.pageNumber, item); sticky.open(item); }} />
+          <PdfHighlightList highlights={highlights.highlights} disabled={highlights.busy || Boolean(highlights.saveError) || leaving || importing}
+            onNavigate={(rect) => continuousRef.current?.navigate(rect.pageNumber, rect)} onRemove={highlights.remove} />
         </aside>}
       </div>
+      {sticky.panel}
     </section>
   );
+}
+
+function PdfZoomInput({ scale, zoomMode, disabled, onZoom }: { scale: number; zoomMode: ZoomMode; disabled: boolean; onZoom: (scale: number) => void }) {
+  const label = zoomMode === "fit-width" ? "适应宽度" : `${Math.round(scale * 100)}%`;
+  const [value, setValue] = useState(label);
+  const dirtyRef = useRef(false);
+  const commit = () => {
+    if (!dirtyRef.current) return;
+    dirtyRef.current = false;
+    const next = parsePdfScale(value);
+    if (next !== null) { setValue(`${Math.round(next * 100)}%`); onZoom(next); }
+    else setValue(label);
+  };
+  return <form onSubmit={(event) => { event.preventDefault(); commit(); }}>
+    <input aria-label="缩放比例" title="输入 25%–6400%，按回车应用；⌘0 恢复实际大小" value={value} disabled={disabled}
+      onChange={(event) => { dirtyRef.current = true; setValue(event.target.value); }} onFocus={(event) => event.target.select()} onBlur={commit}
+      onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); dirtyRef.current = false; setValue(label); event.currentTarget.blur(); } }} />
+  </form>;
 }

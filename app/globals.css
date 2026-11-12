@@ -1447,10 +1447,88 @@ a:focus-visible {
 }
 
 .note-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
   padding: 11px 13px;
   border-left: 3px solid #d7c9a8;
   border-radius: 0 9px 9px 0;
   background: #faf8f2;
+}
+
+.card-note-edit-button {
+  flex-shrink: 0;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--note-strong);
+  background: transparent;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.card-note-edit-button:hover {
+  background: var(--note);
+}
+
+.note-row .card-note-content {
+  min-width: 0;
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+
+.card-note-editor {
+  display: grid;
+  grid-column: 2 / -1;
+  gap: 10px;
+}
+
+.card-note-editor textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 11px 12px;
+  border: 1px solid #d7c9a8;
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--panel, #fff);
+  font: inherit;
+  font-size: var(--paper-body-size);
+  line-height: 1.8;
+  resize: vertical;
+}
+
+.card-note-editor textarea:focus-visible {
+  outline: 2px solid var(--note-strong);
+  outline-offset: 2px;
+}
+
+.card-note-toolbar,
+.card-note-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.card-note-toolbar small {
+  color: var(--note-strong);
+  font-size: 11px;
+}
+
+.card-note-actions {
+  margin-left: auto;
+}
+
+.card-note-actions button {
+  padding: 7px 12px;
+  min-height: 32px;
+  font-size: 12px;
+}
+
+.note-row .card-note-error {
+  color: var(--danger, #a53b32);
+  font-size: 12px;
 }
 
 .note-label {
@@ -1460,6 +1538,7 @@ a:focus-visible {
 
 .paper-card-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -1467,9 +1546,22 @@ a:focus-visible {
   border-top: 1px solid var(--line);
 }
 
+.paper-footer-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.paper-footer-actions .citation-button {
+  width: auto;
+}
+
 .resource-grid {
-  display: grid;
-  grid-template-columns: repeat(3, max-content);
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: 6px;
 }
 
@@ -1502,6 +1594,17 @@ a:focus-visible {
   color: var(--faint);
   background: #f2f3f2;
   border: 1px solid transparent;
+}
+
+.resource-slot.supplement-resource {
+  color: var(--muted);
+  background: var(--card);
+}
+
+.resource-slot.supplement-resource:hover {
+  color: var(--ink);
+  background: var(--ink-soft);
+  border-color: var(--line-strong);
 }
 
 .resource-state {
@@ -5321,9 +5424,6 @@ a:focus-visible {
     display: none;
   }
 
-  .resource-grid {
-    grid-template-columns: repeat(3, max-content);
-  }
 }
 
 @media (max-width: 760px) {
@@ -5548,18 +5648,21 @@ a:focus-visible {
     line-height: 1.45;
   }
 
-  .summary-row,
-  .note-row {
+  .summary-row {
     grid-template-columns: 1fr;
     gap: 7px;
   }
 
-  .content-label {
-    width: fit-content;
+  .note-row {
+    column-gap: 7px;
   }
 
-  .resource-grid {
-    grid-template-columns: 1fr;
+  .card-note-editor {
+    grid-column: 1 / -1;
+  }
+
+  .content-label {
+    width: fit-content;
   }
 
   .resource-slot {
